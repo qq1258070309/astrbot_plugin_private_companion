@@ -1,0 +1,108 @@
+name: Publish current main (first release / manual republish)
+
+# Companion to sync-release.yml. The first fork release is produced by a local
+# three-way merge, so no new upstream tag exists to trigger the sync workflow.
+# This manual job puts the CURRENT main through the same mechanical gates and AI
+# compatibility review, then creates the Release for its existing version.
+# It never merges, bumps a version, or changes main.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: companion-fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: menglimi/astrbot_plugin_private_companion
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install gate dependencies
+        run: python -m pip install -q PyYAML regex Pillow httpx aiohttp 'cryptography>=42' tzdata
+
+      - name: Validate release contract
+        run: python -X utf8 tools/fork_release.py check
+
+      - name: Mechanical gates
+        id: gates
+        run: |
+          bash tools/fork_gates.sh \
+            "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
+            2>&1 | tee "$RUNNER_TEMP/gates.log"
+          echo '{"result":"pass"}' > "$RUNNER_TEMP/gates.json"
+
+      - name: AI compatibility review
+        id: ai
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git show --stat --oneline HEAD > "$RUNNER_TEMP/merge-diff.txt"
+          VERSION="$(python -X utf8 tools/fork_release.py version)"
+          BASE="$(python -X utf8 tools/fork_release.py base)"
+          python -X utf8 tools/ai_compat_review.py \
+            --diff "$RUNNER_TEMP/merge-diff.txt" \
+            --notes CHANGELOG.md \
+            --customizations FORK_CUSTOMIZATIONS.md \
+            --gates "$RUNNER_TEMP/gates.json" \
+            --version "$VERSION" \
+            --upstream-tag "$BASE" \
+            --report "$RUNNER_TEMP/COMPAT_REPORT.md" \
+            --outputs "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        if: steps.ai.outputs.compatible == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(python -X utf8 tools/fork_release.py version)"
+          BASE="$(python -X utf8 tools/fork_release.py base)"
+          {
+            echo "## $VERSION"
+            echo
+            echo "首个定制发行版：对齐上游 [$BASE](https://github.com/${UPSTREAM_REPO}/releases/tag/$BASE)，"
+            echo "合并 7.1.5 之后 15 个上游版本并保留本地定制。"
+            echo
+            echo "机械门禁与 AI 兼容性审查均通过；结论见附件 COMPAT_REPORT.md，"
+            echo "定制明细见 FORK_CUSTOMIZATIONS.md，变更见 CHANGELOG.md。"
+          } > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" \
+              "$RUNNER_TEMP/fork-release"/*.zip \
+              "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
+              "$RUNNER_TEMP/COMPAT_REPORT.md" --clobber
+          else
+            gh release create "v$VERSION" \
+              "$RUNNER_TEMP/fork-release"/*.zip \
+              "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
+              "$RUNNER_TEMP/COMPAT_REPORT.md" \
+              --title "$VERSION" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+      - name: Refuse to publish
+        if: steps.ai.outputs.compatible != 'true'
+        run: |
+          echo "::error::AI review did not approve this release (compatible=${{ steps.ai.outputs.compatible }}, configured=${{ steps.ai.outputs.ai_configured }}). Configure LLM_API_KEY and rerun."
+          exit 1

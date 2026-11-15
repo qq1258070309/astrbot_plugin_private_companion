@@ -66,7 +66,12 @@ AstrBot（含插件更新管理器的自定义源）读取**默认分支** `meta
    - `LLM_MODEL`（可选，默认 `gpt-4o-mini`）。
 3. 在 **Actions → Sync upstream, verify compatibility, and release → Run workflow** 手动跑一次验证，
    可勾选 `dry_run` 只跑检查不发布。
-4. 确认 `main` 的 `metadata.yaml` 版本号与 `UPSTREAM_BASE` 正确后，即可交给定时任务。
+4. 推送 `main` 后，在 **Actions → Publish current main (first release / manual republish)
+   → Run workflow** 手动跑一次，产出首个 Release `v7.1.20a`。首个版本由本地三方合并而来，
+   没有新的上游 tag 可触发同步流程，因此用这个辅助 workflow 走**同样的门禁 + AI 审查**后发布；
+   它不合并、不 bump 版本、不改动 `main`。
+5. 之后上游每次发版由 `sync-release.yml` 全自动发布，无需再手动介入。
+6. 确认 `main` 的 `metadata.yaml` 版本号与 `UPSTREAM_BASE` 正确后，即可交给定时任务。
 
 > fork 仓库的 `schedule` 在仓库连续 60 天无活动后会被 GitHub 自动停用；
 > 届时手动跑一次 workflow 即可恢复。凭据只放 Secrets，**不要写进任何文件、脚本或对话**。
