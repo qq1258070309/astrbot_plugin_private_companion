@@ -32,6 +32,7 @@ import time
 import aiohttp
 
 from companion_v2.execution.models import TaskError
+from companion_v2.qzone.credential import passive_retry_delay_seconds
 from companion_v2.qzone.protocol import (COOKIE_ACTIONS, COOKIE_DOMAINS, REFERER_ROOT, USER_AGENT,
                                          QzoneCredential, QzoneRequest, cookie_uin,
                                          credential_from_cookies, h5_index_request,
@@ -190,6 +191,12 @@ class QzoneHttpClient:
         self._request_timeout = _seconds(request_timeout_seconds, 20.0)
         self._credential = None
         self._credential_at = 0.0
+        # 凭据获取失败后的退避：失败一次就把「下次才允许再问」推到将来，免得每次操作
+        # 都把那批 COOKIE_ACTIONS × COOKIE_DOMAINS 的 OneBot 调用重打一遍。
+        # refresh=True（人手动点「刷新凭据」）不受它约束——那是明确要求的重试。
+        self._retry_at = 0.0
+        self._retry_failures = 0
+        self._last_failure = None
         self._tokens = {}
         self._lock = asyncio.Lock()
         self._state = {"source": SOURCE_NONE, "state": STATE_UNKNOWN, "uin_masked": "", "reason": ""}
@@ -203,17 +210,62 @@ class QzoneHttpClient:
         a burst of OneBot requests. A failed acquisition drops the previous
         snapshot: a session the host just refused to refresh must not come back
         through the next cache hit.
+
+        A failed acquisition also arms a backoff (see ``_retry_delay``): the next
+        caller gets the same refusal back immediately instead of re-running the
+        whole cookie search. ``refresh=True`` skips the backoff because the
+        operator asked for exactly that retry; a manual cookie that appears while
+        the backoff is armed is picked up immediately as well.
         """
         async with self._lock:
-            if (not refresh and self._credential is not None
-                    and self._credential_at + self._credential_ttl > time.monotonic()):
+            if not refresh and self._credential is not None \
+                    and self._credential_at + self._credential_ttl > time.monotonic():
                 return self._credential
+            if not refresh and self._retry_at > time.monotonic() and not self._manual_text():
+                # 退避窗口内：不重新问宿主，把上次的拒绝原样交回去。
+                if self._last_failure is not None:
+                    raise self._last_failure
             try:
-                return await self._acquire()
-            except BaseException:
+                return await self._remember_acquired()
+            except BaseException as error:
                 self._credential = None
                 self._credential_at = 0.0
+                if not refresh:
+                    self._arm_backoff(error)
                 raise
+
+    def _arm_backoff(self, error: BaseException) -> None:
+        """Remember one refusal and schedule the next automatic attempt."""
+        self._retry_failures += 1
+        self._last_failure = error
+        self._retry_at = time.monotonic() + self._retry_delay(self._retry_failures)
+        self._note("credential.backoff", "armed", failures=self._retry_failures,
+                   retry_in=int(self._retry_delay(self._retry_failures)))
+
+    @staticmethod
+    def _retry_delay(failures: int) -> float:
+        """Automatic retry spacing for **ordinary callers**, capped at five minutes.
+
+        The full ladder (1m → 5m → 10m → 20m → 30m → 1h → 2h → 3h → 6h → 12h →
+        24h) lives in ``companion_v2/qzone/credential.py`` and is driven by the
+        background watch (``astrbot_host/qzone_credential_watch.py``), which
+        always calls ``credential(refresh=True)`` and therefore never waits on
+        this guard. Implicit callers -- a page scan, a proactive turn -- only get
+        the short end of the ladder: a click must not sit for a day because the
+        host failed a few times earlier.
+        """
+        return float(passive_retry_delay_seconds(failures))
+
+    def _clear_backoff(self) -> None:
+        self._retry_at = 0.0
+        self._retry_failures = 0
+        self._last_failure = None
+
+    async def _remember_acquired(self) -> QzoneCredential:
+        """Acquire once, and clear the backoff when that acquisition succeeded."""
+        credential = await self._acquire()
+        self._clear_backoff()
+        return credential
 
     async def _acquire(self) -> QzoneCredential:
         manual = self._manual_text()
@@ -322,6 +374,8 @@ class QzoneHttpClient:
         self._credential_at = time.monotonic()
         self._state = {"source": source, "state": STATE_READY,
                        "uin_masked": _mask_uin(credential.uin), "reason": ""}
+        # 拿到了就立刻解除退避：无论是手动 Cookie 还是宿主终于肯给。
+        self._clear_backoff()
         self._note("credential.acquire", "ok", manual=(source == SOURCE_MANUAL))
         return credential
 
@@ -432,7 +486,11 @@ class QzoneHttpClient:
     @property
     def last_credential_state(self) -> dict:
         """The page-facing conclusion: a source, a state, a masked id and a reason."""
-        return dict(self._state)
+        state = dict(self._state)
+        remaining = self._retry_at - time.monotonic()
+        state["retry_failures"] = self._retry_failures
+        state["retry_in_seconds"] = max(0, int(remaining)) if remaining > 0 else 0
+        return state
 
     def _note(self, action, status, **flags):
         """Record one conclusion: an action, a status and boolean flags only."""

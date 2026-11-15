@@ -295,6 +295,23 @@ STAGE_TIMINGS = {"assemble": "assemble_ms", "model": "wait_ms",
                  "parse": "parse_ms", "commit": "commit_ms"}
 
 
+def _discovery_key(context):
+    """What one private discovery answer depends on: role, bot, installation.
+
+    Private discovery returns the windows of a role, whichever window of that role
+    asks, so every window of one role in one pass shares one answer. A window that
+    carries no role binding cannot prove it shares a role with another one, so it
+    is keyed by itself and the pass keeps asking per window -- the conservative
+    answer, and the shape the scan fixtures build.
+    """
+    role = getattr(getattr(context, "role_binding", None), "role", None)
+    role_id = getattr(role, "subject_id", None)
+    scope = context.scope
+    if role_id is None:
+        return ("window", context.key)
+    return ("role", role_id, scope.bot_id, scope.installation_id)
+
+
 def enter_stage(job, name):
     """Open a phase: name it and zero its stopwatch at the same moment.
 
@@ -2169,28 +2186,51 @@ class ExpressionStyleService:
         budget is set on the service for exactly the walk that spends it.
         """
         scanned_private = set()
+        # One pass used to recompute the whole role's private discovery for every
+        # binding it walked. A pass walks up to sixteen bindings of the same role,
+        # and one discovery measured ~0.6 s of synchronous store reads, so the walk
+        # spent its whole budget re-answering one question: this is what blocked
+        # the event loop for 30 s and dragged in-flight model calls past their
+        # timeout. The answer depends only on the role, bot and installation of the
+        # binding asking, so the second window of a role reuses the first answer.
+        # The instant is fixed once per pass for the same reason -- a pass is one
+        # synchronous walk, so asking the clock again per binding only made the same
+        # question look different and would defeat the memo.
+        at = self.tasks.now()
+        discovered = {}
         for _ in range(min(16, len(bindings))):
             if budget.spent:
                 break
             context, instruction, _ = bindings[self.cursor % len(bindings)]
             self.cursor += 1
-            at = self.tasks.now()
             if context.scope.kind is not ScopeKind.PRIVATE:
                 continue
-            try:
-                from .private_scope import role_private_contexts
-                candidates = role_private_contexts(self.runtime, self.tasks.identity,
-                    self.samples.messages, context, at)
-                # The live binding is authoritative. Private-scope discovery can
-                # legitimately return nothing (identity bindings were rebuilt or
-                # the stored observation is gone); skipping the bound window would
-                # then disable automatic learning forever while the page still
-                # shows an empty rule library.
-                if not candidates:
-                    candidates = (context,)
-            except TaskError as error:
-                self.results[self._work_key(context)] = {"state": "blocked", "code": error.code}
-                continue
+            discovery_key = _discovery_key(context)
+            candidates = discovered.get(discovery_key)
+            if candidates is None:
+                try:
+                    from .private_scope import role_private_contexts
+                    from companion_v2.configuration.owners import stable_repeated_reads
+                    # One discovery asks for the same role-level configuration
+                    # target once per stored window (144 identical reads here).
+                    # The scope is opened for exactly this synchronous call, so
+                    # nothing can be written between two reads inside it and the
+                    # collapsed answer is the same answer.
+                    with stable_repeated_reads():
+                        candidates = role_private_contexts(self.runtime, self.tasks.identity,
+                            self.samples.messages, context, at)
+                except TaskError as error:
+                    self.results[self._work_key(context)] = {"state": "blocked", "code": error.code}
+                    continue
+                # An empty answer is a real answer and is memoized as one; only a
+                # failed read is retried by the next binding.
+                discovered[discovery_key] = candidates
+            # The live binding is authoritative. Private-scope discovery can
+            # legitimately return nothing (identity bindings were rebuilt or
+            # the stored observation is gone); skipping the bound window would
+            # then disable automatic learning forever while the page still
+            # shows an empty rule library.
+            candidates = candidates or (context,)
             for candidate in self._in_turn(candidates):
                 # The cap belongs here, not only on the bindings and the group
                 # loop: one discovery result can hold every window of a role, and

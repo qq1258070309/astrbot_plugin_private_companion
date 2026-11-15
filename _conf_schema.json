@@ -1024,6 +1024,53 @@
       }
     }
   },
+  "qq_pre_reply_reaction": {
+    "description": "QQ 表情预回应（NapCat / OneBot v11）",
+    "hint": "消息被唤醒、确认要回复后，在等待模型回复的这段时间里，给「触发回复的那条消息」贴一个表情；未命中回复的消息不贴。只支持 NapCat / OneBot v11 的 set_msg_emoji_like 扩展动作，其他平台自动跳过。贴表情失败不会影响正常回复。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用表情预回应",
+        "hint": "默认关闭。保存后重载插件生效；建议先在本地用小号 QQ 试，再上生产。",
+        "type": "bool",
+        "default": false
+      },
+      "emoji_id": {
+        "description": "「处理中 / 等待」表情 ID",
+        "hint": "QQ 表情 ID：212=🤔思考（默认，处理中）、324=👌收到/等待、32=✅、351=👍、319=🎉、0=😲、14=🙂、67=❤️。填 NapCat 支持的整数。",
+        "type": "int",
+        "default": 212
+      },
+      "emoji_type": {
+        "description": "表情类型",
+        "hint": "NapCat 官方接口只需要 message_id / emoji_id / set 三个参数；这里保留 emoji_type 是为了与本机已装的 parser 插件保持一致。留空则不传这个参数。",
+        "type": "string",
+        "default": "1"
+      },
+      "scope": {
+        "description": "作用范围",
+        "hint": "all = 只要这条消息被唤醒、确定要回复就贴（默认，符合需求）；companion = 额外要求陪伴小屋在准入阶段挂过核心回复上下文，只给陪伴小屋接管的消息贴。",
+        "type": "string",
+        "options": [
+          "companion",
+          "all"
+        ],
+        "default": "all"
+      },
+      "clear_after_reply": {
+        "description": "回复发出后撤销表情",
+        "hint": "开启后，机器人正式回复发出时自动把「处理中」表情取消；关闭则一直保留在这条消息上。",
+        "type": "bool",
+        "default": true
+      },
+      "timeout_seconds": {
+        "description": "兜底撤销时间（秒）",
+        "hint": "模型失败、事件被丢弃等没有发出回复时，最多保留这么久再自动撤销，避免表情永久挂着。默认 180 秒。",
+        "type": "int",
+        "default": 180
+      }
+    }
+  },
   "legacy": {
     "description": "兼容｜从 V1 迁移数据",
     "hint": "首次从 V1 换到 V2 时用。V1 的数据留在原来的插件数据目录里，这里填它的绝对路径（例如 …/data/plugin_data/astrbot_plugin_private_companion）。留空则按 V2 数据目录的同级目录自动寻找 V1。迁移是只读 V1、单向写入 V2：过程中不会修改或删除 V1 的任何文件，所以可以先试算几遍再决定。实际执行在「陪伴小屋 → 开始使用」的最后一步完成。",

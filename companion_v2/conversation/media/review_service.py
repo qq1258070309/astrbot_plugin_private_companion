@@ -292,12 +292,15 @@ class GroupImageReviewService:
                 raise TaskError("image_review_conflict", "a decided review cannot be decided again")
             run.begin_effect()
             self.review.store(row["review_key"], document)
-            run.record_operation(row["review_key"])
+            # 判定结论落库即本任务的原子提交，主人签发的操作号沿用本任务 task_id。
+            # 上游 7.1.0 改成用 review_key 当操作号，会把 owner/scope 语义换成群聊审核键；
+            # 本地保留 task_id（与 operation 预留时登记的 owner 一致）。
+            run.record_operation(run.task.task_id)
         self.results[row["review_key"]] = {"state": document["state"], "label": document["label"],
                                            "decision": decision}
         self.notify()
         return TaskResult("succeeded", effect="committed", result_ref=row["review_key"],
-                          receipt_ref=row["review_key"], operation_id=row["review_key"])
+                          operation_id=run.task.task_id, receipt_ref=run.task.task_id)
 
     # -- lifecycle -----------------------------------------------------
 

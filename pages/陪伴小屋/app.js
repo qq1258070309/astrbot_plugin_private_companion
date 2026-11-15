@@ -741,7 +741,10 @@ function renderFurniturePanel(id){
     +`<div class="shell-panel-body"><div class="furniture-brief-actions">${button(I('armchair')+' 布置衣柜','data-detail="arrange"')}${button(I('shirt')+' 参考素材与衣柜','data-go="manage" data-manage="output" data-output-target="materials"')}</div></div>`;
   const entry=directory.find(item=>item.station===id);
   if(!entry)return renderHomePanel();
-  const status=capabilityStatus(entry.cap)[0];
+  /* 页头与家具目录必须共用同一套判据：基础家具没有 cap，直接喂给
+     capabilityStatus(undefined) 会落到兜底的「配置未知」，和自己目录里
+     显示的「V2 工作区」自相矛盾。 */
+  const status=furnitureStatus(entry)[0];
   const head=panelHead(entry.name,entry.text,entry.icon,
     chip(status)+button('回到小屋','data-shell-home'));
   if(id==='calendar')return head+`<div class="shell-panel-body">${renderRoleState('','planning')}</div>`;
@@ -2890,12 +2893,30 @@ function qzoneBlockedMarkup(){
   return `<p class="action-qzone-alert" role="alert">${I('triangle-alert')}`
     +`<span><strong>QQ 空间已自动暂停</strong>${escapeHTML(blocked)}</span></p>`;
 }
+/* 后台看守的等待时长，和 companion_v2/qzone/credential.py 的梯子同一套说法：
+   1 分钟 / 2 小时 / 24 小时。这里只负责把秒数说成人话，不自己算档位。 */
+function qzoneDelayText(seconds){
+  const total=Math.max(0,Math.round(Number(seconds)||0));
+  if(total>=3600){
+    const hours=Math.floor(total/3600), rest=total%3600;
+    return rest?`${hours} 小时 ${Math.floor(rest/60)} 分钟`:`${hours} 小时`;
+  }
+  if(total>=60)return `${Math.floor(total/60)} 分钟`;
+  return `${total} 秒`;
+}
 function qzoneCredentialMarkup(credential){
   const row=credential&&typeof credential==='object'?credential:{};
   const state=typeof row.state==='string'?row.state:'unknown';
   const source=typeof row.source==='string'?row.source:'none';
   const masked=typeof row.uin_masked==='string'?row.uin_masked:'';
   const reason=typeof row.reason==='string'?row.reason.trim():'';
+  /* 连续失败次数与"下次自动重试"由宿主侧看守写进同一份状态；没这一项就当没失败过，
+     不编一个 0 次出来。 */
+  const failures=Number.isFinite(row.retry_failures)?Math.max(0,Math.round(row.retry_failures)):0;
+  const retryIn=Number.isFinite(row.retry_in_seconds)?Math.max(0,Math.round(row.retry_in_seconds)):0;
+  const watch=failures>0&&state!=='ready'
+    ?`<span class="action-qzone-reason">连续失败 ${failures} 次${retryIn>0?` · ${qzoneDelayText(retryIn)}后自动重试`:' · 正在自动重试'}</span>`
+    :'';
   const tone=state==='ready'?'is-ok':state==='unknown'?'is-off':'is-warn';
   /* 「没有可用来源」只在失败态出现；unknown 只意味着还没读过，不能替用户下结论。 */
   const failed=QZONE_CREDENTIAL_FAILED_STATES.includes(state);
@@ -2906,7 +2927,8 @@ function qzoneCredentialMarkup(credential){
     +`${showSource?`<span>${escapeHTML(QZONE_CREDENTIAL_SOURCES[source]||'来源未知')}</span>`:''}`
     +`${state==='unknown'?'<span class="action-qzone-reason">刷新凭据或读一次空间即可确认。</span>':''}`
     +`${masked?`<span>账号 ${escapeHTML(masked)}</span>`:''}`
-    +`${reason?`<span class="action-qzone-reason">${escapeHTML(reason)}</span>`:''}</span>
+    +`${reason?`<span class="action-qzone-reason">${escapeHTML(reason)}</span>`:''}`
+    +watch+`</span>
     <button class="button small" type="button" data-qzone-action="refresh-credentials" ${qzoneState.busy?'disabled':''}>${I('key-round')}<span>刷新凭据</span></button>
   </div>`;
 }
@@ -3539,7 +3561,7 @@ function renderOutputOriginal(){
               <div id="outputTriggerPreferences"><div id="imageOutputWorkspace" class="output-workbench-block" data-output-config aria-label="生图触发与提示词设置">${consoleLoading('正在读取生图偏好…')}</div></div>
             </section>
             <div class="output-workbench-block" id="imageControlWorkspace" data-output-config aria-label="生图额度与审核配置">${consoleLoading('正在读取生图额度与审核设置…')}</div>
-            <div class="output-provider-strip"><header><h2>生成能力</h2></header>${outputProviderLine('image','图像生成')}</div>
+            <div class="output-provider-strip"><header><h2>生成能力</h2></header>${outputProviderLine('image','图像生成')}${imageAssembleNotice()}</div>
           </section>
           <section class="output-config-panel" id="output-panel-gallery" role="tabpanel" aria-labelledby="output-tab-gallery" tabindex="0" data-output-panel hidden>
             <section class="output-gallery-panel" aria-labelledby="output-gallery-heading">
@@ -4926,6 +4948,17 @@ function contentAssembleButton(){
   const assembled=item.assembled===true&&item.desired_state!=='discarded';
   if(assembled)return '';
   return button('装配 Content 拓展','data-builtin-extension="content" data-builtin-extension-action="assemble"','small primary');
+}
+/* 图像拓展被卸载后，产出页只剩一枚「未装配」标签，这一页没有装配入口（创作书架
+   的同类死循环已在 7.0.12 修过）。装配只把 V2 内置拓展恢复为 active，不创建消息
+   事件、不启动后台生图：图片工具是事件作用域的，只有用户消息这一轮里模型判断需要
+   配图才会调用；主动联系只从已有素材里选图附上，不会自己画一张新图。 */
+function imageAssembleNotice(){
+  const item=product.extension('image');
+  if(!item)return `<p class="product-muted">能力目录暂未读到，先到「模型与连接」核对 V2 内置图像拓展。</p><div class="dialog-actions">${button('打开模型与连接','data-go="manage" data-manage="models"','small')}</div>`;
+  const assembled=item.assembled===true&&item.desired_state!=='discarded';
+  if(assembled)return '';
+  return `<p class="product-muted">未装配时本轮不会开放生图工具；装配只恢复入口，不会自行画图——只有消息这一轮里模型判断需要配图才会调用，主动联系只从已有素材里选图附上。</p><div class="dialog-actions">${button('装配图像拓展','data-builtin-extension="image" data-builtin-extension-action="assemble"','small primary')}</div>`;
 }
 function capabilitySurface(key){
   if(['content','image','screen'].includes(key))return bundledCapabilitySurface(key);

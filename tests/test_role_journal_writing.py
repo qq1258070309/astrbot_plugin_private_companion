@@ -98,6 +98,31 @@ class JournalWritingTests(HostFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual((entry.draft.body, entry.draft.afterglow, entry.draft.recall),
                              (text, afterglow, DreamRecall(recall)))
 
+    async def test_diary_survives_a_spare_afterglow_field(self):
+        """A diary the model decorated with mood text must still land.
+
+        Production failure (2026-10-31): ``ValueError: a diary cannot carry a dream
+        afterglow`` threw away an otherwise complete diary because the model filled the
+        dream-only slot. The mood text is now folded into the body instead.
+        """
+        await self.setup_writer()
+        cases = (
+            ("diary-with-body-and-mood", "今天把窗台的积灰擦干净了。", "心里松快了一点。",
+             "今天把窗台的积灰擦干净了。"),
+            ("diary-with-only-mood", "", "只记得醒来时心情很轻。", "只记得醒来时心情很轻。"),
+        )
+        for index, (request, text, afterglow, expected_body) in enumerate(cases):
+            async def model(envelope, text=text, afterglow=afterglow):
+                return answered(body(text, afterglow=afterglow))
+            self.model_behavior = model
+            target = self.target("2026-09-2" + str(index))
+            result = (await self.write(target=target, request=request)).unwrap().task
+            self.assertEqual(result.state, "succeeded")
+            entry = self.journal.get(target.key)
+            self.assertEqual(entry.draft.body, expected_body)
+            self.assertEqual(entry.draft.afterglow, "")
+            self.assertIsNone(entry.draft.recall)
+
     async def test_classified_artifact_contents_reach_writing_and_derivation_with_original_dependencies(self):
         await self.setup_writer()
         self.grant(self.important, SCOPE, "role.journal.write")
@@ -401,6 +426,22 @@ class JournalWritingTests(HostFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.unwrap().task.state, "succeeded")
         service = RoleJournalService(self.open_runtime(), now=self.clock.now)
         self.assertEqual(service.head(self.target().key).state, JournalState.ABSENT)
+
+    async def test_failed_diary_attempt_records_the_error_and_releases_its_slot(self):
+        await self.setup_writer()
+        async def model(envelope):
+            return answered("这不是 JSON")
+        self.model_behavior = model
+        task = (await self.write()).unwrap().task
+        self.assertEqual(task.state, "failed")
+        row = self.runtime.read_one(
+            "SELECT record_json, slot_held FROM execution_attempts WHERE task_id = ?", (task.task_id,))
+        record = json.loads(row["record_json"])
+        self.assertIn("JSONDecodeError", record["detail"])
+        self.assertIn("Expecting value", record["detail"])
+        self.assertLessEqual(len(record["detail"]), 240)
+        self.assertEqual(record["stopped_proof"], "supervised_coroutine_stopped")
+        self.assertEqual(row["slot_held"], 0)
 
 
 if __name__ == "__main__":

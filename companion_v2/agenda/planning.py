@@ -29,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 KIND = "calendar.plan"
 OWNER = "calendar.planning"
+# ``TaskSupervisor.submit`` refuses a deadline more than a week out, so a wide
+# planning window has to be clamped here instead of widened there.
+SUBMISSION_HORIZON = timedelta(days=7)
+
+
+def planning_deadline(job):
+    """Last moment this plan is still worth running.
+
+    The captured job already carries the end of its own window, and ``validate``
+    keeps re-checking that window when the plan is claimed. A short fixed budget
+    instead expired plans that merely waited in the single background lane, and
+    the runner then also derived its execution budget from that near deadline.
+    """
+    return min(job["end"], job["at"] + SUBMISSION_HORIZON)
 
 
 def planning_profile(provider, *, max_output_tokens=2048):
@@ -328,7 +342,7 @@ class CalendarPlanning:
             self.pending[identifier] = job
             try:
                 require(self.tasks.submit(TaskSpec(identifier, context, KIND, digest(job), identifier,
-                    job["at"], min(job["end"], job["at"] + timedelta(minutes=3)))))
+                    job["at"], planning_deadline(job))))
             except BaseException:
                 self.pending.pop(identifier, None)
                 raise

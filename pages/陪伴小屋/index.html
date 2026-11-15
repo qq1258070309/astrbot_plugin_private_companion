@@ -148,7 +148,7 @@
     <script defer src="page-motion.js?v=page-interactions-20261011"></script>
     <script defer src="entrance.js?v=entrance-state-build-20261001"></script>
     <script defer src="config-snapshot.js?v=brand-no-version-20261018"></script>
-    <script defer src="home-sidebar.js?v=planning-feedback-20261019"></script>
+    <script defer src="home-sidebar.js?v=planning-blocker-20261103"></script>
     <script defer src="persona-designer-memory.js?v=persona-recreation-20261101"></script>
     <script defer src="product-page.js?v=group-navigation-20261103"></script>
     <script defer src="confirmation-dialog.js?v=consolidated-20261024-r1"></script>
@@ -170,10 +170,16 @@
 
     <script defer src="screen-observation.js?v=screen-retained-20261014"></script>
     <script defer src="screen-access.js?v=screen-retained-20261014"></script>
+    <!-- 决策页挂在 app.js 启动时：app.js 里的「决策页」挂载点直接取
+         window.CompanionDecisionPage，而它只调用一次、没有轮询重试。
+         放在 app.js 之后（以前在 196 行）时，同一次启动里 app.js 先跑、
+         那时模块还没定义，挂载被静默跳过，页面停在「正在读取当前角色…」。
+         顺序即依赖：decision-page.js → app.js。 -->
+    <script defer src="decision-page.js?v=harassment-v2-20261102"></script>
     <!-- app.js 先于 room-editor.js：体素在首屏就挂载，此时 room-editor 的
          顶层函数还不存在，mountStage 里的两处回调因此必须惰性解析（见
          app.js 的注释）。tests/test_voxel_mount_callbacks.cjs 守住这个顺序。 -->
-    <script defer src="app.js?v=video-capability-card-20261106"></script>
+    <script defer src="app.js?v=header-status-20261109"></script>
     <script defer src="room-editor.js?v=transient-time-preview-20261029-r2"></script>
     <script defer src="memory-page.js?v=memory-repair-20261028"></script>
     <script defer src="contact-page.js?v=proactive-media-diagnostics-20261029"></script>
@@ -197,9 +203,8 @@
     <script defer src="output-page.js?v=7.1.0"></script>
     <script defer src="role-profile-draft.js?v=7.1.0"></script>
     <script defer src="role-profile-migration.js?v=migration-ui-20261015"></script>
-    <script defer src="decision-page.js?v=harassment-v2-20261102"></script>
     <script defer src="expression-page.js?v=expression-completion-20261008"></script>
-    <script defer src="models-page.js?v=search-priority-20261102"></script>
+    <script defer src="models-page.js?v=bulk-provider-20261107"></script>
     <script defer src="image-materials-page.js?v=reference-usage-persistence-20261007"></script>
     <script defer src="maintenance-page.js?v=meal-topics-auto-dates-20261025"></script>
     <script defer src="appearance-page.js?v=account-display-preferences-20261028"></script>
@@ -256,7 +261,7 @@
         })();
     </script>
   </template>
-  <script defer src="performance-gate.js?v=performance-mode-20261027"></script>
+  <script defer src="performance-gate.js?v=first-paint-split-20261107"></script>
 
   <!-- 配置控制台外壳。
        console.css 定义 .console / .console-section / .console-section-head /

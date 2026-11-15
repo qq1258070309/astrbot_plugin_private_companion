@@ -61,6 +61,11 @@ window.CompanionWorkbench = (() => {
     host_persona_changed: "角色人格已变化，请重新读取角色状态。",
     bridge_timeout: "连接超时，请核对连接后重试。",
     invalid_response: "返回数据不完整，请刷新核对。",
+    /* 后端已经明确拒绝的码。页面桥只转发 message（机器码），所以这些码常常
+       是以 Error.message 的身份到达的，见代码里的 isCode()。它们必须当作
+       「没有写入」处理，不能再落进 pending 里反复核对。 */
+    configuration_scope_not_supported: "这一项不支持在当前对象上保存，请按它所属的范围切换对象后再修改。",
+    unknown_configuration_field: "这项设置不属于当前分区，请刷新页面后重新核对。",
     /* 宿主对未注册路由的拒绝：通常是插件更新后还没重载，或新角色路由尚未挂上。 */
     plugin_route_missing: "这个页面的接口还没挂上：插件可能刚更新但未重载，或角色路由还没生效。先刷新本页再试；仍失败就在 AstrBot 插件页重载插件。",
     route_not_found: "当前页面请求的功能路由未注册；请把插件升级到最新版并重启 AstrBot 后重新打开。",
@@ -134,6 +139,15 @@ window.CompanionWorkbench = (() => {
   const e = value => String(value ?? "").replace(/[&<>"']/g, c =>
     ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
   const error = (code, confirmed = false) => Object.assign(new Error(code), {code, confirmed});
+  /* 读与写的等待预算分开。读取只是投影，15 s 足够，再久就该告诉用户「重新读取」；
+     写入要排宿主的 control lock、落库、轮换 edit token，把 15 s 用在同一档上
+     会让慢一点的保存全都变成「结果未确认」——那是最难处理的一种提示，因为用户
+     既不能重试也不能确认。写成功与否由 operation_key 幂等保证，等久一点不额外花代价。 */
+  const READ_TIMEOUT_MS = 15000;
+  const WRITE_TIMEOUT_MS = 60000;
+  /* 桥的默认预算是 18 s；要让它等得比页面这层更久，把读写的预算都传下去。
+     桥只接受 1000..300000 的整数，传错就会退回它自己的默认值。 */
+  const bridgeBudget = method => (method === "GET" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS);
   function relative(path) {
     if (typeof path !== "string" || !path.startsWith(PREFIX)) throw error("invalid_response");
     const route = path.slice(PREFIX.length);
@@ -158,6 +172,19 @@ window.CompanionWorkbench = (() => {
   const localized = (problem, fallback) => errors[problem?.code]
     || (isCode(problem?.message) ? errors[problem.message] : problem?.message)
     || fallback;
+  /* 「服务端已经看清请求并明确拒绝」的码：写入没有发生，重放同一个 operation_key
+     只会得到同一个拒绝。以前只认 configuration_revision_conflict，其余一律当成
+     「回执没回来」，于是页面挂上 pending、400ms 后自动重放，再失败再挂，用户
+     看到的就是「保存结果尚未确认（连接没有返回保存确认。）」且永远不结束——
+     而真相是这项设置根本不允许在角色层写。 */
+  const DEFINITIVE_CODES = new Set([
+    "configuration_scope_not_supported",
+    "unknown_configuration_field",
+    "invalid_configuration_patch",
+    "invalid_configuration_value",
+    "reply_configuration_invalid",
+    "expression_configuration_invalid",
+  ]);
   const icon = name => `<i data-lucide="${name}" aria-hidden="true"></i>`;
   let instanceSequence = 0;
   /* Short-lived stale-while-revalidate cache for workbench reads.  Page
@@ -660,7 +687,7 @@ window.CompanionWorkbench = (() => {
         + "<button type=\"button\" data-wb-word-remove=\"" + e(item.name) + "\""
         + " data-wb-word-index=\"" + index + "\" aria-label=\"删除 "
         + e(wordLabel(word)) + "\" title=\"删除\""
-        + (words.length <= (policy.minItems || 0) ? " disabled" : "")
+        + (locked || words.length <= (policy.minItems || 0) ? " disabled" : "")
         + ">" + icon("x") + "</button></span>").join("");
       const specialLabels = {newline: "换行", space: "空格", tab: "制表符"};
       const specialWords = {newline: "\n", space: " ", tab: "\t"};
@@ -894,7 +921,8 @@ window.CompanionWorkbench = (() => {
     const value = state.draft[name];
     const provenance = state.status?.provenance?.[name] || {};
     const inherited = provenance.explicit === false && provenance.layer !== null;
-    const layerEditable = !item.editable.length || item.editable.includes(item.writeLayer || container.writeLayer);
+    const layerEditable = item.noWriteLayer ? false
+      : !item.editable.length || item.editable.includes(item.writeLayer || container.writeLayer);
     const locked = state.locked() || !layerEditable;
     /* 控件已显示当前值；只有草稿覆盖继承值时，额外标出被替换的来源值。 */
     let label = item.label || name;
@@ -924,6 +952,12 @@ window.CompanionWorkbench = (() => {
       + (container.presentation === "journal" ? "" : railMarkup(state, name, item, state.status?.provenance, container))
       + `<div class="wb-field-main"><span class="wb-label">${label}</span>`
       + (item.help && container.presentation !== "journal" ? `<p class="wb-help" id="${e(helpId)}">${e(item.help)}</p>` : "")
+      /* 后端声明这一项在当前对象上不可写（`editable_layers` 不含本层）时，
+         控件是灰的：再让用户点保存只会换来一次必然失败的请求。灰掉的同时说清
+         「为什么、去哪里改」，否则用户只知道点不动。分区可以用 lockedHints
+         覆盖这句话。 */
+      + (!layerEditable ? `<p class="wb-help wb-locked-hint">${icon("lock")}${e(item.lockedHint
+        || "这一项在当前对象上不可写，请切换到它所属的对象后再修改。")}</p>` : "")
       + `<div class="wb-control">${controlMarkup(item, value, locked, state)}</div>`
       + `<p class="wb-field-error" id="${e(errorId)}" data-wb-field-error></p></div>`
       + `<div class="wb-field-side">${chip}${reset}</div></div>`;
@@ -1074,6 +1108,9 @@ window.CompanionWorkbench = (() => {
   function create(spec) {
     const {
       group, title, note = "", labels = {}, helps = {}, choices = {}, sections = null,
+      /* 按对象不可写的字段可以在这里配一句更具体的「去哪改」；没配的字段会显示
+         通用说明。两者都只影响提示文案，不改变可用性判断。 */
+      lockedHints = {},
       catalogs = {}, rows = {}, inputs = {}, suggestions = {}, segmentedChoices = [],
       visibility = {}, listFields = {}, chipOptions = {}, navigationLimit = 8,
       presentation = "", sectionTabPrefix = "", initialSection = null,
@@ -1130,6 +1167,8 @@ window.CompanionWorkbench = (() => {
        而不是留一份与继承值相同的显式副本。 */
     let resets_ = [];
     let autoRecoveryKey = "";
+    /* notifyStatus() 用：上一次推给订阅者的快照引用。 */
+    let lastNotified = null;
     let autoRecoveryTimer = null;
 
     const locked = () => state.busy || state.loading || !!state.pending || !state.status || state.denied;
@@ -1229,7 +1268,12 @@ window.CompanionWorkbench = (() => {
         fields[name] = contract(name, definitions[name], choices[name] || null);
         fields[name].label = labels[name] || name;
         fields[name].help = helps[name] || "";
+        fields[name].lockedHint = lockedHints[name] || "";
         fields[name].writeLayer = definitions[name].write_layer || "";
+        /* 分区显式写 `write_layer: null` 表示「这一项在当前对象上不接受写入」
+           （reply 分区对按群聊落库的字段就是这么标的）。缺省（undefined）只表示
+           分区没声明写入层，仍按继承链最后一层渲染——两者不能混为一谈。 */
+        fields[name].noWriteLayer = definitions[name].write_layer === null;
         /* 目录型控件（选项来自读取结果，如 TTS 扩展）与多行文本框行数。 */
         if (typeof catalogs[name] === "function") fields[name].catalog = catalogs[name];
         if (rows[name]) fields[name].rows = rows[name];
@@ -1299,9 +1343,27 @@ window.CompanionWorkbench = (() => {
            `path`（`route` 算完就被丢掉），于是宿主再拼一次插件名 →
            「未找到该路由」+「Plugin bridge endpoint is invalid.」。
            同一约定见 product-page.js 的 relative() 注释。 */
+        /* 写请求给的时间比读长：一次配置写入要在宿主的 control lock 里排队、落库、
+           轮换 edit token；服务器一慢（实测单次读取从 0.06 s 到 7.8 s 都有）就会
+           顶到 15 s，于是明明已经写进去的一次保存被报成「没有返回保存确认」。
+           真没回也不丢：pending 落在 sessionStorage，save() 立刻自核对一次。 */
+        const budget = method === "GET" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+        /* options 透给桥，product-page.js 才会按同一个预算去等宿主；
+           只改页面这层的话，桥仍会在 18 s 时先报超时。 */
+        const options = {timeoutMs: bridgeBudget(method)};
         const response = await Promise.race([
-          method === "GET" ? bridge.apiGet(route, query || body) : bridge.apiPost(route, body),
-          new Promise((_, reject) => {timer = setTimeout(() => reject(error("bridge_timeout")), 15000);}),
+          method === "GET" ? bridge.apiGet(route, query || body, options)
+            : bridge.apiPost(route, body, options),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              /* 桥自己也会超时并抛 bridge_timeout；谁先到就记谁，核对后的提示语
+                 才说得清是本地这层先放弃，还是连宿主的回执都没等到。 */
+              const late = error("bridge_timeout");
+              late.timeoutMs = budget;
+              late.timeoutStage = "page";
+              reject(late);
+            }, budget);
+          }),
         ]);
         const wrapped = isEnvelope(response) ? response : isEnvelope(response?.data) ? response.data : null;
         if (wrapped?.status === "error") throw error(codeOf(wrapped) || "invalid_response", true);
@@ -1370,6 +1432,15 @@ window.CompanionWorkbench = (() => {
         }
         return `${label}要填数字${item?.decimals ? `，最多 ${item.decimals} 位小数` : "，不能带小数"}。`;
       }
+      /* 账号 ID 列表：后端只收 ASCII 十进制、不带前导零的短数字串。
+         不在这里单独说清楚，用户看到的只会是「取值不合法，请核对」。 */
+      if (item?.input === "word-list" && item?.listPolicy?.numericIds) {
+        const words = parseStringList(value) || [];
+        const bad = words.find(word => !/^[0-9]+$/.test(word) || word.startsWith("0"));
+        if (bad !== undefined) {
+          return `${label}只填账号 ID（一串数字，不以 0 开头）：${visibleToken(bad) || "空条目"} 不是账号 ID。`;
+        }
+      }
       if (item?.hasBounds) {
         return `${label}的取值要在 ${toDisplay(item, item.minimum)} 到 ${toDisplay(item, item.maximum)} 之间。`;
       }
@@ -1403,8 +1474,22 @@ window.CompanionWorkbench = (() => {
       row.querySelector("[data-wb-field]")?.setAttribute?.("aria-invalid", "false");
     }
 
+    /* 只把「快照本身」推给订阅者，而且只在快照换了一帧时才推。
+       订阅者（决策页卡片、表达页预览）在自己的回调里会重画、甚至再读一次；
+       如果每次 paint 都推，就是「推→重画→再推」的死循环——同一次读取会
+       一连发十几个请求，界面也会停在半路。真实快照的引用只在读取与保存成功时
+       换新，按引用比较就足够跳过这些重入。 */
+    function notifyStatus() {
+      if (!onStatus) return;
+      const snapshot = state.status || null;
+      if (snapshot === lastNotified) return;
+      lastNotified = snapshot;
+      try { onStatus(snapshot); } catch (_) {}
+    }
+
     function paint() {
       const root = mountPoint();
+      notifyStatus();
       if (!root) return;
       if (!state.status && !state.loading) {
         root.innerHTML = noticeMarkup(state);
@@ -1957,6 +2042,14 @@ window.CompanionWorkbench = (() => {
         state.bad = true; state.ok = false; paint();
         return;
       }
+      /* 账号 ID 类词条在加入时就按后端的规则挡一次：等到点保存才被拒，
+         用户会看见「保存结果尚未确认」那种更像故障的提示。规则与 valid()
+         的同名字段一致（ASCII 十进制、不以 0 开头、20 位以内）。 */
+      if (policy.numericIds && (!/^[0-9]+$/.test(word) || word.startsWith("0") || word.length > 20)) {
+        state.notice = "主要成员只填账号 ID：一串数字，不以 0 开头，20 位以内（例如 123456789）。";
+        state.bad = true; state.ok = false; paint();
+        return;
+      }
       words.push(word);
       updateWordList(name, words, `已添加“${wordLabel(word)}”。`, true);
     }
@@ -2446,7 +2539,6 @@ window.CompanionWorkbench = (() => {
         else if (retried) state.notice = "";
         state.loading = false;
         paint();
-        if (onStatus) onStatus(value);
         if (state.pending) scheduleAutoRecovery(state.pending.operation_key, ticket);
         schedule();
         if (usedCache && !prefetched) {
@@ -2517,6 +2609,22 @@ window.CompanionWorkbench = (() => {
         for (const [name, value] of Object.entries(state.draft)) {
           if (value !== state.base[name]) changes[wireName(name)] = value;
         }
+        /* 当前对象上不可写的字段（按群聊落库的那种）不进请求：控件已经灰掉，
+           走到这里说明草稿是更早的一次编辑或会话恢复带来的。发出去只会被后端
+           以 configuration_scope_not_supported 拒绝，用户却要等一轮往返。 */
+        const blocked = Object.keys(state.draft)
+          .filter(name => state.container.fields[name]?.noWriteLayer && state.draft[name] !== state.base?.[name]);
+        if (blocked.length) {
+          const first = blocked[0];
+          state.bad = false;
+          state.notice = state.container.fields[first]?.lockedHint
+            || errors.configuration_scope_not_supported;
+          paint();
+          /* 说明已经写在这一行下面，把视线带过去就够了；灰掉的控件不该标成
+             「填错了」——它根本没有可填的入口。 */
+          fieldRow(first)?.scrollIntoView?.({block: "center", behavior: REDUCED() ? "auto" : "smooth"});
+          return;
+        }
         /* 恢复继承：这些字段要显式告诉后端「清掉本层的值」，
            而不是写一份和继承值相同的副本。 */
         const resets = Object.keys(state.draft).filter(name =>
@@ -2578,7 +2686,6 @@ window.CompanionWorkbench = (() => {
           state.stale = false;
           state.conflicts = {};
           resets_ = [];
-          if (onStatus) onStatus(fresh);
         }
         /* 🔴 保存成功后广播「这个分区已落盘」。
          *
@@ -2622,13 +2729,31 @@ window.CompanionWorkbench = (() => {
         state.busy = false;
         state.bad = true;
         const problemCode = problem?.code || (isCode(problem?.message) ? problem.message : "");
-        if (problem.confirmed || problemCode === "configuration_revision_conflict") {
+        /* 只有「真的没等到回执」才该落进 pending 去核对。服务端明确拒绝的码
+           （作用范围不支持、字段不认识、值不合法……）一律算没有写入：继续用同一个
+           operation_key 核对只会拿到同一个拒绝，却会把「保存结果尚未确认」挂成
+           常态。桥只转发 message，所以这些码多数情况下是从 message 认出来的。 */
+        const definitive = problem.confirmed || problemCode === "configuration_revision_conflict"
+          || DEFINITIVE_CODES.has(problemCode);
+        if (definitive) {
            state.pending = null; state.pendingReason = ""; savePending();
            clearAutoRecovery(request.operation_key);
            state.stale = problemCode === "configuration_revision_conflict";
            state.notice = localized(problem, "保存未通过。请读取当前设置后核对。");
         } else {
-           state.pendingReason = localized(problem, "连接没有返回保存确认。");
+           /* 「没有返回保存确认」最容易被误读成「写入失败」，而它其实只是没等到回执：
+              宿主的写请求要排 control lock，慢一点就会被页面这层的超时先截断，
+              写完的那次保存于是被报成未确认。写是幂等的（operation_key + edit_token），
+              所以确认结果不是失败：先挂着 pending 立刻核对一次，核对到就显示「已确认」，
+              核不到才把「结果未确认」留给用户。用户点「核对原保存结果」走的是同一条路径。 */
+           /* 原因仍以连接层的既有说法开头（「连接超时，请核对连接后重试。」这类
+              文案来自 errors 表，用户和测试都认得）；只有真的量到等待时长时才补一句
+              「等了多少秒、是谁先放弃」，说明这次不是写入失败而是没等到回执。 */
+           const base = localized(problem, "连接没有返回保存确认。");
+           const waited = Math.round((problem?.timeoutMs || 0) / 1000);
+           state.pendingReason = problemCode === "bridge_timeout" && waited
+             ? `${base}已等 ${waited} 秒${problem?.timeoutStage === "page" ? "（页面先放弃等待）" : ""}，正在核对`
+             : base;
            state.pending.pending_reason = state.pendingReason.slice(0, 512);
            if (problemCode) state.pending.pending_reason_code = problemCode.slice(0, 80);
            savePending();

@@ -113,6 +113,43 @@ class ModelFailureTests(ModelFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(private, str(tuple(self.runtime.read_one("SELECT * FROM model_call_failures", ()))))
         self.assertEqual([name for name, _ in self.called], ["primary"])
 
+    async def test_contract_rejected_answer_retries_the_configured_fallback(self):
+        prose = "今天下雨了，我把伞晾在门口，鞋也湿了半只。你那边呢？"
+        summary = ResponseDiagnostics(True, "stop", "contract_rejected",
+            raw=ResponseTextSummary.from_text(prose), parsed=ResponseTextSummary.from_text(prose),
+            failure=ModelFailure.WIRE_DECODE)
+        self.responses["primary"] = ProviderResponse(
+            "unknown", usage=Amount(12, 30), receipt_ref="primary:prose",
+            failure=ModelFailure.WIRE_DECODE, diagnostics=summary)
+
+        completion = await self.gateway.generate(self.model_run(), self.request())
+
+        self.assertEqual(completion.draft.text, "private draft")
+        self.assertEqual([name for name, _ in self.called], ["primary", "fallback"])
+        observed = self.gateway.observe(self.context, "task-1").unwrap()
+        self.assertEqual(observed["calls"][0]["failure"]["code"], ModelFailure.WIRE_DECODE.value)
+        self.assertEqual(observed["calls"][0]["response_diagnostics"], summary.to_record())
+        codes = [row["code"] for row in self.runtime.read_all(
+            "SELECT code FROM model_call_failures", ())]
+        self.assertIn(ModelFailure.WIRE_DECODE.value, codes)
+
+    async def test_contract_rejected_answer_without_a_fallback_stays_unknown(self):
+        self.patch_model(fallback="")
+        summary = ResponseDiagnostics(True, "stop", "contract_rejected",
+            raw=ResponseTextSummary.from_text("今天加班到八点，回家路上买了个烤红薯。"),
+            failure=ModelFailure.WIRE_DECODE)
+        self.responses["primary"] = ProviderResponse(
+            "unknown", usage=Amount(12, 30), receipt_ref="primary:prose",
+            failure=ModelFailure.WIRE_DECODE, diagnostics=summary)
+
+        with self.assertRaises(TaskError) as error:
+            await self.gateway.generate(self.model_run(), self.request())
+
+        self.assertEqual(error.exception.code, "model_usage_unknown")
+        self.assertEqual([name for name, _ in self.called], ["primary"])
+        self.assertEqual(self.gateway.observe(self.context, "task-1").unwrap()["calls"][0]
+                         ["failure"]["code"], ModelFailure.WIRE_DECODE.value)
+
     async def test_response_diagnostics_accept_only_bounded_error_metadata(self):
         summary = ResponseDiagnostics(False, failure=ModelFailure.TRANSPORT,
             error_type="RateLimitError", error_code="provider_rate_limited", status_code=429)

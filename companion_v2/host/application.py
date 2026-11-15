@@ -474,6 +474,8 @@ class CompanionApplication:
         # proactive body cannot contradict a stored fact. Memory stays optional:
         # an unwired host keeps generating contacts without it.
         self.proactive.attach_memory(self.memory)
+        if self.qzone is not None:
+            self.proactive.attach_qzone(self.qzone)
         self.proactive.role_state = self.role_state
         self.proactive.life_context = self.life_context
         self.proactive.expression_context = self.expression_style_context
@@ -511,6 +513,7 @@ class CompanionApplication:
                                    relationships=self.relationship_memories, weather_port=weather_port,
                                    role_state=self.role_state, authoring=self.authoring,
                                    web_search_factory=search_port_factory)
+        self.proactive.attach_tools(self.tools)
         self.messages.reply_settings = self.reply_settings
         self.messages.perception_settings = self.perception_settings
         self.acquaintance_settings = AcquaintanceSettings(self.configuration)

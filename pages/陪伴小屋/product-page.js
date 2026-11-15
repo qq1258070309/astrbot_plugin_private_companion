@@ -491,9 +491,17 @@ window.CompanionProduct = (() => {
   const diagnosticEndpoint = value => String(value || "").split("?", 1)[0]
     .replace(/(^|\/)targets\/[^/]+/g, "$1targets/:target")
     .replace(/(^|\/)roles\/[^/]+/g, "$1roles/:role");
+  /* 超时标出「谁先放弃」：页面外层（stage=parent）还是桥/宿主那层（stage=bridge，
+     由桥自己抛的 bridge_timeout 带过来）。写入是否生效由 operation_key 幂等保证，
+     但提示语要说得清是哪一段没等到回执，用户才知道该重发还是该核对。 */
   async function bounded(promise, timeoutMs = DEFAULT_API_TIMEOUT_MS) {
     let timer;
-    try { return await Promise.race([promise, new Promise((_,reject) => {timer = setTimeout(() => reject(fail("bridge_timeout")),timeoutMs);})]); }
+    try { return await Promise.race([promise, new Promise((_,reject) => {timer = setTimeout(() => {
+      const late = fail("bridge_timeout");
+      late.timeoutMs = timeoutMs;
+      late.timeoutStage = "parent";
+      reject(late);
+    },timeoutMs);})]); }
     finally { clearTimeout(timer); }
   }
   async function api(method, path, body, options) {
@@ -507,7 +515,14 @@ window.CompanionProduct = (() => {
       }
       /* 老版页面桥会把机器码放在 Error.message 或 Error.code 上，未必经过
          unwrap()。先把已知码送回同一张表，避免 setup-guide 直接显示英文串。 */
-      if (error.code && errors[error.code]) throw fail(error.code, error.confirmed === true);
+      if (error.code && errors[error.code]) {
+        const same = fail(error.code, error.confirmed === true);
+        /* 超时的等待时长与阶段要跟着码一起穿过去：工作台靠它写「等了多少秒、
+           是谁先放弃」，只丢码的话用户看到的还是笼统的「没有返回保存确认」。 */
+        if (error.timeoutMs) same.timeoutMs = error.timeoutMs;
+        if (error.timeoutStage) same.timeoutStage = error.timeoutStage;
+        throw same;
+      }
       if (CODE.test(error.message || "") && errors[error.message]) throw fail(error.message, error.confirmed === true);
       if (error.code) throw fail(error.code, error.confirmed === true);
       if (/initialized|explicit V2 profile/i.test(error.message)) throw fail("staging_not_initialized");
@@ -1344,13 +1359,17 @@ window.CompanionProduct = (() => {
       }
       // Preserve original response envelopes and error reasons for each workspace.
       timeoutMs=requestTimeout({timeoutMs:message.timeoutMs});
-      const execute=()=>bounded(method==="GET"?bridge.apiGet(mapped,message.body):bridge.apiPost(mapped,message.body),timeoutMs);
+      /* The budget the member page asked for has to reach the bridge too: the
+         bridge defaults to 18 s and would otherwise give up before a slow write
+         (configuration saves serialize on the host control lock) can answer. */
+      const budget = {timeoutMs};
+      const execute=()=>bounded(method==="GET"?bridge.apiGet(mapped,message.body,budget):bridge.apiPost(mapped,message.body,budget),timeoutMs);
       const retained=context.kind==="designer"&&method==="POST"&&["designer/turn","designer/drafts"].includes(path);
       const id=path==="designer/turn"?message.body?.request_id:message.body?.id;
       if(retained&&(typeof id!=="string"||!/^[a-f0-9]{32}$/.test(id)))throw fail("invalid_response");
       const result=await (retained?window.CompanionPersonaDesignerMemory.run(
         (path==="designer/turn"?"turn:":"save:")+id,execute,
-        path==="designer/turn"?()=>bridge.apiPost("persona-designer/cancel",{request_id:id}):undefined):execute());valid();
+        path==="designer/turn"?()=>bridge.apiPost("persona-designer/cancel",{request_id:id},budget):undefined):execute());valid();
       send({kind:"response",requestId:message.requestId,ok:true,data:result});
     } catch(error){
       /* 宿主页面桥对 status=error 只抛出 `new Error(message)`，不带 `code`；
@@ -1365,6 +1384,8 @@ window.CompanionProduct = (() => {
         method,endpoint:diagnosticEndpoint(path),elapsed_ms:Date.now()-startedAt,
         timeout_ms:timeoutMs,code:code||"unknown",confirmed:false,
       });
+      /* 超时的等待时长与阶段随响应一起回给成员页：成员页的「结果未确认」提示
+         要写清等了几秒、是页面外层先放弃还是桥没等到宿主回执。 */
       /* 一次失败只属于实际请求的那条来源路由，不能拿主页面当前选中的
          目标冒充；先从 endpoint 里的 target/role 反查标签，再退回当前选择。 */
       const routeTarget=/(?:^|\/)targets\/([^/]+)\/roles\/([^/]+)(?:\/|$)/.exec(path||"");
@@ -1375,7 +1396,9 @@ window.CompanionProduct = (() => {
       send({kind:"response",requestId:message.requestId,ok:false,
         error:errors[code]||reason||"请求未完成，请刷新核对当前状态后重试。",
         code:code||undefined,reason:reason||undefined,sourceLabel:sourceLabel||undefined,
-        confirmed:error?.confirmed===true});
+        confirmed:error?.confirmed===true,
+        timeoutMs:Number.isInteger(error?.timeoutMs)?error.timeoutMs:undefined,
+        timeoutStage:typeof error?.timeoutStage==="string"?error.timeoutStage.slice(0,16):undefined});
     }
   });
   function extensionsMarkup(ids) {

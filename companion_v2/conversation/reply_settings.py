@@ -78,6 +78,12 @@ GROUP_WAKEUP_PROMPT_FIELDS = frozenset(GROUP_WAKEUP_DEFAULTS) - GROUP_WAKEUP_TIM
 GROUP_WAKEUP_PREVIOUS_FIELDS = GROUP_WAKEUP_PROMPT_FIELDS - GROUP_WAKEUP_ADDED_FIELDS
 GROUP_WAKEUP_WORD_FIELDS = ("group_wakeup_direct_words", "group_wakeup_context_words",
                             "group_wakeup_interest_keywords", "group_wakeup_owner_direct_words")
+# 这两项一度只注册在群窗口上（角色层写入会被 role_settings.write 以
+# configuration_scope_not_supported 拒绝）。但决策页的「回应判断」编辑的正是角色
+# 默认值，页面顶部的选择器又只切角色、不切对象，于是这份名单在界面上根本存不进去：
+# 保存必被拒，页面再把拒绝翻成「保存结果尚未确认」。现在按 reviewed scope
+# （conversation.presentation = role_defaults_with_group_exceptions）改成
+# 角色默认值：角色层写默认名单，单个群窗口仍可各自覆盖。
 GROUP_WAKEUP_GROUP_FIELDS = frozenset(("group_wakeup_primary_member_ids", "group_wakeup_owner_direct_words"))
 GROUP_WAKEUP_LIMITS = {"group_wakeup_question_threshold": (0, 100),
                        "group_wakeup_cold_group_threshold": (0, 100),
@@ -142,7 +148,9 @@ ROLE_SHARED_FIELDS = (frozenset(asdict(SegmentationPolicy())) | SPACING_FIELDS
     | frozenset(GROUP_AIR_DEFAULTS)
     | frozenset(GROUP_CONTINUATION_DEFAULTS) | frozenset(PRIVATE_CLOSING_DEFAULTS)
     | frozenset(PRIVATE_DEBOUNCE_DEFAULTS)
-    | (frozenset(GROUP_WAKEUP_DEFAULTS) - GROUP_WAKEUP_GROUP_FIELDS)
+    # 群唤醒的全部字段都可以在角色层设默认值，包括主要成员名单与专属直呼词；
+    # 群窗口仍按窗口落库，写入时覆盖角色默认（见 RoleSharedSettingsOwner.write）。
+    | frozenset(GROUP_WAKEUP_DEFAULTS)
     | frozenset(GROUP_SAFETY_DEFAULTS) | frozenset(SILENCE_DEFAULTS) | frozenset(OUTBOUND_DEFAULTS) | frozenset(TEXT_DEFAULTS)
     | frozenset(FORWARD_DEFAULTS) | frozenset(CONTEXT_IMAGE_DEFAULTS)
     | frozenset(IMAGE_NARRATION_DEFAULTS) | frozenset(UNDERSTANDING_DEFAULTS)

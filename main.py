@@ -86,11 +86,15 @@ from .astrbot_host.event_routing import (
 from .astrbot_host.shared_host_migration import migrate_single_target_config
 from .astrbot_host.storage_location import prepare_storage_root, resolve_data_root
 from companion_v2.product import PRODUCT_VERSION
+from companion_v2.adapters.astrbot.memory_owner import read_memory_owner
 from companion_v2.diagnostics.inbound import InboundNoReplyLedger, SUPPRESSED, UNMET
 from companion_v2.conversation.private_reply_context import merged_input_sequence
 from .astrbot_host.integration_registry import UnifiedCompanionExtensionAPI
 from .astrbot_host.recalls import is_notice_event
 from .astrbot_host.stranger_notice import refuse_stranger
+from .astrbot_host.qq_pre_reply_reaction import (
+    apply_pre_reply_reaction, cancel_all_pre_reply_reactions, clear_pre_reply_reaction,
+)
 
 
 PLUGIN_NAME = "astrbot_plugin_private_companion"
@@ -176,6 +180,10 @@ class PrivateCompanionV2StagingPlugin(Star):
             self._startup_failure_key = None
             self._startup_failure_at = 0.0
             self._session_settings_warm_task = None
+            # QQ 空间凭据的后台看守：没人点「刷新凭据」时也要自己重取，
+            # 未连接时按档位私聊管理员。见 astrbot_host/qzone_credential_watch.py。
+            self._qzone_credential_watch = None
+            self._qzone_credential_task = None
             self.config = config if config is not None else {}
             default_data_root = resolve_data_root(Path(StarTools.get_data_dir(PLUGIN_NAME)).resolve())
             data_root = prepare_storage_root(default_data_root, self.config)
@@ -198,6 +206,13 @@ class PrivateCompanionV2StagingPlugin(Star):
             # One public facade exposes the body and its seven internal modules.
             # Independent third-party integrations use their documented APIs.
             self.extension_api = UnifiedCompanionExtensionAPI(self.staging)
+            # MemoryCompanion 1.10.5 reaches the live Star through
+            # ``get_private_companion_api()._plugin`` (personal-memory snapshot
+            # and bridge handshake).  V2 replaced the facade but never
+            # republished that back-reference, so the page silently fell back to
+            # an empty status.  Keep it as a plain back-reference: no data copy,
+            # no lifecycle ownership, released with the plugin instance.
+            self.extension_api._plugin = self
             global _ACTIVE_EXTENSION_API
             _ACTIVE_EXTENSION_API = self.extension_api
             try:
@@ -234,6 +249,59 @@ class PrivateCompanionV2StagingPlugin(Star):
             logger.warning("[CompanionV2] 初始化失败后清理导入模块失败", exc_info=True)
         finally:
             self._imports_retired = True
+
+    def _memory_companion_coordination_status(self) -> dict[str, Any]:
+        """Publish the live memory-owner handshake for the MemoryCompanion page.
+
+        ``page_api._private_companion_status()`` probes this method on the plugin
+        behind ``get_private_companion_api()``.  V1 published it; V2 dropped the
+        contract, so the personal-memory page kept rendering ``联动已降级`` with
+        ``bridge_status_unavailable`` -- that string is only the empty-dict
+        fallback, not a probe result.  Report the same ownership decision the
+        reply path uses plus the bridge's own lifecycle flag, so a genuinely
+        disabled bridge still degrades instead of being papered over.
+
+        Read-only: ``read_memory_owner`` is explicitly side-effect free.
+        """
+        try:
+            owner = read_memory_owner(getattr(self, "context", None))
+            ownership = owner.ownership
+            handle = owner.handle
+            lifecycle_getter = getattr(handle, "bridge_lifecycle_status", None)
+            active = True
+            if callable(lifecycle_getter):
+                try:
+                    lifecycle = lifecycle_getter()
+                    active = bool(lifecycle.get("active", True)) if isinstance(lifecycle, dict) else True
+                except Exception:
+                    active = False
+            healthy = bool(ownership.delegated and handle is not None and active)
+            if healthy:
+                reason = "memory_owner_active"
+            elif not ownership.delegated:
+                reason = ownership.reason or "memory_owner_inactive"
+            elif handle is None:
+                reason = "memory_owner_handle_missing"
+            elif not active:
+                reason = "bridge_lifecycle_inactive"
+            else:
+                reason = "memory_owner_inactive"
+        except Exception:
+            return {
+                "available": False,
+                "state": "degraded",
+                "degraded": True,
+                "reason": "handshake_unreadable",
+            }
+        return {
+            "available": healthy,
+            "state": "ready" if healthy else "degraded",
+            "degraded": not healthy,
+            "reason": reason,
+            "owner": ownership.owner,
+            "provider": ownership.provider,
+            "display_name": ownership.display_name,
+        }
 
     def _save_plugin_config(self, candidate: dict[str, Any]) -> None:
         previous = dict(self.config)
@@ -467,6 +535,7 @@ class PrivateCompanionV2StagingPlugin(Star):
         if self._session_settings_warm_task is None or self._session_settings_warm_task.done():
             self._session_settings_warm_task = asyncio.create_task(
                 warm_session_settings(), name="companion-v2-session-settings-warmup")
+        self._start_qzone_credential_watch()
         if self.staging.settings is None or not self.staging.settings.enabled:
             logger.info("[CompanionV2] 共享宿主已加载，等待账号与人格配置")
             return
@@ -561,6 +630,28 @@ class PrivateCompanionV2StagingPlugin(Star):
         if task is None or task.done():
             self._host_start_task = asyncio.create_task(
                 self._wait_for_host_start(), name="companion:host-startup")
+
+    def _start_qzone_credential_watch(self) -> None:
+        """Keep the Zone session fresh without a human clicking anything.
+
+        Started once per plugin instance and never restarted by a host reload:
+        the loop itself waits for a running session with an installed Zone
+        extension, so it costs one idle sleep per minute before that. The
+        acquire ladder and the "tell the administrator" text live in
+        ``companion_v2/qzone/credential.py``; this hook is only the wiring.
+        """
+        task = self._qzone_credential_task
+        if task is not None and not task.done():
+            return
+        try:
+            from .astrbot_host.qzone_credential_watch import QzoneCredentialWatch
+        except Exception as error:  # noqa: BLE001 - 看守起不来不该拦住整个插件
+            logger.warning("[CompanionV2] QQ 空间凭据看守未启动 error_type=%s", type(error).__name__)
+            return
+        watch = QzoneCredentialWatch(self.staging)
+        self._qzone_credential_watch = watch
+        self._qzone_credential_task = asyncio.create_task(
+            watch.run(), name="companion:qzone-credential-watch")
 
     async def _wait_for_host_start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1281,6 +1372,11 @@ class PrivateCompanionV2StagingPlugin(Star):
             await self._route_core_video_to_image_provider(event)
         except Exception as error:
             logger.warning("[CompanionV2] 视频视觉路由暂不可用 error_type=%s", type(error).__name__)
+        # 只有已唤醒、要回复的消息才会走到这个钩子；贴表情是纯附加反馈，
+        # 内部全程异常隔离，失败不会中断 AstrBot 的 LLM 请求。
+        await apply_pre_reply_reaction(
+            event, config=getattr(self, "config", None),
+            core_extra_key=CORE_REPLY_CONTEXT_EXTRA)
 
     @filter.on_llm_request(priority=250000)
     async def prepare_companion_core_request(self, event: AstrMessageEvent, req):
@@ -1325,6 +1421,8 @@ class PrivateCompanionV2StagingPlugin(Star):
             self._record_no_reply(event, "core_reply_authorization_changed", origin_key=origin_key,
                                   channel=channel, event_ref=event_ref, stage="model_request",
                                   turn=event_ref, code=code or "authorization_denied")
+            # 等待钩子已贴过表情，但这一轮授权失败不会回复：立刻撤掉。
+            await clear_pre_reply_reaction(event, reason="core_reply_denied")
             event.stop_event()
             return
         with measure_core_preparation(event, "prompt_injection", now=self.staging.now):
@@ -1649,6 +1747,8 @@ class PrivateCompanionV2StagingPlugin(Star):
 
     @filter.after_message_sent(priority=1000000)
     async def observe_companion_core_reply_sent(self, event: AstrMessageEvent):
+        # 回复已发出，等待表情可以撤了；分段发送会多次触发，清理是幂等的。
+        await clear_pre_reply_reaction(event, reason="reply_sent")
         from .astrbot_host.core_reply_voice_authoring import restore_core_voice_authoring
         self._private_reply_followups().finish(event)
         restore_core_voice_authoring(event)
@@ -1768,6 +1868,7 @@ class PrivateCompanionV2StagingPlugin(Star):
             logger.info("[CompanionV2] 窗口临时上下文已清理")
 
     async def terminate(self) -> None:
+        await cancel_all_pre_reply_reactions()
         extension_api = getattr(self, "extension_api", None)
         close_memory = getattr(extension_api, "close_memory_providers", None)
         if callable(close_memory):
@@ -1798,6 +1899,18 @@ class PrivateCompanionV2StagingPlugin(Star):
             startup_task.cancel()
             try:
                 await startup_task
+            except asyncio.CancelledError:
+                pass
+        watch = getattr(self, "_qzone_credential_watch", None)
+        watch_task = getattr(self, "_qzone_credential_task", None)
+        self._qzone_credential_watch = None
+        self._qzone_credential_task = None
+        if watch is not None:
+            watch.stop()
+        if watch_task is not None and not watch_task.done():
+            watch_task.cancel()
+            try:
+                await watch_task
             except asyncio.CancelledError:
                 pass
         retire_reset_marker = getattr(self, "_retire_context_reset_marker", None)

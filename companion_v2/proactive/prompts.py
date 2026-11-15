@@ -376,10 +376,34 @@ def prompt_sections():
     return tuple(sections)
 
 
+ZONE_INSTRUCTION = """【顺带发 QQ 空间】本轮聊完后，若刚才的念头本身就值得当成一条公开说说（不是把私聊内容原样搬出去），可以再调用 qzone.post.publish 发一条；纯问候、无内容的寒暄、涉及对方隐私或只在私聊成立的话不发。
+说说要能脱离私聊单独读：用角色自己的口吻写具体的一件事、一个念头或一点心情，不点名对方、不带私聊细节、不写「回复我」「来找我」一类只对某个人成立的话。
+主题与场景照 QZONE 目录选，confidence 按真实把握填，材料不足就低分或干脆不发；被拒绝时按返回原因收手，不要换个说法重试，也不要因为能发就每轮都发。这段只是允许，不是任务；没有任何值得公开的内容时跳过不影响本轮回复。"""
+
+
+def zone_instruction(zone):
+    """The Zone invitation for one contact, or nothing when it cannot go out.
+
+    The QQ Zone extension shipped as four tools and a topic catalogue, but no
+    background worker ever offered them: the contact prompt never mentioned the
+    Zone, so the model had no reason to open it, and the publish counter stayed
+    at zero on a role whose publish consent was already granted. The invitation
+    is attached only when this exact window may actually publish, so a contact
+    in a window without consent is never told about a tool it will not receive.
+    """
+    from companion_v2.qzone.topic_prompt import CONVERSATION_GUIDANCE
+    if not zone.get("publish_allowed"):
+        return ""
+    remaining = zone.get("remaining_today")
+    budget = ("今天还能发 1 条。" if remaining == 1 else
+              "今天还能发 %s 条。" % remaining if isinstance(remaining, int) else "")
+    return ZONE_INSTRUCTION + budget + "\n" + CONVERSATION_GUIDANCE
+
+
 def request_for(job, records, preferences, history=(), *, last_reply=None, reply_for_dedup=True,
                 reactions_available=False,
                 voice_available=False, poke_available=False, memory=(), expression=(), dialogue=(),
-                rhythm_snapshot=None, role_state=None, recent_life=None):
+                rhythm_snapshot=None, role_state=None, recent_life=None, zone=None):
     """One proactive prompt; memory is optional material, never a requirement.
 
     The proactive path had no memory entry point at all, so a stored fact (for
@@ -416,6 +440,10 @@ def request_for(job, records, preferences, history=(), *, last_reply=None, reply
         contact_intent["role_state"] = role_state
     if recent_life is not None and not administrator_test:
         contact_intent["recent_life"] = recent_life
+    if zone is not None and not administrator_test:
+        # Only the counts and the day: the body of an earlier post is not this
+        # contact's material, and the model must not be able to quote it back.
+        contact_intent["zone"] = zone
     materials = [PromptMaterial(GROUP, "contact_intent", json.dumps(contact_intent, ensure_ascii=False))]
     materials.extend(evidence_materials(records))
     if job.interaction is not None and not administrator_test:
@@ -496,6 +524,7 @@ def request_for(job, records, preferences, history=(), *, last_reply=None, reply
                           ("\n" + "\n".join(origin_instructions) if origin_instructions else "") +
                           ("\n" + news_instruction if news_instruction else "") +
                           ("\n" + greeting_instruction if greeting_instruction else "") +
+                         ("\n" + zone_instruction(zone) if zone is not None and not administrator_test else "") +
                          ("\n" + REACTION_INSTRUCTION if reactions_available else "") +
                           ("\n" + voice_instruction(getattr(job, "voice_policy", None),
                               preferences.values["voice_action_max_chars"]) if voice_available else "") +

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 from typing import Mapping, Protocol
 
@@ -12,6 +14,27 @@ from companion_v2.storage.runtime import StorageRuntime
 
 from .models import ConfigTarget, ConfigurationError, EffectiveValue, Scalar, encode
 from .registry import FieldDefinition
+
+
+# A read scope answers repeated reads of one target from the first answer. It is
+# only ever entered around one synchronous discovery pass on the event-loop
+# thread, and every writer in this tree runs on that same thread, so no write can
+# land between two reads inside the scope: the cached answer is the same answer,
+# not an older one. It exists because expression discovery asks for the same
+# role-level target once per stored window -- 144 byte-identical reads per pass
+# against a 361-row table, measured as the dominant share of a 30 s loop stall.
+_READ_SCOPE: ContextVar[dict[tuple[str, str, tuple[str, ...]], "OwnerSnapshot"] | None] = (
+    ContextVar("configuration_read_scope", default=None))
+
+
+@contextmanager
+def stable_repeated_reads():
+    """Collapse repeated reads of one configuration target within this block."""
+    token = _READ_SCOPE.set({})
+    try:
+        yield
+    finally:
+        _READ_SCOPE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -56,6 +79,12 @@ class SparseConfigurationOwner:
 
     def read(self, target: ConfigTarget, fields: tuple[FieldDefinition, ...]) -> OwnerSnapshot:
         ids = tuple(field.field_id for field in fields)
+        scope = _READ_SCOPE.get()
+        scope_key = (self.owner_id, target.key, ids) if scope is not None else None
+        if scope is not None:
+            cached = scope.get(scope_key)
+            if cached is not None:
+                return cached
         placeholders = ",".join("?" for _ in ids)
         layers = target.chain()
         revision = 0
@@ -81,7 +110,10 @@ class SparseConfigurationOwner:
                     value = field.validate(stored_value)
                     source = layer
             effective[field.field_id] = EffectiveValue(value, source, source == target, source_revision)
-        return OwnerSnapshot(revision, tuple(dependencies), effective)
+        snapshot = OwnerSnapshot(revision, tuple(dependencies), effective)
+        if scope is not None:
+            scope[scope_key] = snapshot
+        return snapshot
 
     def write(
         self, target: ConfigTarget, fields: tuple[FieldDefinition, ...], *,

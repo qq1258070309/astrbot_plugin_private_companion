@@ -217,6 +217,9 @@ window.CompanionConfigEditors = (() => {
     {id: "topics", title: "主题判定",
      help: "一条说说在写出正文之前必须先定主题与场景：这里决定谁来定、要不要人工确认，以及给模型的补充指引。",
      fields: ["topic_auto_enabled", "topic_require_confirmation", "topic_prompt_guidance"]},
+    {id: "credential", title: "凭据与通知",
+     help: "登录凭据不由这一组填写：cookie 一直留在宿主侧，页面不显示也不保存。这里只决定凭据失效时要不要私聊管理员；自动重取本身一直进行，1 分钟起逐级放大到 24 小时。",
+     fields: ["credential_admin_notice"]},
     ...QZONE_TOPIC_SECTIONS.map(topic => ({
       id: topic.prefix,
       title: topic.title,
@@ -1578,7 +1581,7 @@ window.CompanionConfigEditors = (() => {
      * 值按角色共享，窗口层只作为旧值的回落，
      * 卡片右上角那句由内核按继承链写，不需要自己声明 scopeNote。
      *
-     * 注册表里这一组是 47 项：9 项全局 + 7 个主题各 5 项。主题那 35 项由下面
+     * 注册表里这一组是 48 项：10 项全局（含「凭据未连接时私聊管理员」）+ 7 个主题各 5 项。主题那 35 项由下面
      * 两张表拼出来——47 个字段名手写一遍，漏一个不会有任何报错，只会让审计
      * 报「没有控件声明」；场景取值也必须与后端 topics.py 的 TOPIC_SPECS 一致，
      * 多写一个合法的场景 id 会在后端整组校验时被拒（那个场景不属于这个主题）。 */
@@ -1598,6 +1601,7 @@ window.CompanionConfigEditors = (() => {
         topic_auto_enabled: "允许模型自行发布",
         topic_require_confirmation: "主题必须人工确认",
         topic_prompt_guidance: "补充表达指引",
+        credential_admin_notice: "凭据未连接时私聊管理员",
         ...Object.fromEntries(QZONE_TOPIC_SECTIONS.flatMap(({prefix, title}) => [
           [prefix + "_enabled", title + " · 启用"],
           [prefix + "_scenes", title + " · 允许的场景"],
@@ -1619,6 +1623,7 @@ window.CompanionConfigEditors = (() => {
         topic_auto_enabled: "开启后才允许模型在无需人工确认的情况下自行发布；默认关闭，关着时模型提出的主题必须有人确认。",
         topic_require_confirmation: "开启时模型提出的主题必须有人确认才能发布；默认开启，只有上面那项打开且这一项关闭，模型才可能不经过确认就发。",
         topic_prompt_guidance: "给模型的补充表达指引（例如口吻、篇幅、不要写什么）；只影响怎么写，不改主题目录、场景放行与任何授权。",
+        credential_admin_notice: "开启后，QQ 空间凭据连续失效会私聊管理员一条消息：失败次数、原因、下次自动重试的时间；恢复时补一句「已恢复」。每个档位只发一条，不会反复打扰。关掉只是不说话——后台仍按 1 分钟、5 分钟、10 分钟、20 分钟、30 分钟、1 小时、2 小时、3 小时、6 小时、12 小时、24 小时自动重取。",
         ...Object.fromEntries(QZONE_TOPIC_SECTIONS.flatMap(({prefix, title, scenes}) => [
           [prefix + "_enabled", "关闭后这个主题的说说一律不发，模型提出的该主题会被拒；不影响其他主题。"],
           [prefix + "_scenes", `这个主题允许出现在哪些场景，用半角逗号分隔，只能填该主题自己的场景：${qzoneSceneWords(scenes)}。留空、重复或写了别的场景会被后端拒绝；多个场景之间没有优先级。`],

@@ -41,6 +41,9 @@ DEFAULTS = {
     "topic_auto_enabled": False,
     "topic_require_confirmation": True,
     "topic_prompt_guidance": "",
+    # 凭据坏了以后要不要私聊管理员。自动重取本身一直进行（1 分钟 → 24 小时逐级
+    # 递推，见 companion_v2/qzone/credential.py），这一项只决定"说不说"。
+    "credential_admin_notice": True,
 }
 for _topic in TOPIC_SPECS:
     _key = _topic.topic.value
@@ -65,7 +68,8 @@ for _topic in TOPIC_SPECS:
         f"{_key}_cooldown_minutes": (0, 1440),
     })
 BOOLEAN_FIELDS = ("enabled", "like_enabled", "comment_enabled", "publish_enabled",
-                  "topic_auto_enabled", "topic_require_confirmation") + tuple(
+                  "topic_auto_enabled", "topic_require_confirmation",
+                  "credential_admin_notice") + tuple(
                       f"{item.topic.value}_enabled" for item in TOPIC_SPECS)
 INTEGER_FIELDS = tuple(LIMITS)
 PROBABILITY_FIELDS = tuple(f"{item.topic.value}_min_confidence" for item in TOPIC_SPECS)

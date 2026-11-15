@@ -11,6 +11,14 @@ const appPage = fs.readFileSync(path.resolve(__dirname, PAGE + 'app.js'), 'utf8'
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const drains = async (times = 8) => { for (let index = 0; index < times; index += 1) await flush(); };
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+/* 有的挂载路径要跨一个宏任务才把请求排进 harness（refresh 的 await 链里夹着
+   setTimeout）。只冲 setImmediate 的 drains() 遇到这种时序时 requests[i] 还是空的，
+   负责分区检查的那条用例因此在 HEAD 上就会随机失败。等请求出现再解，比无条件
+   加长 drains 更精确，也不拖慢其它用例。 */
+const requestAt = async (harnessed, index) => {
+  for (let attempt = 0; attempt < 200 && !harnessed.requests[index]; attempt += 1) await wait(5);
+  return harnessed.requests[index];
+};
 const TOKEN = 'a'.repeat(64);
 const PREFIX = '/astrbot_plugin_private_companion/';
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -108,7 +116,6 @@ const LIMITS = {
   file_understanding_timeout_seconds: [1, 30],
   reply_diagnostic_limit: [10, 300],
 };
-const GROUP_SCOPE_FIELDS = new Set(['group_wakeup_primary_member_ids', 'group_wakeup_owner_direct_words']);
 const FIELDS = Object.fromEntries(Object.entries(DEFAULTS).map(([name, value]) => {
   const kind = name === 'part_gap_log_base' ? 'weight'
     : ['voice_probability', 'voice_primary_mention_probability',
@@ -124,11 +131,12 @@ const FIELDS = Object.fromEntries(Object.entries(DEFAULTS).map(([name, value]) =
     'private_closing_guard_prompt_enabled', 'recall_silence_enabled',
     'private_debounce_enabled', 'private_debounce_min_ms', 'private_debounce_max_ms',
     'private_debounce_total_ms',
-    ...Object.keys(DEFAULTS).filter(name => name.startsWith('group_wakeup_') && !GROUP_SCOPE_FIELDS.has(name)),
+    /* 群唤醒字段（含主要成员名单与专属直呼词）都是角色默认值：
+       角色层可写，群窗口写入时覆盖角色默认。 */
+    ...Object.keys(DEFAULTS).filter(name => name.startsWith('group_wakeup_')),
   ]);
   const entry = {kind, default: value, apply_mode: 'immediate',
-    editable_layers: GROUP_SCOPE_FIELDS.has(name) ? ['window']
-      : roleShared.has(name) ? ['role', 'window'] : ['window']};
+    editable_layers: roleShared.has(name) ? ['role', 'window'] : ['window']};
   entry.write_layer = 'window';
   if (LIMITS[name]) [entry.minimum, entry.maximum] = LIMITS[name];
   if (kind === 'probability') Object.assign(entry, {minimum: 0, maximum: 1, decimal_places: 2});
@@ -339,8 +347,68 @@ test('group wakeup controls keep the selected group override', async () => {
   const instance = live(harnessed);
   assert.deepEqual(instance.state.container.fields.group_wakeup_enabled.editable, ['role', 'window']);
   assert.equal(instance.state.container.fields.group_wakeup_enabled.writeLayer, 'window');
+  /* 主要成员名单/专属直呼词也是角色默认值：决策页（角色层）能保存，
+     群窗口写入时覆盖角色默认。它们曾被标成只能按群聊写，结果页面上存不进去。 */
+  for (const name of ['group_wakeup_primary_member_ids', 'group_wakeup_owner_direct_words']) {
+    assert.deepEqual(instance.state.container.fields[name].editable, ['role', 'window'], name);
+  }
   assert.match(harnessed.slots.settings.innerHTML,
     /data-rail="group_wakeup_enabled"[\s\S]*data-layer="window"/);
+});
+
+test('a field the backend marks unwritable is greyed out and never sent', async () => {
+  /* reply 分区用 write_layer:null + editable_layers:[] 表示「这一项在当前对象上
+     不接受写入」。空 editable 过去被当成「哪层都能写」，控件可填、保存必被后端
+     拒，再被翻译成「保存结果尚未确认（连接没有返回保存确认。）」。 */
+  const unwritable = () => {
+    const base = status();
+    base.fields = {...base.fields, group_wakeup_context_words: {
+      ...base.fields.group_wakeup_context_words, write_layer: null, editable_layers: []}};
+    return base;
+  };
+  const harnessed = harness();
+  harnessed.page.mount(harnessed.root, {view: 'decision'});
+  await drains();
+  harnessed.requests[0].resolve(unwritable());
+  await drains();
+  const instance = live(harnessed);
+  const html = harnessed.slots.settings.innerHTML;
+  assert.match(html, /class="wb-field[^"]*is-layer-locked" data-wb-row="group_wakeup_context_words"/);
+  assert.match(html, /data-wb-word-input="group_wakeup_context_words"[^>]*disabled/);
+  assert.match(html, /data-wb-row="group_wakeup_context_words"[\s\S]*?不可写/);
+  assert.doesNotMatch(html, /class="wb-field[^"]*is-layer-locked" data-wb-row="group_wakeup_direct_words"/);
+
+  /* 会话里带回来的旧草稿也不该把不可写字段发给后端。 */
+  instance.state.draft.group_wakeup_context_words = '["观星"]';
+  const before = harnessed.requests.length;
+  await instance.save(false);
+  await drains();
+  assert.equal(harnessed.requests.length, before, 'the locked field never reaches the server');
+  assert.equal(instance.state.pending, null);
+  assert.match(instance.state.notice, /不支持在当前对象上保存/);
+});
+
+test('a scope rejection is reported as rejected instead of an unconfirmed save', async () => {
+  /* 页面桥只转发 message，后端码常以 Error.message 的身份到达（没有 code、没有
+     confirmed）。这种「服务端已经明确拒绝」的回执不能落进 pending 反复核对：
+     重放同一个 operation_key 只会得到同一个拒绝，用户看到的却永远是
+     「保存结果尚未确认」。 */
+  const harnessed = await loaded(harness(), 'decision');
+  const instance = live(harnessed);
+  instance.state.draft.group_wakeup_direct_words = '["小星"]';
+  const saving = instance.save(false);
+  await drains();
+  const request = harnessed.requests[harnessed.requests.length - 1];
+  request.reject(new Error('configuration_scope_not_supported'));
+  await saving;
+  await drains();
+  assert.equal(instance.state.pending, null, 'a definitive rejection is not a pending write');
+  assert.doesNotMatch(instance.state.notice, /尚未确认/);
+  assert.match(instance.state.notice, /不支持在当前对象上保存/);
+  const settled = harnessed.requests.filter(entry => entry.route.endsWith('/configure')).length;
+  await wait(600);
+  assert.equal(harnessed.requests.filter(entry => entry.route.endsWith('/configure')).length, settled,
+    'no automatic replay after a definitive rejection');
 });
 
 test('a window override can be cleared through the role inheritance control', async () => {

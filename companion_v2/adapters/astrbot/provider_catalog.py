@@ -155,6 +155,33 @@ def loaded_routing(fallback_provider_id, replacement_rules, provider_ids):
     return fallback, encoded
 
 
+def routed_fallback(profiles, fallback_provider_id, providers):
+    """Honour the saved fallback route for task profiles that can use it.
+
+    Reply profiles are assembled with ``default_fallback`` already; background
+    profiles are built from the primary provider alone, so their ``fallback``
+    field defaults to that same provider and the router collapses the chain to a
+    single entry. Attaching the saved fallback here is what lets a structurally
+    unusable primary answer be retried on the fallback instead of failing the
+    whole task. Profiles the fallback cannot serve keep their original route.
+    """
+    loaded = [item.local_provider() if callable(getattr(item, "local_provider", None)) else item
+              for item in providers]
+    fallback = next((item for item in loaded if item.binding.provider == fallback_provider_id), None)
+    if fallback is None:
+        return tuple(profiles)
+    capable = set(fallback.capabilities)
+    routed = []
+    for profile in profiles:
+        if (profile.default_fallback or profile.default_provider == fallback_provider_id
+                or not set(profile.capabilities).issubset(capable)
+                or profile.max_output_tokens > fallback.maximum_output_tokens):
+            routed.append(profile)
+        else:
+            routed.append(replace(profile, default_fallback=fallback_provider_id))
+    return tuple(routed)
+
+
 def assemble_providers(context, *, bridge, native_types, primary_id, additional=(), defaults=None):
     """Expose every loaded, verified AstrBot text provider to V2 routing.
 

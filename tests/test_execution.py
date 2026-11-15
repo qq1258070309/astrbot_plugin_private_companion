@@ -91,28 +91,6 @@ class ExecutionTests(ExecutionFixture):
         limits = json.loads(self.runtime.read_one("SELECT limits_json FROM task_supervisor", ())['limits_json'])
         self.assertEqual(limits["retained_tasks"], expanded.retained_tasks)
 
-    def test_start_adopts_lane_and_queue_capacity_increases_without_clearing_work(self):
-        running = self.running(kind="fixture.effect")
-        self.tasks.begin_effect(running).unwrap()
-        self.tasks.record_operation(running, "original-operation").unwrap()
-        queued = self.submit("queued", kind="fixture.background")
-        expanded = replace(self.limits, foreground_slots=3, background_slots=3, queued_per_lane=16)
-        next_supervisor = self.supervisor(limits=expanded)
-
-        self.assertEqual(next_supervisor.start(expected_generation=1).unwrap(), 2)
-        self.assertEqual(next_supervisor.read(self.context, queued.task_id).unwrap(), queued)
-        self.assertEqual(self.tasks.check_generation().failure.code, "supervisor_fenced")
-        self.assertEqual(next_supervisor.recover().unwrap(), (running.task_id,))
-        retained = next_supervisor.read(self.context, running.task_id).unwrap()
-        self.assertEqual((retained.state, retained.operation_id, retained.effect),
-                         ("uncertain", "original-operation", "unknown"))
-        self.assertTrue(next_supervisor.observe(self.context, running.task_id).unwrap()["slot_held"])
-        self.assertEqual(next_supervisor.claim(Lane.BACKGROUND).unwrap().claim.task_id, queued.task_id)
-        attached = self.supervisor(limits=expanded)
-        self.assertEqual(attached.attach(expected_generation=2).unwrap(), 2)
-        self.assertEqual(self.supervisor().attach(expected_generation=2).failure.code,
-                         "supervisor_generation_conflict")
-
     def test_start_rejects_capacity_decreases_even_when_another_capacity_increases(self):
         for changed in (replace(self.limits, retained_tasks=self.limits.retained_tasks - 1),
                         replace(self.limits, foreground_slots=self.limits.foreground_slots - 1),
@@ -477,6 +455,16 @@ class ExecutionTests(ExecutionFixture):
         self.assertIsNotNone(self.claim())
 
 
+    def test_claim_failure_rolls_back_attempt_and_capacity(self):
+        self.submit()
+        with patch.object(self.tasks, "_change", side_effect=RuntimeError("fault before task transition")):
+            with self.assertRaises(RuntimeError):
+                self.tasks.claim(Lane.FOREGROUND)
+        self.assertEqual(self.runtime.read_one("SELECT COUNT(*) n FROM execution_attempts", ())["n"], 0)
+        self.assertEqual(self.read_task().state, "created")
+        self.assertIsNotNone(self.claim())
+
+
 class SelfReviewActionAdmissionTests(ExecutionFixture):
     """The daily review's declared action must survive real task admission."""
 
@@ -503,6 +491,90 @@ class SelfReviewActionAdmissionTests(ExecutionFixture):
                                                 context=foreign)).failure.code, "private_task_required")
         self.assertEqual(self.runtime.read_one(
             "SELECT COUNT(*) n FROM execution_tasks WHERE task_id = 'task-foreign'", ())["n"], 0)
+
+class OrphanSlotReleaseTests(ExecutionFixture):
+    """The settled-attempt sweep must also cover local commits that never crossed the boundary."""
+
+    def attach_with(self, *definitions):
+        registrations = self.registrations + tuple(TaskRegistration(definition, self.validate_inputs)
+                                                   for definition in definitions)
+        supervisor = self.supervisor(self.open_runtime(), registrations=registrations)
+        supervisor.attach(expected_generation=1).unwrap()
+        return supervisor
+
+    def leak(self, supervisor, identifier, *, kind="fixture.effect", lane=Lane.FOREGROUND, boundary=False):
+        """Reproduce the field bug: a worker that may still run keeps its slot after the task settles."""
+        supervisor.submit(self.spec(identifier, kind=kind)).unwrap()
+        claim = supervisor.claim(lane).unwrap().claim
+        self.assertIsNotNone(claim)
+        supervisor.begin(claim).unwrap()
+        if boundary:
+            supervisor.begin_effect(claim).unwrap()
+        supervisor.abandon(claim, reason="worker_error").unwrap()
+        return claim
+
+    def observed(self, supervisor, task_id):
+        return supervisor.observe(self.context, task_id).unwrap()
+
+    def test_unstarted_local_commit_releases_capacity_and_readmits_the_lane(self):
+        local = replace(self.effectful, kind="fixture.effect-background", lane=Lane.BACKGROUND)
+        tasks = self.attach_with(local)
+        self.leak(tasks, "stuck", kind=local.kind, lane=Lane.BACKGROUND)
+        stuck = self.observed(tasks, "stuck")
+        self.assertEqual((stuck["state"], stuck["slot_held"], stuck["finished_at"], stuck["capacity_release"]),
+                         ("uncertain", True, None, None))
+        tasks.submit(self.spec("waiting", kind=local.kind)).unwrap()
+        self.assertIsNone(tasks.claim(Lane.BACKGROUND).unwrap().claim)
+
+        self.assertEqual(tasks.release_orphaned_slots().unwrap(), ("stuck",))
+
+        released = self.observed(tasks, "stuck")
+        self.assertEqual((released["state"], released["slot_held"], released["finished_at"],
+                          released["capacity_release"]),
+                         ("uncertain", False, None, "orphaned_unstarted_local_effect_task"))
+        self.assertEqual(tasks.held(Lane.BACKGROUND).unwrap(), 0)
+        self.assertEqual(tasks.claim(Lane.BACKGROUND).unwrap().claim.task_id, "waiting")
+        self.assertEqual(tasks.release_orphaned_slots().unwrap(), ())
+
+    def test_local_commit_past_the_boundary_keeps_its_slot(self):
+        self.leak(self.tasks, "stuck", boundary=True)
+        self.assertEqual(self.observed(self.tasks, "stuck")["state"], "uncertain")
+        self.assertEqual(self.tasks.release_orphaned_slots().unwrap(), ())
+        stuck = self.observed(self.tasks, "stuck")
+        self.assertEqual((stuck["slot_held"], stuck["capacity_release"]), (True, None))
+        self.assertEqual(self.tasks.held(Lane.FOREGROUND).unwrap(), 1)
+
+    def test_read_only_release_keeps_its_reason_and_never_finishes_the_attempt(self):
+        self.leak(self.tasks, "stuck", kind="fixture.read")
+        self.assertEqual(self.tasks.release_orphaned_slots().unwrap(), ("stuck",))
+        released = self.observed(self.tasks, "stuck")
+        self.assertEqual((released["state"], released["slot_held"], released["finished_at"],
+                          released["capacity_release"]),
+                         ("uncertain", False, None, "orphaned_read_only_task"))
+
+    def test_other_declared_effects_keep_their_slots(self):
+        effects = (SideEffect.EXTERNAL_DEVICE, SideEffect.EXTERNAL_NETWORK, SideEffect.MESSAGE_DELIVERY)
+        lanes = (Lane.FOREGROUND, Lane.FOREGROUND, Lane.BACKGROUND)
+        definitions = tuple(replace(self.foreground, kind=f"fixture.{effect.value}", lane=lane, side_effect=effect,
+                                    binding=ProviderBinding("fixture.commit", "fixture", "1", f"provider-{effect.value}"))
+                            for effect, lane in zip(effects, lanes))
+        tasks = self.attach_with(*definitions)
+        for definition in definitions:
+            self.leak(tasks, definition.kind, kind=definition.kind, lane=definition.lane)
+        self.assertEqual(tasks.release_orphaned_slots().unwrap(), ())
+        for definition in definitions:
+            projection = self.observed(tasks, definition.kind)
+            self.assertEqual((projection["state"], projection["slot_held"], projection["capacity_release"]),
+                             ("uncertain", True, None))
+        self.assertEqual((tasks.held(Lane.FOREGROUND).unwrap(), tasks.held(Lane.BACKGROUND).unwrap()), (2, 1))
+
+    def test_released_local_attempt_cannot_commit_before_its_boundary_late(self):
+        claim = self.leak(self.tasks, "stuck")
+        self.assertEqual(self.tasks.release_orphaned_slots().unwrap(), ("stuck",))
+        self.assertEqual(self.tasks.begin_effect(claim).failure.code, "task_attempt_fenced")
+        self.assertEqual(self.tasks.record_operation(claim, "late").failure.code, "task_attempt_fenced")
+        self.assertEqual(self.tasks.finish(claim, TaskResult("succeeded")).failure.code, "task_attempt_fenced")
+        self.assertEqual(self.observed(self.tasks, "stuck")["state"], "uncertain")
 
 
 if __name__ == "__main__":

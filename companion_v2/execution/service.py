@@ -34,6 +34,17 @@ from .models import (
 
 logger = getLogger(__name__)
 
+#: Upper bound for the optional per-attempt diagnostic recorded by ``stop``.
+DETAIL_LIMIT = 240
+
+#: Declared effects whose commit cannot outlive this runtime, mapped to the release reason
+#: recorded on the attempt. Only these may be settled without host stop evidence, and only
+#: while the attempt provably never crossed the effect boundary.
+ORPHAN_SLOT_RELEASE_LABELS = MappingProxyType({
+    SideEffect.NONE.value: "orphaned_read_only_task",
+    SideEffect.LOCAL.value: "orphaned_unstarted_local_effect_task",
+})
+
 
 def outcome(method):
     @wraps(method)
@@ -123,6 +134,11 @@ class TaskSupervisor:
             if row and row["limits_json"] != encode(self.limits):
                 previous = json.loads(row["limits_json"])
                 current = asdict(self.limits)
+                # 7.1.0 的上游语义：任何配额「只增不减」都能接管——更大的车道或队列
+                # 预算不会让已保留的任务失效，新 generation 仍然把旧 supervisor 挡在外面，
+                # 在跑的 attempt 继续持有原来的槽位。我方 7.0.0 曾更严（只认
+                # retained_tasks 单字段扩容），但那会让调大并发后的重启直接拒绝启动，
+                # 属于过度约束，这里回到上游语义。
                 capacity_only_increase = (
                     set(previous) == set(current)
                     and all(type(previous[key]) is int and previous[key] <= value
@@ -131,9 +147,6 @@ class TaskSupervisor:
                 retained = connection.execute("SELECT COUNT(*) FROM execution_tasks").fetchone()[0]
                 if not capacity_only_increase or retained > current["retained_tasks"]:
                     raise TaskError("supervisor_limits_changed", "only safe task capacity increases can be adopted at startup")
-                # A larger lane or queue budget does not invalidate retained
-                # work. The new generation still fences previous supervisors;
-                # existing attempts continue to hold their original slots.
             generation = expected_generation + 1
             connection.execute("""INSERT INTO task_supervisor VALUES (1, ?, ?, ?)
                 ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation,
@@ -348,6 +361,21 @@ class TaskSupervisor:
     def read(self, context: TaskContext, task_id: str) -> TaskRecord:
         with self.runtime.read_snapshot():
             return self._record(self._owned(context, task_id, self._now()))
+
+    @outcome
+    def held(self, lane: Lane) -> int:
+        """Count the slots an exact claim competes for in one lane.
+
+        Coordinators that start exact children must size their batch by this
+        count rather than by their own worker bookkeeping: judges, compose
+        workers and delivery parts share the same lane capacity.
+        """
+        if not isinstance(lane, Lane):
+            raise ValueError("held requires a lane")
+        with self.runtime.read_snapshot():
+            row = self.runtime.read_one(
+                "SELECT COUNT(*) AS held FROM execution_attempts WHERE slot_held = 1 AND lane = ?", (lane.value,))
+        return int(row["held"]) if row is not None else 0
 
     @outcome
     def claim(self, lane: Lane, *, scan_limit: int = 32) -> ClaimResult:
@@ -643,8 +671,14 @@ class TaskSupervisor:
             return self._record(row)
 
     @outcome
-    def stop(self, claim: TaskClaim, *, reason: str) -> TaskRecord:
-        """Called only after the supervised coroutine has actually terminated."""
+    def stop(self, claim: TaskClaim, *, reason: str, detail: str | None = None) -> TaskRecord:
+        """Called only after the supervised coroutine has actually terminated.
+
+        ``detail`` is optional diagnostics for a worker that raised: the stable
+        ``reason`` stays the machine-readable contract, while the exception type
+        and message land on the attempt so an operator can read why it failed
+        without a live console.
+        """
         if reason not in ("timeout", "worker_error", "permission_changed", "runner_cancelled", "cancelled"):
             raise ValueError("unknown stop reason")
         with self.runtime.transaction():
@@ -653,6 +687,15 @@ class TaskSupervisor:
             if row["attempt_id"] != claim.attempt_id or claim.generation != self.generation:
                 raise TaskError("task_attempt_fenced", "old worker cannot change current task state")
             require(self.acknowledge_stopped(claim, proof_ref="supervised_coroutine_stopped"))
+            if detail:
+                # Re-read after the stop proof: ``attempt`` above was read before the
+                # acknowledgement, so writing that stale snapshot would drop the proof
+                # and put the slot back on hold (a capacity leak until a recovery sweep).
+                attempt = self._attempt(claim)
+                attempt_data = json.loads(attempt["record_json"])
+                if attempt_data.get("detail") != detail:
+                    attempt_data["detail"] = detail[:DETAIL_LIMIT]
+                    self._save_attempt(attempt, attempt_data, stopped=True)
             if row["state"] in TERMINAL and row["state"] != "uncertain":
                 return self._record(row)
             attempt_data = json.loads(attempt["record_json"])
@@ -741,6 +784,89 @@ class TaskSupervisor:
                     logger.info("[CompanionV2] 已回收退出工作者的执行名额 task=%s kind=%s generation=%s proof=%s",
                                 claim.task_id, attempt.kind, claim.generation, proof)
             return WorkerStopRecovery(len(rows), rows[-1]["attempt_id"] if rows else None, tuple(released))
+
+    @outcome
+    def release_orphaned_slots(self, *, limit: int = 32) -> tuple[str, ...]:
+        """Release slots whose attempt outlived its task without any way to prove a stop.
+
+        ``recover`` only reaches tasks still open, and ``recover_stopped_workers`` only
+        reclaims superseded generations. An attempt whose task already settled while the
+        slot stayed held is therefore unreachable by both, and a converged lane would
+        refuse every later claim. This bounded sweep settles only what one of two
+        independent justifications covers:
+
+        * host stop evidence for this exact attempt, or
+        * a task whose declared effect cannot outlive this runtime -- it either declares no
+          effect at all (``SideEffect.NONE``) or commits only into this runtime's own store
+          (``SideEffect.LOCAL``) -- and whose attempt never crossed the effect boundary
+          (``effect_started`` is exactly ``False``).
+
+        Any other declared effect, an attempt past the boundary, and a record that proves
+        neither keeps its slot; a warning names them so an operator can supply the missing
+        receipt. The sweep is idempotent and never installs a late result.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("orphan slot release requires a bounded page")
+        with self.runtime.transaction() as connection:
+            self._active()
+            done = ",".join("?" * len(TERMINAL))
+            rows = connection.execute(f"""SELECT a.*, t.state AS task_state, t.record_json AS task_json
+                FROM execution_attempts a
+                JOIN execution_tasks t ON t.task_id = a.task_id
+                WHERE a.slot_held = 1 AND t.state IN ({done})
+                  AND json_extract(a.record_json, '$.finished_at') IS NULL
+                ORDER BY a.attempt_id LIMIT ?""", (*sorted(TERMINAL), limit)).fetchall()
+            released = []
+            for row in rows:
+                data = json.loads(row["record_json"])
+                claim = TaskClaim(row["task_id"], row["attempt_id"], row["generation"])
+                proof = self._orphan_slot_proof(row, data)
+                if proof is not None:
+                    require(self.acknowledge_stopped(claim, proof_ref=proof))
+                    released.append(claim.task_id)
+                    logger.info("[CompanionV2] 已回收已完成任务的陈旧执行名额 task=%s kind=%s attempt=%s proof=%s",
+                                claim.task_id, row["kind"], row["attempt_id"], proof)
+                    continue
+                task_data = json.loads(row["task_json"])
+                definition = task_data.get("definition") or {}
+                side_effect = definition.get("side_effect")
+                effect_started = data.get("effect_started")
+                # A settled attempt whose record predates a field, or whose writer failed
+                # before it could complete the record, cannot prove it stayed inside the
+                # declared effect boundary. Keep its slot rather than guess.
+                label = ORPHAN_SLOT_RELEASE_LABELS.get(side_effect)
+                if label is None or effect_started is not False:
+                    logger.warning("[CompanionV2] 任务已终态但仍占执行名额且无停止证据 task=%s kind=%s attempt=%s "
+                                   "state=%s side_effect=%s effect_started=%s",
+                                   claim.task_id, row["kind"], row["attempt_id"], row["task_state"],
+                                   side_effect, effect_started)
+                    continue
+                if data.get("stopped_proof") is None:
+                    data.update(stopped_proof="orphaned_task_settled")
+                data["capacity_release"] = label
+                self._save_attempt(row, data, release_capacity=True)
+                released.append(claim.task_id)
+                logger.info("[CompanionV2] 已释放已完成且未越过副作用边界的执行名额 task=%s kind=%s attempt=%s "
+                            "state=%s side_effect=%s", claim.task_id, row["kind"], row["attempt_id"],
+                            row["task_state"], side_effect)
+            return tuple(released)
+
+    def _orphan_slot_proof(self, row, data) -> str | None:
+        """Host stop proof for one attempt: recorded, host-confirmed, or never started."""
+        if data.get("stopped_proof") is not None:
+            return data["stopped_proof"]
+        if data.get("started_at") is None:
+            return "not_started"
+        if self.worker_lifecycle is None:
+            return None
+        try:
+            ownership = WorkerOwnership.restore(data["worker_owner"]) if data.get("worker_owner") else None
+            attempt = WorkerAttempt(TaskClaim(row["task_id"], row["attempt_id"], row["generation"]),
+                row["kind"], row["attempt_no"], datetime.fromisoformat(data["started_at"]), ownership,
+                SideEffect(json.loads(row["task_json"])["definition"]["side_effect"]))
+            return self.worker_lifecycle.stopped_proof(attempt)
+        except (ValueError, KeyError, TypeError):
+            return None
 
     @outcome
     def reconcile(self, context: TaskContext, task_id: str, *, expected_revision: int,

@@ -13,11 +13,32 @@ from companion_v2.execution.models import TaskContext
 from companion_v2.foundation.refs import ScopeKind
 
 
+def _principal_key(principal):
+    """The exact inputs ``resolve_authenticated`` reads, and nothing else."""
+    return (principal.installation_id, principal.host_id, principal.platform,
+            principal.native_account_id, principal.bot_id, principal.account_id)
+
+
+def _scope_key(scope):
+    """The exact inputs ``resolve_role`` reads, and nothing else."""
+    return (scope.installation_id, scope.platform, scope.kind, scope.native_scope_id,
+            scope.bot_id, scope.account_id, scope.conversation_id, scope.session_id)
+
+
 def private_people(runtime, identity, context, at):
     """List only participants with a stored, currently bound private context for this role."""
     if context.scope.kind is not ScopeKind.PRIVATE:
         return ()
     candidates = {}
+    # The source tables repeat one window's context hundreds of times, but the
+    # identity answer depends only on the principal and scope inside it. Resolving
+    # per row made a single discovery pay ~1,300 directory reads (two per row) to
+    # learn something about five subjects. Both caches are exact rather than
+    # approximate: the same principal and the same scope resolve identically at the
+    # same instant, while the per-row revision comparison below still happens for
+    # every row, so a stale observation is rejected exactly as before.
+    resolved_cache = {}
+    role_cache = {}
     scope_filter = """json_extract(context_json, '$.role_binding.role.subject_id') = ?
         AND json_extract(context_json, '$.role_binding.scope.bot_id') = ?
         AND json_extract(context_json, '$.role_binding.scope.installation_id') = ?"""
@@ -46,8 +67,16 @@ def private_people(runtime, identity, context, at):
             subject_id = candidate.actor.subject.subject_id
             if subject_id in candidates:
                 continue
-            resolved = identity.resolve_authenticated(candidate.actor.principal, observed_at=at)
-            current_role = identity.resolve_role(candidate.scope, observed_at=at)
+            principal_key = _principal_key(candidate.actor.principal)
+            resolved = resolved_cache.get(principal_key)
+            if resolved is None:
+                resolved = identity.resolve_authenticated(candidate.actor.principal, observed_at=at)
+                resolved_cache[principal_key] = resolved
+            scope_key = _scope_key(candidate.scope)
+            current_role = role_cache.get(scope_key)
+            if current_role is None:
+                current_role = identity.resolve_role(candidate.scope, observed_at=at)
+                role_cache[scope_key] = current_role
             if (not resolved.is_success or not current_role.is_success
                     or resolved.unwrap().subject != candidate.actor.subject
                     or resolved.unwrap().binding_id != candidate.actor.binding_id
@@ -75,6 +104,11 @@ def role_private_contexts(runtime, identity, messages, context, at):
     people = private_people(runtime, identity, context, at)
     allowed_ids = {item["subject_id"] for item in people}
     contexts = {}
+    # One window key can appear hundreds of times in the observation table. Its
+    # admission depends on the restored context and configuration layers, never
+    # on the row, so read those layers once per key. This loop runs synchronously
+    # on the event loop and used to dominate a discovery pass.
+    decisions = {}
     scope_filter = """json_extract(context_json, '$.role_binding.role.subject_id') = ?
         AND json_extract(context_json, '$.role_binding.scope.bot_id') = ?
         AND json_extract(context_json, '$.role_binding.scope.installation_id') = ?"""
@@ -85,14 +119,24 @@ def role_private_contexts(runtime, identity, messages, context, at):
         "SELECT context_json FROM conversation_native_observations WHERE kind = 'input' AND "
         + scope_filter + " ORDER BY observed_at DESC, rowid DESC LIMIT 2000",
     )
+    # The observation table repeats the same context_json many times per window.
+    # An identical blob always restores the identical context, and admission is
+    # already keyed by candidate.key, so skip the repeat before parsing it. This
+    # loop runs on the event loop; avoiding thousands of throwaway restorations
+    # per pass also slows long-running heap growth.
+    seen_json = set()
     for query in queries:
         try:
             rows = runtime.read_all(query, parameters)
         except Exception:
             continue
         for row in rows:
+            raw = row["context_json"]
+            if raw in seen_json:
+                continue
+            seen_json.add(raw)
             try:
-                candidate = TaskContext.restore(json.loads(row["context_json"]))
+                candidate = TaskContext.restore(json.loads(raw))
             except (TypeError, ValueError, KeyError):
                 continue
             subject_id = candidate.actor.subject.subject_id
@@ -100,16 +144,22 @@ def role_private_contexts(runtime, identity, messages, context, at):
                 continue
             try:
                 messages.authorize(candidate, at)
-                policy = read_settings(runtime, candidate)
-                if (candidate.scope.kind is ScopeKind.PRIVATE
+            except Exception:
+                continue
+            if candidate.key not in decisions:
+                try:
+                    policy = read_settings(runtime, candidate)
+                    decisions[candidate.key] = bool(
+                        candidate.scope.kind is ScopeKind.PRIVATE
                         and candidate.scope.installation_id == context.scope.installation_id
                         and candidate.scope.bot_id == context.scope.bot_id
                         and candidate.role_binding.role == context.role_binding.role
                         and policy.private_learning_enabled
-                        and source_subject_allowed_for_context(runtime, candidate)):
-                    contexts[candidate.key] = candidate
-            except Exception:
-                continue
+                        and source_subject_allowed_for_context(runtime, candidate))
+                except Exception:
+                    decisions[candidate.key] = False
+            if decisions[candidate.key]:
+                contexts[candidate.key] = candidate
     return tuple(contexts.values())
 
 

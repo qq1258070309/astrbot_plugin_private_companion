@@ -74,6 +74,9 @@
     host_native_lookup_timeout: "AstrBot 读取原生状态超时，请刷新状态后重试。",
     host_target_not_ready: "角色或窗口尚未就绪，请核对映射和模型连接。",
     bridge_unavailable: "页面连接尚未就绪，请从插件管理页面重新打开。",
+    /* 超时只代表没等到回执，不代表写入失败；配置往往已经落盘。
+       提示要让人先核对状态，而不是重复提交或以为保存没生效。 */
+    bridge_timeout: "等待结果超时，本次保存可能已经生效。请先点「刷新状态」核对，不要重复提交；确认没变化后再重试。",
   };
   /* 后端把「运行实例读不出来」的真实原因编进码尾（staging_intent_invalid__schema）。
      具体原因比泛码更能指导修复，所以先查这张表；查不到再退回泛码文案。 */
@@ -1241,7 +1244,11 @@
   async function api(method, endpoint, body = {}, timeoutMs = 30000) {
     if (!bridge) throw new Error("AstrBot 页面桥尚未就绪，请从已启用插件的管理页面打开本页。");
     let timer;
-    const pending = method === "GET" ? bridge.apiGet(endpoint, {}) : bridge.apiPost(endpoint, body);
+    /* 预算必须一路传到工作区桥：桥默认只等 18 秒，而保存共享模型后后端还要
+       准备角色运行环境，负载高时会超过 18 秒。只在本地 race 设 60 秒而不告诉桥，
+       桥会先抛 bridge_timeout，把已经写盘的保存误报成「保存未完成」。 */
+    const options = {timeoutMs};
+    const pending = method === "GET" ? bridge.apiGet(endpoint, {}, options) : bridge.apiPost(endpoint, body, options);
     const timeout = new Promise((_, reject) => {
       timer = window.setTimeout(() => reject(Object.assign(
         new Error("请求未及时返回，操作结果暂时无法确认。"), {code: "host_operation_result_unknown"}

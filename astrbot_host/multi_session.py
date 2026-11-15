@@ -24,7 +24,7 @@ from companion_v2.adapters.astrbot.platform_sender import AstrBotPlatformSender
 from companion_v2.adapters.astrbot.presence import OneBotPresencePort
 from companion_v2.adapters.astrbot.provider import AstrBotTextProvider, REPLY_TASK_CAPABILITIES
 from companion_v2.adapters.astrbot.provider_catalog import (TextProviderSettings, assemble_providers,
-    attach_native_video, loaded_routing)
+    attach_native_video, loaded_routing, routed_fallback)
 from companion_v2.adapters.astrbot.tools import CompositeAstrBotToolPort
 from companion_v2.configuration.registry import FieldRegistry
 from companion_v2.conversation.content.authoring_tasks import authoring_profiles
@@ -523,7 +523,7 @@ class MultiHostSession:
                         if "video" in model.local_provider().capabilities)),)
                       if any("video" in model.local_provider().capabilities for model in self.models) else ()))
         # The host budget is a reply budget; structural tasks register a larger default.
-        profiles = with_thinking_margins(profiles)
+        profiles = routed_fallback(with_thinking_margins(profiles), fallback_provider_id, self.models)
         modes = ["onebot_private", "onebot_group"]
         self.sender_binding = ProviderBinding("message.delivery", "astrbot-multi." + ".".join(modes),
             native_types.version, digest([runtime.installation_id, *modes]))

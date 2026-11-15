@@ -102,6 +102,14 @@ test("known role preparation failures show a specific recovery action", () => {
   assert.match(h.page.publicError({code: "host_store_in_use"}), /实例与数据目录/);
 });
 
+test("a bridge timeout says the save may already have landed", () => {
+  const h = harness();
+  const text = h.page.publicError({code: "bridge_timeout"});
+  assert.match(text, /刷新状态/);
+  assert.match(text, /不要重复提交/);
+  assert.doesNotMatch(text, /错误码：bridge_timeout/);
+});
+
 test("account workspace exposes shared model bootstrap", () => {
   const html = fs.readFileSync(path.join(__dirname, "..", "pages", "\u5bbf\u4e3b\u7ba1\u7406", "workspace.html"), "utf8");
   assert.match(html, /shared-model-provider/);

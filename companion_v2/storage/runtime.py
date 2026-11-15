@@ -276,6 +276,17 @@ class StorageRuntime:
 
     DATABASE_FILENAME = "companion-v2.sqlite3"
     SLOW_OPERATION_SECONDS = 1.0
+    # The live store grows past 185 MB. SQLite defaults to a 2 MB page cache and
+    # no mmap, so each read snapshot keeps re-reading hot pages from disk while
+    # holding the runtime lock. These only change how pages are fetched; the
+    # durability contract below (synchronous=FULL, wal_autocheckpoint=0 plus
+    # explicit passive checkpoints) is deliberately left untouched.
+    PAGE_CACHE_KIB = 64 * 1024          # 64 MiB, PRAGMA cache_size uses KiB
+    MMAP_BYTES = 256 * 1024 * 1024      # enough to map the whole store
+    # Without this, a WAL that once grew large is reused forever and never
+    # shrinks back, even though passive checkpoints keep succeeding. Set on
+    # every connection (the limit is connection-scoped, not stored in the DB).
+    WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
     # Same window as the two rate-limited diagnostics this repository already
     # trusts: ProactiveScheduler._write_diagnostic(minimum_interval=60) and
     # report_slow_native_lookup (NATIVE_LOOKUP_SLOW_LOG_INTERVAL_SECONDS = 60).
@@ -443,6 +454,9 @@ class StorageRuntime:
         try:
             checkpoint = sqlite3.connect(str(self._database_path), timeout=0.0, isolation_level=None)
             checkpoint.execute("PRAGMA synchronous = FULL")
+            # The passive checkpoint is the moment SQLite trims the WAL down to
+            # the size limit; the limit belongs to the connection doing it.
+            checkpoint.execute(f"PRAGMA journal_size_limit = {self.WAL_SIZE_LIMIT_BYTES}")
             row = checkpoint.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
             result = tuple(int(value) for value in row)
             return result
@@ -608,6 +622,10 @@ class StorageRuntime:
             connection.execute("PRAGMA synchronous = FULL")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA wal_autocheckpoint = 0")
+            connection.execute(f"PRAGMA cache_size = -{self.PAGE_CACHE_KIB}")
+            connection.execute(f"PRAGMA mmap_size = {self.MMAP_BYTES}")
+            connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute(f"PRAGMA journal_size_limit = {self.WAL_SIZE_LIMIT_BYTES}")
         except (OSError, sqlite3.Error) as error:
             if connection is not None:
                 connection.close()

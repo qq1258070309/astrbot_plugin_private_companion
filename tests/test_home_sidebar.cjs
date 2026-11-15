@@ -213,6 +213,23 @@ test("当日规划失败时显示原因和后续评估，不把空日历画成�
   assert.match(html,/当日规划未完成：模型等待超时/);
   assert.match(html,/18:00 重新评估剩余时段/);
   assert.doesNotMatch(html,/今日暂无安排|当前未安排|调度巡检/);
+  state.planning.daily_result={state:"failed",code:"model_timeout"};
+  const timeout=renderSchedule({now,state,life:life([])});
+  assert.match(timeout,/当日规划未完成：模型请求超时（结果未知）/);
+  assert.doesNotMatch(timeout,/model_timeout/);
+  // 失败之后的自动重试停在准备阶段时，页面要说清当前阻塞，而不是复述几小时前的超时。
+  state.planning.daily_result={state:"failed",code:"model_timeout",observed_at:"2026-09-30T04:00:00Z"};
+  state.planning.last_result={state:"blocked",code:"host_account_changed",mode:"daily",observed_at:"2026-09-30T04:30:00Z"};
+  state.planning.next_review_at="2026-09-30T03:55:00Z";
+  const blocked=renderSchedule({now,state,life:life([])});
+  assert.match(blocked,/当日规划未完成：宿主账号未连接（QQ 端已断开）/);
+  assert.doesNotMatch(blocked,/模型请求超时/);
+  assert.match(blocked,/下次巡检时重新评估剩余时段/);
+  assert.doesNotMatch(blocked,/11:55/);
+  // 比失败更旧的 blocked 记录不能覆盖更新的失败原因。
+  state.planning.last_result={state:"blocked",code:"authorization_denied",observed_at:"2026-09-30T03:00:00Z"};
+  assert.match(renderSchedule({now,state,life:life([])}),/模型请求超时（结果未知）/);
+  delete state.planning.last_result;delete state.planning.next_review_at;
   state.planning.running=true;
   assert.match(renderSchedule({now,state,life:life([])}),/今日规划正在生成/);
   state.planning.running=false;state.planning.daily_result={state:"succeeded",saved:0};
@@ -240,4 +257,19 @@ test("四项图标用不同状态呈现，无法归类的自由描述原样保�
   const noSymptoms=renderState({now,state,life:life([])});
   assert.match(noSymptoms,/data-visual="well"[^>]*title="健康 · 身体状态正常，暂无明显不适"/);
   assert.match(noSymptoms,/data-visual="well"/);assert.doesNotMatch(noSymptoms,/data-visual="strained"/);
+});
+
+test("健康否定句不被判成不适，明确的轻微不适仍然提示", () => {
+  const state=status([]);
+  const health=raw=>{state.state.values={health:raw};return renderState({now,state,life:life([])});};
+  for(const raw of ["身体没什么不舒服，坐久了尾巴有点发麻","没有不舒服","没有明显不适","今天没什么精神，但身体没有不舒服"]){
+    const html=health(raw);
+    assert.match(html,/data-state-kind="health"[^>]*data-visual="well"/,raw);
+    assert.doesNotMatch(html,/data-visual="strained"/,raw);
+  }
+  for(const raw of ["不太舒服","有点不舒服","没有发烧，但是头有点疼"]){
+    const html=health(raw);
+    assert.match(html,/data-state-kind="health"[^>]*data-visual="strained"/,raw);
+    assert.match(html,/data-tone="warn"/,raw);
+  }
 });
