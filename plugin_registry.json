@@ -1,0 +1,25 @@
+{
+  "astrbot-plugin-private-companion": {
+    "name": "astrbot_plugin_private_companion",
+    "market_plugin_id": "qq1258070309/astrbot_plugin_private_companion",
+    "display_name": "我会永远陪着你",
+    "desc": "将一切串联成角色的生活，一站式互联拟人化插件；整合记忆、主动联系与 Content / Image / Screen / Reality / Together / Game / Live 七项内置能力，支持私聊群聊细调。本条目由 fork 维护，版本跟随本仓库 main 分支。",
+    "author": "menglimi",
+    "repo": "https://github.com/qq1258070309/astrbot_plugin_private_companion",
+    "tags": [
+      "陪伴",
+      "角色",
+      "记忆",
+      "主动联系",
+      "拟人化"
+    ],
+    "social_link": "https://github.com/qq1258070309",
+    "version": "7.1.20a",
+    "astrbot_version": ">=4.27.2",
+    "support_platforms": [
+      "aiocqhttp"
+    ],
+    "updated_at": "2026-11-15T14:40:00Z",
+    "logo": "https://raw.githubusercontent.com/qq1258070309/astrbot_plugin_private_companion/main/logo.png"
+  }
+}
