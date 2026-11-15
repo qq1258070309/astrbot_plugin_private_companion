@@ -135,11 +135,14 @@ window.CompanionHomeSidebar = (() => {
     if (!raw) return item("unknown",icons[kind],loading ? "读取中" : unreadable ? "待读取" : "未记录");
     if (/^(未知|不清楚|未记录|暂无|尚未记录|未设置|待确认)$/.test(raw)) return item("unknown",icons[kind],"未知");
     if (kind === "health") {
-      if (/^(稳定|正常|健康|良好|状态良好|无不适|没有不适|身体无不适)$/.test(raw)) return item("well","heart-pulse","良好","ok");
+      if (/^(稳定|正常|健康|良好|状态良好|无不适|没有不适|身体无不适|身体还好|还好|没什么不舒服|没有不舒服)$/.test(raw)) return item("well","heart-pulse","良好","ok");
       if (/恢复中|康复中|正在恢复|逐渐恢复|正在好转|有所好转/.test(raw)) return item("recovering","heart-handshake","恢复中","ok");
-      const symptoms = raw.replace(/(?:没有|暂无|并无|未见|没有出现|未出现|不再|无|没|不)(?:明显|任何)?(?:不适|疼痛|头痛|发热|发烧|感冒|虚弱|生病)/g, "");
-      if (/不舒服|不适|生病|发烧|发热|疼痛|头痛|感冒|虚弱|不稳定|欠佳/.test(symptoms)) return item("strained","heart-crack","不适","warn");
-      if (/稳定|正常|健康|良好|(?:没有|暂无|无)(?:明显|任何)?不适/.test(raw)) return item("well","heart-pulse","良好","ok");
+      // 「没有不舒服」「没什么不适」是否定句：先剔除被否定的症状，避免只看关键词就把常态判成不适。
+      const signs = /不太舒服|不大舒服|不舒服|不适|疼痛|头痛|头疼|发烧|发热|感冒|虚弱|生病|恶心|呕吐|腹泻|异常|头(?:有点|有些|很|特别)?(?:疼|痛|晕)/;
+      const denied = raw.replace(/(?:没有|没什么|暂无|并无|未见|没有出现|未出现|不再|并不|并未|无|没|不)(?:(?:觉得|感到|出现|明显|任何|什么|的)\s*)*(?:不太舒服|不大舒服|不舒服|不适|疼痛|头痛|头疼|发烧|发热|感冒|虚弱|生病|恶心|呕吐|腹泻|异常|头(?:有点|有些|很|特别)?(?:疼|痛|晕))/g, "");
+      if (signs.test(denied)) return item("strained","heart-crack","不适","warn");
+      if (/稳定|正常|健康|良好|还好|(?:没有|暂无|无|没什么)(?:明显|任何)?(?:不适|不舒服)/.test(raw)) return item("well","heart-pulse","良好","ok");
+      if (denied !== raw) return item("well","heart-pulse","良好","ok");
     } else if (kind === "hunger") {
       if (/吃撑|太饱|过饱|饱胀|有点撑/.test(raw)) return item("full","utensils-crossed","偏饱","warn");
       if (/^(不饿|没有饥饿感|已吃饱|吃饱了|饱腹|饱足|已饱|适中)$/.test(raw)) return item("sated","utensils","不饿","ok");
@@ -267,15 +270,28 @@ window.CompanionHomeSidebar = (() => {
     const planningIncomplete = planning?.enabled && planning.calendar_enabled
       && (planning.running || ["failed","expired","dead_letter","cancelled","uncertain","blocked","deferred"].includes(dailyResult?.state));
     const planningFailure = planningIncomplete && !planning.running;
-    const planningFailureLabel = ({provider_wait_timed_out:"模型等待超时",timeout:"执行超时",
+    // daily_result 只记录那次任务本身的结果。任务之后的自动重试如果停在准备阶段
+    // （宿主账号断连、平台未加载、预算延期）根本不会产生新任务，页面就会一直复述
+    // 几小时前的旧失败。这里用更新的 blocked 结果替换展示原因，状态仍是「今天没规划完」。
+    const latestResult = planning?.last_result;
+    const blocker = planningFailure && latestResult?.state === "blocked"
+      && stamp(latestResult.observed_at) > (stamp(dailyResult?.observed_at) ?? -Infinity) ? latestResult : null;
+    const failureCode = blocker?.code || dailyResult?.code;
+    const planningFailureLabel = ({provider_wait_timed_out:"模型等待超时",model_timeout:"模型请求超时（结果未知）",
+      provider_wait_interrupted:"模型请求被中断",timeout:"执行超时",
       model_usage_unknown:"模型输出不完整（可能达到长度上限）",response_contract_rejected:"模型返回格式不符合日程要求",
-      native_response_parse_failed:"模型返回无法解析",planning_output_invalid:"模型返回的日程无效",worker_error:"生成失败"})[dailyResult?.code]
-      || (dailyResult?.code ? `生成未完成（${dailyResult.code}）` : "生成未完成");
+      native_response_parse_failed:"模型返回无法解析",planning_output_invalid:"模型返回的日程无效",worker_error:"生成失败",
+      host_account_changed:"宿主账号未连接（QQ 端已断开）",host_platform_unavailable:"宿主平台尚未加载",
+      host_platform_changed:"宿主平台已变化",host_not_running:"角色尚未运行",
+      authorization_denied:"当前身份未通过会话授权",calendar_disabled:"角色日程总开关已关闭",
+      model_task_unregistered:"规划模型尚未配置",planning_role_changed:"角色绑定已变化",
+      planning_closed:"规划任务已停止",planning_job_unavailable:"规划输入已失效"})[failureCode]
+      || (failureCode ? `生成未完成（${failureCode}）` : "生成未完成");
     const nextReview = stamp(planning?.next_review_at);
     const planningNote = planning?.enabled
       ? !planning.calendar_enabled ? "日历写入尚未开启，自动规划暂停"
         : planning.running ? "自动规划正在检查日程"
-          : planningFailure ? `当日规划未完成：${planningFailureLabel} · 发送「重新生成日程」可立即重试${nextReview != null ? ` · ${moment(nextReview, now, zone)} 重新评估剩余时段` : ""}`
+          : planningFailure ? `当日规划未完成：${planningFailureLabel} · 发送「重新生成日程」可立即重试${nextReview != null ? (nextReview > now ? ` · ${moment(nextReview, now, zone)} 重新评估剩余时段` : " · 下次巡检时重新评估剩余时段") : ""}`
           : nextCheck != null ? `自动规划已开启 · 调度巡检 ${moment(nextCheck, now, zone)}`
             : "自动规划已开启 · 暂无近期计划"
       : "";

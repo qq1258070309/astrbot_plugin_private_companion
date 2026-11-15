@@ -1587,6 +1587,20 @@ class ContactSchedule:
         if error.code in ("supervisor_fenced", "supervisor_generation_conflict"):
             raise error
 
+    def _hold_window(self, context, until, now):
+        """Park the pending window at the moment its gate lifts.
+
+        ``next_at`` is only "do not look again before this"; a gate that is never
+        written back leaves the row looking overdue forever while every tick
+        skips it again. Writing it keeps the schedule honest and lets the page
+        show when the role will actually retry.
+        """
+        if until is None or until <= now:
+            return
+        with self.runtime.transaction() as connection:
+            connection.execute("UPDATE role_state_schedules SET next_at = ? WHERE context_key = ? AND enabled = 1",
+                               (stamp(until), context.key))
+
     def _activate_plan(self, row, plan, available, now):
         context, _, intents, _, origin = plan
         purpose = intents[0].purpose if intents else None
@@ -1594,16 +1608,19 @@ class ContactSchedule:
         if circuit_until is not None:
             self._note_window(context, row, now, "delivery_admission", "skipped", "platform_circuit_open",
                               purpose=purpose, next_at=circuit_until)
+            self._hold_window(context, circuit_until, now)
             return available
         busy_until = self._busy_hold(context, origin, now)
         if busy_until is not None:
             self._note_window(context, row, now, "busy_gate", "skipped", "conversation_busy",
                               purpose=purpose, next_at=busy_until)
+            self._hold_window(context, busy_until, now)
             return available
         sleep_until = self._sleep_hold(context, origin, now)
         if sleep_until is not None:
             self._note_window(context, row, now, "rest_gate", "skipped", "role_sleeping",
                               purpose=purpose, next_at=sleep_until)
+            self._hold_window(context, sleep_until, now)
             return available
         if row["origin_key"] in self._workers:
             return available

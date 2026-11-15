@@ -16,7 +16,7 @@ from companion_v2.model_gateway.response_diagnostics import checked_response_dia
 from .media.models import MAX_INPUT_IMAGES
 from .media.understanding import SCOPE_PERMISSION_FIELDS
 from .reply_settings import (DIAGNOSTIC_DEFAULTS, GROUP, OWNER, ROLE_SHARED_FIELDS,
-    GROUP_WAKEUP_GROUP_FIELDS, group_wakeup_settings, target_for, validate, voice_policy)
+    group_wakeup_settings, target_for, validate, voice_policy)
 from .outbound_plan import component_order
 from .segmentation import minimum_part_gap_seconds, part_gap_seconds
 from .segmentation import DEFAULT_PROMPT, LLM_SEGMENT_MARKER
@@ -147,11 +147,11 @@ class ReplyManagement:
                 if name in ROLE_SHARED_FIELDS:
                     fields[name]["editable_layers"] = ["role", "window"]
                     fields[name]["write_layer"] = self.target.layer.value
-                elif (self.target.layer is ConfigLayer.WINDOW and self.scope.kind is ScopeKind.GROUP
-                      and name in GROUP_WAKEUP_GROUP_FIELDS):
-                    fields[name]["editable_layers"] = ["window"]
-                    fields[name]["write_layer"] = "window"
                 else:
+                    # 角色层与窗口层都不可写的字段：页面据此灰掉控件（write_layer
+                    # 显式为 null）。目前 conversation.presentation 的每个字段都
+                    # 在 ROLE_SHARED_FIELDS 里，这里只是把契约留全，避免以后新增
+                    # 只读字段时页面又把它当成「哪层都能写」。
                     fields[name]["editable_layers"] = []
                     fields[name]["write_layer"] = None
             return {"settings": settings, "edit_token": snapshot.edit_token, "revision": snapshot.revision,

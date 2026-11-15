@@ -14,8 +14,9 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 
 from companion_v2.adapters.astrbot.provider import AstrBotTextProvider, UsageTariff, provider_fingerprint
-from companion_v2.adapters.astrbot.provider_catalog import TextProviderSettings, assemble_providers
-from companion_v2.execution.models import ProviderBinding
+from companion_v2.adapters.astrbot.provider_catalog import TextProviderSettings, assemble_providers, routed_fallback
+from companion_v2.execution.models import Lane, ProviderBinding, digest
+from companion_v2.model_gateway.models import LocalProvider, ModelTaskProfile
 from tests.segmentation_stream_support import native_provider
 
 
@@ -70,6 +71,44 @@ class ProviderSubclassTests(unittest.TestCase):
 
         self.assertIs(adapter.native, provider)
         self.assertEqual(adapter.model, provider.get_model())
+
+
+async def _generate(envelope):
+    raise AssertionError("routing must not dispatch during assembly")
+
+
+def local(model, capabilities=("text",), maximum_output_tokens=2048):
+    return LocalProvider(ProviderBinding("model.text", model, "4.29.3", digest([model])),
+                         tuple(capabilities), maximum_output_tokens,
+                         reserve=lambda envelope: None, generate=_generate, model=model)
+
+
+class BackgroundFallbackRoutingTests(unittest.TestCase):
+    def test_saved_fallback_reaches_background_profiles_that_can_use_it(self):
+        primary, fallback = local("primary"), local("fallback")
+        plain = ModelTaskProfile("role.state.maintain", Lane.BACKGROUND, "primary", "state")
+
+        routed = routed_fallback((plain,), "fallback", (primary, fallback))
+
+        self.assertEqual(routed[0].default_fallback, "fallback")
+
+    def test_fallback_is_not_wired_where_it_cannot_serve_the_task(self):
+        primary, fallback = local("primary"), local("fallback")
+        wide = ModelTaskProfile("role.video.narration", Lane.BACKGROUND, "primary", "video",
+                                capabilities=("video",))
+        crowded = ModelTaskProfile("conversation.draft", Lane.BACKGROUND, "primary", "long",
+                                   max_output_tokens=4096)
+
+        routed = routed_fallback((wide, crowded), "fallback", (primary, fallback))
+
+        self.assertEqual([profile.default_fallback for profile in routed], ["", ""])
+
+    def test_missing_saved_fallback_leaves_the_route_alone(self):
+        primary = local("primary")
+        plain = ModelTaskProfile("role.state.maintain", Lane.BACKGROUND, "primary", "state")
+
+        self.assertEqual(routed_fallback((plain,), "", (primary,))[0].default_fallback, "")
+        self.assertEqual(routed_fallback((plain,), "unloaded", (primary,))[0].default_fallback, "")
 
 
 if __name__ == "__main__":

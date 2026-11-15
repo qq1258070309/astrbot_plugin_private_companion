@@ -453,3 +453,54 @@ test("private access editors separate known users from unbound accounts", () => 
   assert.equal(window.CompanionConfigEditors.endpointFor(null, "", ["private_access_installation"]),
     "/astrbot_plugin_private_companion/config");
 });
+
+test("group participation cards read drafts from workbench instances, not the mount wrapper", () => {
+  /* 回归：config-editor.create() 的挂载对象 state 只有 {instances}，
+     草稿在每个 workbench 实例的 state.draft 上。早前直接读
+     editor.state.draft 恒为 undefined，群聊参与卡片永远停在
+     「读取配置后显示」/「— / 4」。 */
+  const panels = new Map(["overview", "group"].map(view => [view, {dataset:{decisionPanel:view}, innerHTML:"", hidden:false}]));
+  const instance = {state:{draft:{enable_group_topic_threads:true,group_topic_thread_max:9,
+    enable_group_social_context:true,enable_group_mood_detection:true,enable_group_roleplay_strength:true,
+    enable_group_moments:true,enable_group_moment_portrait:true,enable_group_interjection:true,
+    group_interject_min_interval_minutes:45,group_interject_max_daily:6}},status:null,base:null};
+  const wrapper = {state:{instances:[instance]}};
+  /* 7.1.5 起参与设置按来源分层：角色层与本群窗口各读各的草稿，
+     窗口层没有挂载点时「主动插话」会显示「未选择群聊」。这里补一个
+     同样形状的窗口实例，保住「从 workbench 实例读草稿」这条回归。 */
+  const windowWrapper = {state:{instances:[{state:{draft:{
+    enable_group_interjection:true,group_interject_min_interval_minutes:45,
+    group_interject_max_daily:6}}}]}};
+  const current = {textContent:""};
+  const root = {innerHTML:"",dataset:{},querySelector(selector){
+    if(selector==="#groupParticipationConfigWorkspace")return {companionConfigEditor:wrapper};
+    if(selector==="#groupInterjectionConfigWorkspace")return {companionConfigEditor:windowWrapper};
+    if(selector==='[data-decision-current]')return current;
+    const panel=selector.match(/^\[data-decision-panel="([^"]+)"\]$/);
+    return panel?panels.get(panel[1])||null:null;
+  },querySelectorAll(selector){
+    return selector==="[data-decision-panel]"?[...panels.values()]:[];
+  },addEventListener(){},removeEventListener(){}};
+  const window = {lucide:{createIcons(){}}};
+  vm.runInNewContext(source, {window});
+  const page = window.CompanionDecisionPage;
+  page.mount(root, {groupSettingsMarkup:'<section id="groupParticipationConfigWorkspace"></section>'});
+  page.setView("group");
+
+  const group = panels.get("group").innerHTML;
+  assert.doesNotMatch(group, /读取配置后显示/, "群聊参与卡片不能停留在未读取态");
+  assert.match(group, /最多保留 9 条 · 90 分钟无更新后失效/);
+  assert.match(group, /4 \/ 4 开/);
+  assert.match(group, /间隔 45 分钟 · 每日上限 6 次/);
+  const overview = panels.get("overview").innerHTML;
+  assert.match(overview, /氛围参考 4 \/ 4/);
+  assert.match(overview, /话题线/);
+  page.unmount();
+});
+
+test("group participation editor reports status so the decision cards repaint after the read", () => {
+  const app = fs.readFileSync(path.join(pageRoot, "app.js"), "utf8");
+  /* 7.1.5 起 onStatus 带上来源参数（角色层 'role' / 本群窗口 'window'），
+     决策页据此分层渲染；回调名与参数都要守住。 */
+  assert.match(app, /mountConfigEditor\('groupParticipationConfigWorkspace',\['group_participation'\][\s\S]*?onStatus:status=>window\.CompanionDecisionPage\?\.updateParticipationStatus\?\.\(status,'role'\)/);
+});

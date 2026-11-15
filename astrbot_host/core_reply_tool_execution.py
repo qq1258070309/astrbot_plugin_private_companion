@@ -253,7 +253,8 @@ class CoreReplyToolExecutor:
                 invocation.descriptor.tool.action, response.images, at=self.tasks.now()) if response.images else []
             row.update(state=response.state, effect=response.effect,
                 result={"state": response.state, "effect": response.effect, "invocation_id": invocation.invocation_id,
-                        "operation_id": response.operation_id, "receipt_ref": response.receipt_ref},
+                        "operation_id": response.operation_id, "receipt_ref": response.receipt_ref,
+                        **({"code": response.error_code} if response.error_code else {})},
                 source=json.loads(encode(source.reference)) if source is not None else None,
                 source_hash=digest(source) if source is not None else None, images=images)
             self._save(row)

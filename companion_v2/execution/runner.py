@@ -30,6 +30,11 @@ logger = getLogger(__name__)
 # refusals opts in with ``retain_refusals=True``; see ``_unrun``.
 CAPACITY_REFUSALS = frozenset({"task_lane_full", "task_concurrency_limited"})
 
+#: 我方修复（7.0.0 起）：后台任务异常只进 stdout 时运维端拿不到失败原因。
+#: 把异常类型与消息截断后随 RunResult 一起带出，供任务账本记录；只影响诊断
+#: 字段，不改变任务状态与错误码语义（service.stop 的 detail 已支持）。
+DETAIL_LIMIT = 240
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -103,8 +108,8 @@ class _TaskRunner:
     def active_handles(self) -> tuple[str, ...]:
         return tuple(self._handles)
 
-    def _stopped(self, claim: TaskClaim, reason: str):
-        stopped = self.supervisor.stop(claim, reason=reason)
+    def _stopped(self, claim: TaskClaim, reason: str, detail: str | None = None):
+        stopped = self.supervisor.stop(claim, reason=reason, detail=detail)
         if stopped.failure:
             # A replaced controller may accept stop evidence, but never our result.
             return self.supervisor.acknowledge_stopped(claim, proof_ref="supervised_coroutine_stopped")
@@ -164,11 +169,14 @@ class _TaskRunner:
                                         task.task_id, task.spec.kind, code, error.retry_at.isoformat())
                             return Outcome.success(RunResult(require(self._stopped(claim, "worker_error")),
                                                              code, error.retry_at))
-                        logger.error("[CompanionV2] 后台任务执行失败 task=%s kind=%s code=%s error_type=%s",
-                                     task.task_id, task.spec.kind, code, type(error).__name__)
+                        # 我方修复：异常只进 stdout 时运维端拿不到原因，把类型+MESSAGE
+                        # 截断随账本带出（detail 只做诊断，不改状态与错误码）。
+                        detail = "%s: %s" % (type(error).__name__, str(error)[:DETAIL_LIMIT])
+                        logger.error("[CompanionV2] 后台任务执行失败 task=%s kind=%s code=%s error_type=%s "
+                                     "detail=%s", task.task_id, task.spec.kind, code, type(error).__name__, detail)
                         logger.debug("[CompanionV2][开发者追踪] 后台任务异常 task=%s kind=%s code=%s",
                                      task.task_id, task.spec.kind, code, exc_info=True)
-                        return Outcome.success(RunResult(require(self._stopped(claim, "worker_error")), code))
+                        return Outcome.success(RunResult(require(self._stopped(claim, "worker_error", detail)), code))
                     if not isinstance(result, TaskResult):
                         return Outcome.success(RunResult(require(self._stopped(claim, "worker_error")),
                                                          "worker_result_invalid"))

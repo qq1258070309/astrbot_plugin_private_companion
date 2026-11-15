@@ -62,7 +62,8 @@ from .application import AstrBotCompanionHost
 from .tools import CompositeAstrBotToolPort
 from .native import HostAccount, HostPersona, NativePrivateBridge, check_version, persona_instruction, route_id
 from .provider import AstrBotTextProvider, REPLY_TASK_CAPABILITIES, UsageTariff, provider_fingerprint
-from .provider_catalog import TextProviderSettings, assemble_providers, attach_native_video, loaded_routing
+from .provider_catalog import (TextProviderSettings, assemble_providers, attach_native_video,
+                               loaded_routing, routed_fallback)
 from .staging_config import DELIVERY_CAPABILITY, DELIVERY_GRANT_ID
 from .staging_delivery import delivery_grants, require_delivery_access
 
@@ -326,7 +327,7 @@ class AstrBotStagingSession:
                     *native_video_profiles) + self.writing_profiles + (self.reading_profile,) + authoring_profiles(
                         profile.provider_id, draft_tokens=profile.max_output_tokens)
         # The host budget is a reply budget; structural tasks register a larger default.
-        profiles = with_thinking_margins(profiles)
+        profiles = routed_fallback(with_thinking_margins(profiles), fallback_provider_id, self.models)
         registry_fields = configuration_fields(profiles)
         registry_ids = {item.field_id for item in registry_fields}
         registry_fields += tuple(field for field in relay_configuration_fields()

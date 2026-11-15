@@ -130,6 +130,31 @@
     let pendingStyles = 0;
     let released = false;
     let releasing = false;
+    let deferredInjected = false;
+    let deferredNodes = [];
+
+    /* Host page assets are served with `Cache-Control: no-store` and a fresh
+       asset_token on every visit, so the browser cannot reuse any of the ~6 MB
+       it downloads. app.js paints the shell; the management modules behind it
+       are only needed once an operator opens one of those tabs. Splitting the
+       template at app.js keeps ~2 MB of scripts off the first-paint path.
+       module-ready.js stays last, so the existing "modules-ready re-render"
+       contract still repairs tabs opened during the gap. */
+    const inject = (node) => {
+      if (node.tagName === "SCRIPT") {
+        /* Dynamic classic scripts default to async. Explicitly preserve the
+           author order in each batch; app.js still runs before the larger page
+           modules, and module-ready.js still fires after all of them land. */
+        node.async = false;
+        node.defer = false;
+      }
+      document.head.appendChild(node);
+    };
+    const injectDeferred = () => {
+      if (deferredInjected) return;
+      deferredInjected = true;
+      for (const node of deferredNodes) inject(node);
+    };
     const release = () => {
       if (released || releasing) return;
       releasing = true;
@@ -138,6 +163,10 @@
         released = true;
         root.dataset.companionPerformanceReady = "";
         root.removeAttribute("data-companion-booting");
+        /* A plain timer, not requestIdleCallback: a backgrounded tab must not
+           leave every management page unregistered forever. This runs after the
+           shell is visible, so the remaining scripts no longer delay interaction. */
+        setTimeout(injectDeferred, 0);
       };
       /* The stylesheet load event can fire before the new CSSOM has been
          applied.  Let two frames pass so the boot frame does not flash as
@@ -150,9 +179,15 @@
       }
     };
 
-    const nodes = Array.from(template.content.childNodes, (node) => node.cloneNode(true));
-    for (const node of nodes) {
-      if (node.nodeType !== 1) continue;
+    const nodes = Array.from(template.content.childNodes, (node) => node.cloneNode(true))
+      .filter((node) => node.nodeType === 1);
+    const boundary = nodes.findIndex((node) => node.tagName === "SCRIPT"
+      && /(^|\/)app\.js(\?|$)/.test(node.getAttribute("src") || ""));
+    /* Unknown template shapes keep the old single-batch behavior. */
+    const firstNodes = boundary < 0 ? nodes : nodes.slice(0, boundary + 1);
+    deferredNodes = boundary < 0 ? [] : nodes.slice(boundary + 1);
+
+    for (const node of firstNodes) {
       if (node.tagName === "LINK" && node.getAttribute("rel") === "stylesheet") {
         pendingStyles += 1;
         node.addEventListener("load", () => {
@@ -164,14 +199,7 @@
           if (pendingStyles <= 0) release();
         }, { once: true });
       }
-      if (node.tagName === "SCRIPT") {
-        /* Dynamic classic scripts default to async.  Explicitly preserve the
-           author order: app.js runs after the shell dependencies and before the
-           larger page modules, which re-render once all of them have landed. */
-        node.async = false;
-        node.defer = false;
-      }
-      document.head.appendChild(node);
+      inject(node);
     }
 
     if (pendingStyles === 0) release();

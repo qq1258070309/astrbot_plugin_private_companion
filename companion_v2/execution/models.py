@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
+from functools import cached_property
 import hashlib
 import json
 import math
@@ -112,8 +113,18 @@ class TaskContext:
     def scope(self) -> ScopeRef:
         return self.audience.scope
 
-    @property
+    @cached_property
     def key(self) -> str:
+        """The opaque stable window key; computed once per restored context.
+
+        Every field below is immutable, so the digest is too. It is read several
+        times for the same object in the discovery loops that walk hundreds of
+        stored contexts per pass, and a recursive ``asdict`` plus SHA-256 per read
+        (measured 0.19 ms) was a measurable share of a pass' synchronous work.
+        ``cached_property`` writes through the instance ``__dict__``, which a
+        frozen dataclass allows, and it adds no declared field, so equality,
+        hashing and ``asdict`` are unaffected.
+        """
         return digest({"principal": asdict(self.actor.principal), "subject": asdict(self.actor.subject),
                        "binding": [self.actor.binding_id, self.actor.binding_revision],
                        "role": asdict(self.role_binding), "audience": asdict(self.audience)})

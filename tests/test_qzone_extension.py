@@ -227,6 +227,24 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(Y.publish_reason(state, self.SETTINGS, text="下班路上买了花",
                                           at=NOW + timedelta(hours=2), day="2026-10-03"), "")
 
+    def test_a_short_status_is_not_a_duplicate_of_another_short_status(self):
+        """Two shared trigrams say nothing about an eight-character status.
+
+        A model reading "再发一条说说" reuses the words of the post it already
+        saw; treating that as a duplicate blocks every retry for good.
+        """
+        state = Y.note_publish(Y.QzoneRuntimeState(), text="测试一条，发说说", at=NOW, day="2026-10-02")
+        for text in ("测试一条，发说说吧", "再测试一条发说说看看", "测试一条说说"):
+            self.assertEqual(Y.publish_reason(state, self.SETTINGS, text=text,
+                                              at=NOW + timedelta(hours=2), day="2026-10-03"), "", text)
+        # The same body still counts, across the daily cap.
+        self.assertIn("重复", Y.publish_reason(state, self.SETTINGS, text="测试一条，发说说",
+                                              at=NOW + timedelta(hours=2), day="2026-10-03"))
+        long_state = Y.note_publish(Y.QzoneRuntimeState(),
+            text="晚风凉下来了，慢慢往回走，肚子先一步开始抗议。", at=NOW, day="2026-10-02")
+        self.assertIn("太像", Y.publish_reason(long_state, self.SETTINGS,
+            text="晚风凉下来了，慢慢往回走，肚子先一步开始叫。", at=NOW + timedelta(hours=2), day="2026-10-03"))
+
 
 class QzoneServiceFixture(unittest.TestCase):
     """One assembled service per test; the subclasses below add the cases."""

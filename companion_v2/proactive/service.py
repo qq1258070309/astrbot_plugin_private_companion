@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from companion_v2.capabilities.memory_push import (DEFAULT_MEMORY_PUSH, PUSH_PROACTIVE_MESSAGE, MemoryPushRecord,
     push_memory, push_memory_id)
 from companion_v2.configuration.models import ConfigurationError
+from companion_v2.conversation.foreground import PromptMaterial
 from companion_v2.conversation.messages import source_from_document
 from companion_v2.conversation.reply_preparation import observed_statements, trim_blank_edges
 from companion_v2.conversation.reply_settings import ReplySettings, voice_policy
@@ -136,6 +137,11 @@ def _segmentation_policy(settings):
                                  for key, default in _SEGMENTATION_DEFAULTS.items()})
 
 
+ZONE_FOLLOWUP = ("\n刚才的 QQ 空间调用已经执行，结果在下一条材料里。"
+            "现在只输出本轮主动联系的结果：按原有约定给出 send 或 skip 与被发出去的正文；"
+            "不要再次调用 qzone 工具，不要把空间正文当成私聊消息重复发送，也不要向对方说明刚才发过空间。")
+
+
 class ProactiveContacts:
     def __init__(self, configuration, memory_push=None):
         self.configuration, self.runtime = configuration, configuration.runtime
@@ -153,6 +159,10 @@ class ProactiveContacts:
         self.role_state = self.life_context = None
         self.expression_context = self.expression_review = None
         self.persona_judge = PersonaJudge(self.runtime)
+        # The Zone extension is optional: a host without a transport leaves this
+        # None and every contact prompt stays exactly as it was.
+        self.qzone = None
+        self.tools = None
         self._pending, self._plan_results, self._invocations = {}, {}, set()
         self._closed = False
         self.gateway = self.runner = self.plan_runner = self.generation = self.judge_runner = None
@@ -178,10 +188,28 @@ class ProactiveContacts:
                                            retain_refusals=True)
         self.judge_runner = ExactTaskRunner(self.tasks, frozenset({JUDGE_KIND}), self._judge_generate)
 
+    def attach_qzone(self, qzone):
+        """Bind the Zone service so contacts may also offer a public post."""
+        if qzone is None or qzone.runtime is not self.runtime:
+            raise ValueError("proactive Zone access must use the contact worker's original runtime")
+        if self.qzone is not None and self.qzone is not qzone:
+            raise ValueError("proactive Zone owner cannot be replaced")
+        self.qzone = qzone
+
     def attach_semantics(self, semantics):
         if self.semantics is not None or semantics.app.runtime is not self.runtime:
             raise ValueError("contact reactions require the original semantic service")
         self.semantics = semantics
+
+    def attach_tools(self, tools):
+        """Bind the role tool catalog so a contact can offer the Zone tools.
+
+        The catalog is read fresh for every contact, so reassigning it is how a
+        host refresh (or a test) swaps the role's tool owners. ``None`` keeps the
+        current binding rather than silently removing the Zone offer.
+        """
+        if tools is not None:
+            self.tools = tools
 
     def attach_memory(self, memory):
         """Bind the relationship's memory read owner, exactly as replies do.
@@ -311,6 +339,120 @@ class ProactiveContacts:
             if len(items) >= 2:
                 break
         return items or None
+
+    def _zone_tools(self, context, at):
+        """The Zone tools this contact may call (a catalog), or nothing.
+
+        A proactive message is the only place the role speaks without being
+        asked, so it is the natural moment to also write a public entry. The
+        tools are read through the same admission gate the reply path uses, so a
+        window without consent simply gets an empty catalogue, and a switched off
+        or exhausted Zone does not put a publish tool in front of the model at
+        all.
+        """
+        if self.qzone is None or self.tools is None or self._zone_opportunity(context, at) is None:
+            return None
+        try:
+            catalog = self.tools.catalog_for(context)
+        except Exception:
+            return None
+        offered = tuple(spec for spec in catalog if spec.action.startswith("qzone."))
+        return offered or None
+
+    async def _generate_with_zone(self, run, request, job, at):
+        """Generate the contact in one session, offering the Zone tools when allowed.
+
+        A contact used to be a single tool-free round, so the only writer that
+        speaks on its own could never publish anything. The catalog is handed to
+        the one model session; a round that answers with a Zone call is executed
+        and followed by the same session asking for the contact body, because the
+        contact contract accepts exactly one final JSON object per round. The
+        Zone result can therefore never replace the message the user gets.
+        """
+        tools = None if job.administrator_test else self._zone_tools(job.context, at)
+        if tools is None:
+            return await self.gateway.generate(run, request)
+        session = self.gateway.open_session(run, request, tools=tools)
+        # 7.1.0 的两阶段规划把「真正发给模型的信封」冻在 session.plan.envelope.original
+        # 里（open_session 可能已把人格换成 self 页）。续答必须从这个冻结信封出发，
+        # 否则 ModelSession 的续答校验会以 instruction 不一致整轮失败。
+        current = session.plan.envelope.original
+        # 第一轮就是「开口」轮：它在正常路径上一定要产出正文（结构化 JSON），
+        # 所以这里不能给模型目录。给了就等于让 model_wire 在本地预估阶段
+        # 直接 ValueError（"private writing does not offer tools"），真机表现为
+        # model_estimation_failed、主动联系恒发不出去。目录仍然登记在会话里，
+        # 续轮再用——那时工具结果只以 tool_history 回放，同样的约束也满足。
+        completion = await session.generate(current, tools=())
+        history = ()
+        for round_no in range(2):
+            if completion.draft is not None or not completion.tool_calls:
+                break
+            for call in completion.tool_calls:
+                run.validate()
+                history += (await self.tools.execute_async(run, completion.call_id, call),)
+            payload = json.dumps([{"action": item.call.action,
+                                   "result": json.loads(item.result_json)}
+                                  for item in history], ensure_ascii=False)[:8000]
+            # 空间调用只是「顺带」：规划模式已经在该轮之前决定了开口与正文，工具结果
+            # 回来后再追加一轮会破坏规划契约（续答校验也不允许第二轮改写 instruction）。
+            if getattr(job, "plan", None) is not None:
+                logger.warning("[CompanionV2] 规划模式下的主动联系不再追加第四轮 task=%s",
+                               run.task.task_id)
+                break
+            # 续答只允许在原始信封上「追加」结尾，绝不重写它：instruction 追加
+            # ZONE_FOLLOWUP，材料追加空间工具结果。7.1.0 的 ModelSession 还有第二道
+            # 校验（changed + owner_refresh），所以由本会话主人只放行这一个确切形状。
+            current = replace(current, instruction=current.instruction + ZONE_FOLLOWUP,
+                context=replace(current.context,
+                    materials=tuple(current.context.materials) + (
+                        PromptMaterial("qzone.tools", "zone_tool_results", payload),)))
+            completion = await session.generate(current, history=history, tools=session.tools,
+                owner_refresh=self._zone_followup_refresh)
+        return completion
+
+    @staticmethod
+    def _zone_followup_refresh(original, request, old_history, history):
+        """Own exactly one continuation shape: ZONE_FOLLOWUP appended, everything else frozen."""
+        if request.instruction != original.instruction + ZONE_FOLLOWUP:
+            return False
+        if tuple(request.context.materials[:len(original.context.materials)]) != tuple(original.context.materials):
+            return False
+        if len(request.context.materials) != len(original.context.materials) + 1:
+            return False
+        appended = request.context.materials[-1]
+        if (appended.owner, appended.purpose) != ("qzone.tools", "zone_tool_results"):
+            return False
+        if history[:len(old_history)] != old_history:
+            return False
+        frozen = replace(request, instruction=original.instruction,
+                         context=replace(request.context, materials=tuple(original.context.materials)))
+        return frozen == original
+
+    def _zone_opportunity(self, context, at):
+        """Whether this contact may also post a public Zone entry, and how many remain.
+
+        The Zone extension only ever existed as model tools: no worker mentioned
+        it, so a role with every switch on and active consent never published
+        once. This reads the same gates the publish call will read and answers
+        with a plain summary for the contact prompt; it decides nothing and
+        writes nothing. Any unreadable setting simply withdraws the invitation.
+        """
+        if self.qzone is None:
+            return None
+        try:
+            settings = self.qzone.configuration(context, at)
+            state = self.qzone.state(context)
+            day = at.astimezone(ZoneInfo(str(settings.get("quiet_timezone") or "Asia/Shanghai"))).date()
+        except Exception:
+            return None
+        if not settings.get("enabled") or not settings.get("publish_enabled"):
+            return None
+        cap = int(settings.get("publish_max_daily") or 1)
+        used = state.publish_count if state.publish_day == day.isoformat() else 0
+        if used >= cap:
+            return None
+        return {"publish_allowed": True, "remaining_today": cap - used,
+                "topic_scratch": "每轮最多一条"}
 
     def _reaction_available(self, context, contact_id, *, diagnostic=False):
         if self.semantics is None:
@@ -1108,7 +1250,8 @@ class ProactiveContacts:
                 reactions_available=reactions_available,
                 voice_available=voice_available, poke_available=poke_available,
                 memory=memory_materials, expression=expression_materials,
-                rhythm_snapshot=rhythm_snapshot, role_state=role_state, recent_life=recent_life)
+                rhythm_snapshot=rhythm_snapshot, role_state=role_state, recent_life=recent_life,
+                zone=(None if job.administrator_test else self._zone_opportunity(job.context, at)))
             extra_instruction = "\n".join(text for text in
                 (segmentation.instruction, presentation.instruction,
                  news_presentation_instruction(segmentation) if job.intent.purpose == "news"
@@ -1151,7 +1294,7 @@ class ProactiveContacts:
                     "decision_confidence": job.plan["decision_confidence"],
                     "skip_reason": job.plan["skip_reason"]}
             else:
-                completion = await self.gateway.generate(run, request)
+                completion = await self._generate_with_zone(run, request, job, at)
                 if completion.draft is None:
                     raise ValueError("contact generation requires a final decision or body")
                 try:
@@ -1753,6 +1896,10 @@ class ProactiveContacts:
                     connection.execute("""UPDATE agenda_open_loop_activity
                         SET followup_count = MAX(0, followup_count - 1)
                         WHERE memo_id = ?""", (open_loop["memo_id"],))
+            # 判官自己就是这条草稿的主人，但主人签发的操作号必须就是它随后落地的那条
+            # operation：7.1.0 的 record_operation 只认一次写入，先写 task_id 再写
+            # operation.operation_id 会让第二次写入被判成「已确认」，事务回滚、
+            # 草稿永远停在 judge_pending（真机表现为主动联系恒不发出）。
             if allowed:
                 require(self.delivery.queue(self._part_request(contact_id, context, document, 0,
                     datetime.fromisoformat(document["opened_at"]))))
@@ -1766,7 +1913,8 @@ class ProactiveContacts:
             # 提前推过去，会让牢插件记得一句角色从没说过的话。
             await self._push_contact(context, contact_id, row["body"], data.get("purpose"))
         return TaskResult("succeeded", effect="committed", result_ref=contact_id,
-                          operation_id=operation.operation_id, receipt_ref=operation.operation_id)
+                          operation_id=operation.operation_id,
+                          receipt_ref="proactive-judgement:" + operation.operation_id)
 
     async def _push_contact(self, context, contact_id, body, purpose):
         """把刚排进投递的主动消息推给对外表达记忆的一方；失败不影响这次投递。

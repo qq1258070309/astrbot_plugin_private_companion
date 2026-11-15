@@ -300,6 +300,43 @@ class ReplyManagementTests(HostFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(reset["status"]["provenance"]["group_wakeup_enabled"]["explicit"])
         self.assertFalse(role_manager.status(self.core).unwrap()["settings"]["group_wakeup_enabled"])
 
+    async def test_primary_member_defaults_save_at_the_role_and_groups_can_override(self):
+        """主要成员名单/专属直呼词是角色默认值，单个群聊仍能各自覆盖。
+
+        决策页（回应判断）编辑的是角色默认值；这两项一度只注册在群窗口上，
+        `role_settings.write()` 会以 configuration_scope_not_supported 拒绝，
+        而页面顶部只能切角色、不能切对象，于是名单在界面上根本存不进去。
+        """
+        group_fields = ("group_wakeup_primary_member_ids", "group_wakeup_owner_direct_words")
+        role_manager = ReplyManagement(self.app, self.context, layer=ConfigLayer.ROLE)
+        role_status = role_manager.status(self.core).unwrap()
+        for name in group_fields:
+            self.assertEqual(role_status["fields"][name]["editable_layers"], ["role", "window"])
+            self.assertEqual(role_status["fields"][name]["write_layer"], "role")
+        saved = role_manager.configure(self.core, self.request(role_status, {
+            "group_wakeup_primary_member_ids": '["201"]',
+            "group_wakeup_owner_direct_words": '["私有称呼"]'}, "role-primary-members")).unwrap()
+        self.assertEqual(saved["status"]["settings"]["group_wakeup_primary_member_ids"], '["201"]')
+        self.assertEqual(saved["status"]["settings"]["group_wakeup_owner_direct_words"], '["私有称呼"]')
+
+        group_scope = replace(self.context.scope, kind=ScopeKind.GROUP,
+            native_scope_id="primary-member-group", conversation_id="primary-member-conversation",
+            session_id="primary-member-session")
+        group_target = ConfigTarget(group_scope.installation_id, ConfigLayer.WINDOW,
+            self.context.role_binding.role, group_scope)
+        window_manager = ReplyManagement(self.app, target=group_target)
+        window_status = window_manager.status(self.core).unwrap()
+        self.assertEqual(window_status["settings"]["group_wakeup_primary_member_ids"], '["201"]')
+        self.assertEqual(window_status["provenance"]["group_wakeup_primary_member_ids"]["layer"], "role")
+        self.assertEqual(window_status["fields"]["group_wakeup_primary_member_ids"]["write_layer"], "window")
+
+        overridden = window_manager.configure(self.core, self.request(window_status, {
+            "group_wakeup_primary_member_ids": '["201", "202"]'}, "group-primary-members")).unwrap()
+        self.assertEqual(overridden["status"]["settings"]["group_wakeup_primary_member_ids"], '["201", "202"]')
+        self.assertEqual(overridden["status"]["provenance"]["group_wakeup_primary_member_ids"]["layer"], "window")
+        self.assertEqual(role_manager.status(self.core).unwrap()["settings"]["group_wakeup_primary_member_ids"],
+                         '["201"]')
+
     async def test_old_group_conversation_override_is_found_and_cleared_after_stable_migration(self):
         from companion_v2.configuration.owners import SparseConfigurationOwner
 

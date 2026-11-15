@@ -57,7 +57,8 @@
     const item=pending.get(message.requestId);pending.delete(message.requestId);clearTimeout(item.timer);
     if(message.ok)item.resolve(message.data);else item.reject(Object.assign(new Error(message.error),
       {code:message.code,reason:message.reason,sourceLabel:message.sourceLabel,
-        confirmed:message.confirmed===true}));
+       confirmed:message.confirmed===true,
+       timeoutMs:message.timeoutMs,timeoutStage:message.timeoutStage}));
   });
   function request(method,path,body,options){return new Promise((resolve,reject)=>{
     const requestId="workspace-"+(++count);
@@ -65,7 +66,8 @@
     const timeoutMs=Number.isInteger(requested)&&requested>=1000
       ?Math.min(requested,MAX_REQUEST_TIMEOUT_MS):DEFAULT_REQUEST_TIMEOUT_MS;
     const timer=setTimeout(()=>{pending.delete(requestId);reject(Object.assign(
-      new Error("未收到执行结果，请核对后重试本次操作。"),{code:"bridge_timeout",confirmed:false}));},timeoutMs+1000);
+      new Error("未收到执行结果，请核对后重试本次操作。"),
+      {code:"bridge_timeout",confirmed:false,timeoutMs,timeoutStage:"bridge"}));},timeoutMs+1000);
     pending.set(requestId,{resolve,reject,timer});send({kind:"request",requestId,method,path,body,timeoutMs});
   });}
   /* 宿主代开的确认：context 没声明 confirm 就回 null，调用方退回自己的内联框。

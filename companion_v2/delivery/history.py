@@ -169,7 +169,7 @@ class BackgroundHistory:
         return row, request, body
 
     def capture(self, context, at, *, action="conversation.reply", limit=None, max_chars=None):
-        with validation_batch(self.runtime, at), self.validation_scope() as cache:
+        with self.validation_scope() as cache:
             return self._capture(context, at, action=action, limit=limit, max_chars=max_chars,
                                  validated_records=cache["records"])
 
@@ -178,8 +178,37 @@ class BackgroundHistory:
         item_cap = DEFAULT_ITEMS if limit is None else max(0, min(int(limit), MAX_ITEMS))
         char_cap = MAX_CHARS if max_chars is None else max(0, min(int(max_chars), MAX_CHARS))
         snapshot = {"version": VERSION, "context_key": context.key, "references": []}
-        if not item_cap or not char_cap:
+        # 只把「候选引用」这一段放进读快照：正文校验若也在快照里跑，一条前台回复
+        # 会整段占住全局读锁（7.1.0 实测数秒，见 2026-11-07 性能报告 D2）。
+        # 每条正文自己复核授权与撤回，read() 再复核一遍封存引用，语义不变。
+        with validation_batch(self.runtime, at):
+            groups = self._candidate_groups(context, at, item_cap=item_cap, char_cap=char_cap)
+        if not groups:
             return snapshot
+        used = 0
+        selected = []
+        for group_refs in groups:
+            if len(selected) >= item_cap:
+                break
+            checked, group_size = [], 0
+            for ref in group_refs:
+                try:
+                    item = self._body(ref, context, at, validated_records=validated_records)
+                except TaskError:
+                    continue  # Optional history unavailable before sealing does not block a new conversation.
+                checked.append(ref)
+                group_size += len(json.dumps(item, ensure_ascii=False))
+            if not checked or used + group_size > char_cap:
+                continue
+            selected.append(checked)
+            used += group_size
+        snapshot["references"] = [ref for refs in reversed(selected) for ref in refs]
+        return snapshot
+
+    def _candidate_groups(self, context, at, *, item_cap, char_cap):
+        """Read the bounded candidate references while the shared snapshot is held."""
+        if not item_cap or not char_cap:
+            return ()
         scan_limit = max(item_cap, MAX_SCAN_ROUNDS)
         reset = boundary(self.runtime, context.scope)
         rounds = self.runtime.read_all("""SELECT owner, json_extract(request_json, '$.logical_key') AS logical_key,
@@ -189,7 +218,7 @@ class BackgroundHistory:
             GROUP BY owner, logical_key ORDER BY latest_at DESC, owner, logical_key LIMIT ?""",
             (context.key, stamp(at), reset["background_sequence"] if reset is not None else 0, scan_limit))
         if not rounds:
-            return snapshot
+            return ()
         clauses = " OR ".join("(owner = ? AND json_extract(request_json, '$.logical_key') = ?)"
                               for _ in rounds)
         pair_values = tuple(value for row in rounds for value in (row["owner"], row["logical_key"]))
@@ -203,29 +232,12 @@ class BackgroundHistory:
             grouped.setdefault((request.owner, request.logical_key), []).append(row)
         latest = {(row["owner"], row["logical_key"]): row["latest_at"] for row in rounds}
         ordered = sorted(grouped.items(), key=lambda item: latest.get(item[0], ""), reverse=True)
-        used = 0
-        selected = []
-        # Only this synchronous database snapshot shares validation. Every new
-        # read (including the send fence) rechecks withdrawals and authority.
-        for key, group_rows in ordered:
-            if len(selected) >= item_cap:
-                break
-            group_refs, group_size = [], 0
-            for row in sorted(group_rows,
-                              key=lambda item: DeliveryRequest.restore(item["request_json"]).sequence):
-                ref = self.reference(row)
-                try:
-                    item = self._body(ref, context, at, validated_records=validated_records)
-                except TaskError:
-                    continue  # Optional history unavailable before sealing does not block a new conversation.
-                group_refs.append(ref)
-                group_size += len(json.dumps(item, ensure_ascii=False))
-            if not group_refs or used + group_size > char_cap:
-                continue
-            selected.append(group_refs)
-            used += group_size
-        snapshot["references"] = [ref for refs in reversed(selected) for ref in refs]
-        return snapshot
+        return tuple(
+            tuple(self.reference(row) for row in sorted(
+                group_rows,
+                key=lambda item: DeliveryRequest.restore(item["request_json"]).sequence))
+            for _, group_rows in ordered
+        )
 
     def read(self, snapshot, context, at, *, action="conversation.reply", historical=False,
              round_metadata=False):

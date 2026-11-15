@@ -353,6 +353,10 @@ class StorageRuntime:
     DATABASE_FILENAME = "companion-v2.sqlite3"
     SLOW_OPERATION_SECONDS = 2.0
     SLOW_TRANSACTION_BODY_WARNING_SECONDS = 5.0
+    # Custom: a WAL that once grew large is reused forever unless the
+    # connection-scoped limit is set on every connection. Referenced by the
+    # passive checkpoint path below.
+    WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
     # Same window as the two rate-limited diagnostics this repository already
     # trusts: ProactiveScheduler._write_diagnostic(minimum_interval=60) and
     # report_slow_native_lookup (NATIVE_LOOKUP_SLOW_LOG_INTERVAL_SECONDS = 60).
@@ -585,6 +589,9 @@ class StorageRuntime:
         try:
             checkpoint = sqlite3.connect(str(self._database_path), timeout=0.0, isolation_level=None)
             checkpoint.execute("PRAGMA synchronous = FULL")
+            # The passive checkpoint is the moment SQLite trims the WAL down to
+            # the size limit; the limit belongs to the connection doing it.
+            checkpoint.execute(f"PRAGMA journal_size_limit = {self.WAL_SIZE_LIMIT_BYTES}")
             row = checkpoint.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
             result = tuple(int(value) for value in row)
             return result
@@ -824,6 +831,7 @@ class StorageRuntime:
             connection.execute("PRAGMA cache_size = -65536")
             connection.execute("PRAGMA mmap_size = 268435456")
             connection.execute("PRAGMA temp_store = MEMORY")
+            connection.execute(f"PRAGMA journal_size_limit = {self.WAL_SIZE_LIMIT_BYTES}")
         except (OSError, sqlite3.Error) as error:
             if connection is not None:
                 connection.close()

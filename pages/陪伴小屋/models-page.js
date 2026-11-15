@@ -637,10 +637,86 @@ window.CompanionModelsPage = (() => {
       for (const name of taskFields(task)) draft.inherited[name] = true;
       draft.touched = true; count++; }
     s.bad = false; s.notice = count ? `已把 ${count} 项任务改为跟随上级配置，保存后生效。` : '没有可调整的任务。'; render(); }
+  /* ---------- bulk default / fallback assignment ----------
+     One place to choose the default model and the fallback model, then apply
+     both to every functional task. It writes the same drafts the per-task
+     selects do and reuses saveTasks(), so validation, operation keys, pending
+     confirmation and failure recovery all stay on the existing path. */
+  function bulkConsensus(s, name) {
+    const counts = new Map();
+    for (const task of snapshot(s)) {
+      if (coreReply(task)) continue;
+      const draft = s.drafts.get(task.kind);
+      if (!draft) continue;
+      const value = name === "provider" ? providerFor(task, draft) : effective(task, draft, "fallback");
+      if (value) counts.set(value, (counts.get(value) || 0) + 1);
+    }
+    let best = "", bestCount = 0;
+    for (const [value, count] of counts) if (count > bestCount) { best = value; bestCount = count; }
+    return best;
+  }
+  /* Undefined means "show the current consensus"; an explicit empty string is a
+     real choice (no fallback), so ?? must not swallow it. */
+  function bulkChoice(s) {
+    return {
+      primary: s.bulk?.primary ?? bulkConsensus(s, "provider"),
+      fallback: s.bulk?.fallback ?? bulkConsensus(s, "fallback"),
+    };
+  }
+  function bulkBar(s) {
+    if (!s.status?.providers?.length) return "";
+    const providers = s.status.providers, {primary, fallback} = bulkChoice(s);
+    const count = snapshot(s).filter(task => !coreReply(task)).length;
+    const locked = s.busy || s.loading || s.denied;
+    const options = (value, emptyLabel) => `<option value="" ${value ? "" : "selected"}>${esc(emptyLabel)}</option>`
+      + providers.map(provider => `<option value="${esc(provider.id)}" ${provider.id === value ? "selected" : ""}>${esc(providerLabel(provider))}</option>`).join("");
+    return `<div class="model-selbar"><b>统一模型设置</b>
+      <label><span>默认模型</span><select data-model-bulk="primary" aria-label="统一默认模型" ${locked ? "disabled" : ""}>${options(primary, "选择模型…")}</select></label>
+      <label><span>备用模型</span><select data-model-bulk="fallback" aria-label="统一备用模型" ${locked ? "disabled" : ""}>${options(fallback, "不使用备用模型")}</select></label>
+      <button type="button" class="button small primary" data-model-bulk-apply ${locked || !primary || primary === fallback ? "disabled" : ""}>应用到全部并保存</button>
+      <small>覆盖 ${count} 项功能的单独设置 · 核心回复由 AstrBot 管理，不参与</small></div>`;
+  }
+  function applyBulk(s) {
+    const {primary, fallback} = bulkChoice(s);
+    const providers = s.status?.providers || [];
+    const main = providers.find(provider => provider.id === primary);
+    const spare = fallback ? providers.find(provider => provider.id === fallback) : null;
+    if (!primary || !main || primary === fallback || (fallback && !spare)) {
+      s.bad = true; s.notice = "请先选择两个不同、且已在 AstrBot 加载的模型（备用可留空）。"; render(); return;
+    }
+    if (s.busy || s.loading || s.denied) return;
+    const kinds = [], skipped = [];
+    for (const task of snapshot(s)) {
+      if (coreReply(task)) continue;
+      const draft = s.drafts.get(task.kind);
+      if (!draft || draft.pending || draft.stale) { skipped.push(taskName(task.kind).label); continue; }
+      const fits = provider => task.capabilities.every(cap => provider.capabilities.includes(cap));
+      if (!fits(main) || (spare && !fits(spare))) { skipped.push(taskName(task.kind).label); continue; }
+      draft.values.provider = primary;
+      draft.values.fallback = fallback;
+      draft.inherited.provider = false;
+      draft.inherited.fallback = false;
+      draft.touched = true;
+      fitLimit(s, task, draft);
+      kinds.push(task.kind);
+    }
+    if (!kinds.length) { s.bad = true; s.notice = "没有可统一设置的任务，请刷新配置后重试。"; render(); return; }
+    s.bad = false;
+    s.notice = `正在把 ${kinds.length} 项功能统一为 ${primary}${fallback ? " → " + fallback : "（不使用备用）"}…`;
+    if (skipped.length) s.notice += ` ${skipped.length} 项能力不符或待核对，已跳过。`;
+    render();
+    saveTasks(s, kinds);
+  }
   /* ---------- functional events ---------- */
   function fnInput(event) { const s = state; if (!s || s.busy || s.loading || s.denied) return; const target = event.target;
     /* The policy pane owns toggles and selects, so it gets every input event. */
     if (s.sub === "pol") { event.type === "change" ? ruleChange(s, event) : ruleInput(s, event); return; }
+    if (target.matches("[data-model-bulk]")) {
+      if (event.type !== "change") return;
+      s.bulk = s.bulk || {};
+      s.bulk[target.dataset.modelBulk] = target.value;
+      render(); return;
+    }
     if (target.matches("[data-model-search]")) { s.query = target.value; render(); const next = root.querySelector("[data-model-search]");
       if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); } return; }
     if (target.matches("[data-model-provider-filter]")) { if (event.type !== "change") return; s.providerFilter = target.value || null; render(); return; }
@@ -664,6 +740,8 @@ window.CompanionModelsPage = (() => {
     if (event.target.closest("[data-drawer-close]")) { s.drawer = null; render(); return; }
     const pill = event.target.closest("[data-provider-pill]");
     if (pill) { s.drawer = s.drawer === pill.dataset.providerPill ? null : pill.dataset.providerPill; render(); return; }
+    const bulkApply = event.target.closest("[data-model-bulk-apply]");
+    if (bulkApply) { applyBulk(s); return; }
     const goto = event.target.closest("[data-drawer-goto]");
     if (goto) { s.drawer = null; s.sub = "cfg"; s.cm = "precise"; s.view = "tasks"; s.providerFilter = goto.dataset.drawerGoto; render(); return; }
     const exp = event.target.closest("[data-model-exp]");
@@ -2060,7 +2138,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       return `<section class="model-grp"><header><input type="checkbox" class="model-gck" data-model-gpick="${esc(gkey)}" ${all ? "checked" : ""} aria-label="全选 ${esc(g)}">${icon(groupIcon(g))}<b>${esc(g)}</b><span class="cnt">${ts.length} 项${sel ? " · 已选 " + sel : ""}</span></header>
         ${items || '<p class="model-empty">没有匹配的任务。</p>'}</section>`; }).join("");
     const legend = (s.status?.providers || []).map(p => `<span><i style="background:${pillColor(p.id)}"></i><em>${esc(p.id)}</em></span>`).join("");
-    return `<div class="model-subpane"><div class="model-kpis">${fnKpis(s)}</div>${sitFilters(s)}
+    return `<div class="model-subpane"><div class="model-kpis">${fnKpis(s)}</div>${bulkBar(s)}${sitFilters(s)}
       <details class="model-mlgd-box"><summary><span>模型提供方图例</span><small>${(s.status?.providers || []).length} 个 · 点击展开</small></summary><div class="model-mlgd legend">${legend}</div></details>
       <div class="model-rgrid">${list}</div>${testBar(s)}</div>`; }
   const probeLabel = result => result.status === "ok" ? `连接成功 · ${result.latency_ms} ms`
@@ -2347,7 +2425,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     const cmSeg = [["quick", "快速配置"], ["precise", "精确配置"]];
     const seg = `<div class="model-seg" role="group" aria-label="配置模式">${cmSeg.map(([id, label]) => `<button type="button" data-model-cm="${id}" aria-pressed="${s.cm === id}" class="${s.cm === id ? "on" : ""}">${label}</button>`).join("")}</div>`;
     const body2 = s.cm === "quick" ? quickConfig(s) : `${toolbar(s)}<div class="model-queue-slot">${queue(s)}</div>${body(s)}`;
-    return `<div class="model-subpane"><div class="model-note cfg">${seg}</div>${notice(s)}${s.cm === "quick" ? "" : overview(s)}${body2}</div>`; }
+    return `<div class="model-subpane"><div class="model-note cfg">${seg}</div>${bulkBar(s)}${notice(s)}${s.cm === "quick" ? "" : overview(s)}${body2}</div>`; }
   /* ---------- replacement policy: mutations ---------- */
   const ruleTarget = ref => { const [kind, index] = String(ref || "").split(":"); return { kind, index: Number(index) }; };
   /* Every rule edit funnels through here so the JSON the gateway reads stays canonical. */

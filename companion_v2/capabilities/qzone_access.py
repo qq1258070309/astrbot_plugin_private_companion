@@ -14,8 +14,9 @@ from companion_v2.capabilities.models import CapabilityAuthorizationState, Capab
 from companion_v2.capabilities.repositories import CapabilityRepository
 from companion_v2.execution.models import TaskError, digest, encode, require
 from companion_v2.foundation.refs import OperationRef, ScopeKind, VersionRef
-from companion_v2.identity_policy.models import AuthorizationTier
+from companion_v2.identity_policy.models import AuthorizationTier, GrantState
 from companion_v2.identity_policy.object_access import ObjectAccessPolicy
+from companion_v2.identity_policy.personas import PersonaDirectory
 from companion_v2.identity_policy.repository import PersistentIdentityDirectory
 from companion_v2.qzone.capability import CAPABILITIES, EXTENSION
 from companion_v2.qzone.capability import package_descriptor
@@ -27,6 +28,8 @@ from companion_v2.storage.repositories import OperationRepository
 
 OWNER = "capability.qzone-access"
 INVOKE_CAPABILITY = "extension.tool.invoke"
+# The zones this role owns; see ``_person_scope``.
+PRIVATE_ZONES = "private-zones"
 
 
 def package():
@@ -62,6 +65,50 @@ def catalogue(settings=None):
                        "scenes": effective, "declared_scenes": declared,
                        "enabled": bool(values.get(f"{item.topic.value}_enabled", True))})
     return {"topics": topics, "scenes": dict(SCENES)}
+
+
+def _person_scope(runtime, context):
+    """The persona routes where this participant is the private owner.
+
+    Consent was being written into a single private window, so the Zone tools
+    only ever appeared in the one chat the operator happened to be in when they
+    pressed the switch: a second account of the same person, or the proactive
+    worker composing into another window, saw no tools at all and nothing in the
+    Zone state recorded a refusal. The person, not the chat, owns this switch.
+
+    Groups, and threads whose parent is a group, are never included; a group's
+    speaker is not its owner. An owner whose own window cannot be resolved falls
+    back to the requested scope alone, which keeps the previous behaviour.
+    """
+    own = [context.scope] + [route.scope for route in PersonaDirectory(runtime).routes()
+                             if route.scene_kind is ScopeKind.PRIVATE
+                             and route.user is not None and route.user == context.actor.subject]
+    unique = {}
+    for scope in own:
+        unique[(scope.key, scope.conversation_id, scope.session_id)] = scope
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _replace_authorization(repository, *, capability, subject, scope, active, at):
+    """Point this person's retained consent at ``scope`` (or drop it there).
+
+    Idempotent on purpose: one switch press may revisit the same window through
+    both the person-wide sweep and the original requested-scope write.
+    """
+    target = CapabilityAuthorizationState.ACTIVE if active else CapabilityAuthorizationState.REVOKED
+    consent = repository.consent(extension_id=EXTENSION, capability_id=capability,
+                                 subject=subject, scope=scope)
+    if not consent.is_success:
+        if not active:
+            return
+        expected = 0
+    else:
+        current = consent.unwrap()
+        if current.state is target:
+            return
+        expected = current.revision
+    repository.set_authorization(extension_id=EXTENSION, capability_id=capability,
+        subject=subject, scope=scope, state=target, expected_revision=expected, observed_at=at).unwrap()
 
 
 class QzoneAccess:
@@ -121,6 +168,37 @@ class QzoneAccess:
             rows[capability] = dict(row) if row is not None else None
         return rows
 
+    def _zone(self, scope):
+        """An owner scope as the page shows it; the account never appears in the label."""
+        route = PersonaDirectory(self.runtime).route(scope)
+        user = route.user.subject_id if route is not None and route.user is not None else ""
+        return {"conversation_id": scope.conversation_id, "scene_kind": scope.kind.value,
+                "owner": user.rsplit(":", 1)[-1] if user else "", "session_id": scope.session_id}
+
+    def _extend_invoke_grants(self, context, zones, *, at):
+        """Let the Zone tools follow the person into their other own windows.
+
+        Each switch press used to mint one grant for one window, keyed by that
+        command, and the next press minted a second grant for the same window:
+        the directory then matched two identical grants and answered
+        ``scope_not_granted``, so the tools stopped appearing even in the window
+        the operator had just authorised. Grants are now keyed by the window and
+        issued once; a window that is already granted is left alone.
+        """
+        subject = context.actor.subject
+        held = {grant.scope.key for grant in self.identities.grants_for_subject(subject)
+                if grant.capability == INVOKE_CAPABILITY and grant.state is GrantState.ACTIVE}
+        pending = [scope for scope in zones if scope.key not in held]
+        if not pending:
+            return
+        binding = next(item for item in self.identities.snapshot().bindings
+                       if item.binding_id == context.actor.binding_id)
+        for scope in pending:
+            self.identities.issue_grant(grant_id="qzone-invoke:" + digest([EXTENSION, scope.key]),
+                subject=subject, scope=scope, capability=INVOKE_CAPABILITY,
+                tier=AuthorizationTier.STANDARD, valid_from=at, expires_at=binding.expires_at,
+                expected_revision=self.identities.revision)
+
     def _token(self, state):
         return digest([EXTENSION, self.context.key, encode(self.package),
                        [encode(item) if item is not None else None for item in state],
@@ -157,6 +235,8 @@ class QzoneAccess:
             return {"extension_id": EXTENSION, "package_version": self.package.package_version,
                     "installed": installed is not None, "active": active, "role_enabled": role_enabled,
                     "consented": consented, "invoke_granted": granted, "reason": reason,
+                    "grant_zones": [self._zone(scope) for scope in _person_scope(self.runtime, self.context)],
+                    "credential": dict(self.credential_state or {}), "runtime": runtime,
                     "credential": dict(credential or {}), "runtime": runtime,
                     "capabilities": list(CAPABILITIES),
                     "catalogue": catalogue((runtime or {}).get("settings")),
@@ -184,6 +264,7 @@ class QzoneAccess:
                     raise TaskError("capability_operation_unresolved", "the original install command is unresolved")
                 return {"replayed": True, "status": self.status(operator, at)}
             state = (self._installation(), self._selection(), self._consents())
+            zones = _person_scope(self.runtime, context)
             if command["edit_token"] != self._token(state):
                 raise TaskError("qzone_access_changed", "refresh the changed install settings before saving")
             installed, selection, consents = state
@@ -203,23 +284,24 @@ class QzoneAccess:
                     require(self.repository.set_role_enabled(extension_id=EXTENSION,
                         role=context.role_binding.role, bot_id=context.scope.bot_id, enabled=True,
                         expected_revision=selection.revision if selection else 0, observed_at=at))
-                if not self.identities.authorize(context.actor, scope=context.scope,
-                        capability=INVOKE_CAPABILITY, observed_at=at).is_success:
-                    binding = next(item for item in self.identities.snapshot().bindings
-                                   if item.binding_id == context.actor.binding_id)
-                    self.identities.issue_grant(grant_id="qzone-invoke:" + key,
-                        subject=context.actor.subject, scope=context.scope, capability=INVOKE_CAPABILITY,
-                        tier=AuthorizationTier.STANDARD, valid_from=at, expires_at=binding.expires_at,
-                        expected_revision=self.identities.revision)
+                self._extend_invoke_grants(context, zones, at=at)
             # Revocation only clears this participant's consent; the role switch and
             # the installed package stay as the admin set them.
             if installed is not None:
+                others = tuple(scope for scope in zones if scope.key != context.scope.key)
                 for capability in CAPABILITIES:
-                    row = consents.get(capability)
-                    require(self.repository.set_authorization(extension_id=EXTENSION, capability_id=capability,
-                        subject=context.actor.subject, scope=context.scope,
-                        state=CapabilityAuthorizationState.ACTIVE if enabled else CapabilityAuthorizationState.REVOKED,
-                        expected_revision=row["revision"] if row else 0, observed_at=at))
+                    for scope in others:
+                        _replace_authorization(self.repository, capability=capability,
+                                               subject=context.actor.subject, scope=scope, active=enabled, at=at)
+                    if enabled:
+                        row = consents.get(capability)
+                        require(self.repository.set_authorization(extension_id=EXTENSION, capability_id=capability,
+                            subject=context.actor.subject, scope=context.scope,
+                            state=CapabilityAuthorizationState.ACTIVE,
+                            expected_revision=row["revision"] if row else 0, observed_at=at))
+                    else:
+                        _replace_authorization(self.repository, capability=capability,
+                                               subject=context.actor.subject, scope=context.scope, active=False, at=at)
             require(operations.transition(operation.operation_id, expected_state=OperationState.ACCEPTED,
                                           next_state=OperationState.COMPLETED, observed_at=at))
             return {"replayed": False, "status": self.status(operator, at)}

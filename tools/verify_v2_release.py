@@ -266,7 +266,7 @@ def verify(release, destination):
     core = destination / CORE_ID
     import yaml
     metadata = yaml.safe_load((core / "metadata.yaml").read_text(encoding="utf-8"))
-    if metadata.get("repo") != "https://github.com/menglimi/astrbot_plugin_private_companion":
+    if metadata.get("repo") != "https://github.com/qq1258070309/astrbot_plugin_private_companion":
         raise ValueError("release metadata must preserve the public repository update source")
     schema = json.loads((core / "_conf_schema.json").read_text(encoding="utf-8"))
     if schema["staging"]["items"]["enabled"]["default"] is not False or schema["multi_host"]["items"]["enabled"]["default"] is not False:

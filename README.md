@@ -43,7 +43,7 @@ WeChat Native 接入沿用 AstrBot 核心普通回复与适配器的原事件发
 - 使用说明：[插件 Wiki](https://vue.syuan.org)
 - 服务余额：[NewAPI 与高级请求／提取脚本](docs/service-balance.md)
 - 开发者入口：[开发文档索引](docs/README.md) · [贡献指南](CONTRIBUTING.md) · [第三方扩展开发规范](docs/extension-development.md)
-- 源代码：[GitHub 仓库](https://github.com/menglimi/astrbot_plugin_private_companion)
+- 源代码：[本定制发行仓库](https://github.com/qq1258070309/astrbot_plugin_private_companion) · [上游原仓库](https://github.com/menglimi/astrbot_plugin_private_companion)
 - 6.7.x 稳定版备份：[只读备份仓库](https://github.com/menglimi/astrbot_plugin_private_companion_v2)
 - 问题反馈/交流群：QQ 群 `1097283005`
 - 自愿支持：[爱发电](https://ifdian.net/a/xuhaun)

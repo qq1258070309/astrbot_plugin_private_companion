@@ -20,8 +20,9 @@ from companion_v2.model_gateway.budget import BudgetLedger
 from companion_v2.identity_policy.models import AuthorizationTier, GrantState
 from companion_v2.identity_policy.personas import ConversationRoute
 from companion_v2.role_work.growth import GrowthKind, GrowthState, RoleGrowthRecord
-from companion_v2.role_work.state.maintenance import (PROMPT as STATE_MAINTENANCE_PROMPT,
-    STATE_INTERVENTION_INSTRUCTION, state_output_budget, state_profile)
+from companion_v2.role_work.state.maintenance import (BASELINE_TEXT, PROMPT as STATE_MAINTENANCE_PROMPT,
+    STATE_INTERVENTION_INSTRUCTION, fill_baseline, state_output_budget, state_profile,
+    PREFLIGHT_RETRY_SECONDS)
 from companion_v2.role_work.state.management import StateManagement
 from companion_v2.role_work.state.service import FIELDS
 from companion_v2.sources.models import SourceRecord
@@ -59,6 +60,39 @@ class StateInterventionPromptTests(unittest.TestCase):
         self.assertIn("把握较高的主观状态可以适度、短时变化", STATE_INTERVENTION_INSTRUCTION)
         self.assertIn("睡眠、休息和现实活动仍须对应执行回执", STATE_INTERVENTION_INSTRUCTION)
         self.assertNotIn("关心、建议、邀请", STATE_MAINTENANCE_PROMPT)
+
+
+class StateMaintenancePromptTests(unittest.TestCase):
+    """健康与位置必须按常态持续记录，否则陪伴小屋只会一直显示“尚未记录”。"""
+
+    def test_health_is_described_even_without_a_complaint(self):
+        self.assertIn("不必等到不适才写", STATE_MAINTENANCE_PROMPT)
+        self.assertIn("不要因为“没有变化”长期留 null", STATE_MAINTENANCE_PROMPT)
+        self.assertIn("不要写成医学结论", STATE_MAINTENANCE_PROMPT)
+
+    def test_location_keeps_the_previous_position_and_never_others(self):
+        self.assertIn("沿用 previous_simulation 中的位置", STATE_MAINTENANCE_PROMPT)
+        self.assertIn("也不写聊天对象或他人的位置", STATE_MAINTENANCE_PROMPT)
+
+
+class StateBaselineTests(unittest.TestCase):
+    """面板恒显示健康与位置，模型留空时不能让字段退回“尚未记录”。"""
+
+    def test_null_fields_carry_the_last_written_value(self):
+        previous = {"state": "saved", "values": state_data(health="有点累", location="书房")}
+        data = fill_baseline(previous, state_data(energy=30), {})
+        self.assertEqual((data["health"], data["location"]), ("有点累", "书房"))
+
+    def test_missing_history_states_a_plain_baseline(self):
+        data = fill_baseline({"state": "unknown"}, state_data(), {})
+        self.assertEqual(data["health"], BASELINE_TEXT["health"])
+        self.assertEqual(data["location"], BASELINE_TEXT["location"])
+
+    def test_model_values_win_and_disabled_fields_stay_unset(self):
+        previous = {"state": "saved", "values": state_data(health="有点累", location="书房")}
+        data = fill_baseline(previous, state_data(health="好多了"), {"location_enabled": False})
+        self.assertEqual(data["health"], "好多了")
+        self.assertIsNone(data["location"])
 
 
 class StateFixture(HostFixture):
@@ -786,7 +820,7 @@ class StateMaintenanceTests(StateFixture, unittest.IsolatedAsyncioTestCase):
             app.state_maintenance.bind(context, "原角色人格提示")
             app.state_maintenance.advance()
             self.assertEqual(check.call_count, first_checks)
-            self.clock.advance(timedelta(seconds=31))
+            self.clock.advance(timedelta(seconds=PREFLIGHT_RETRY_SECONDS + 1))
             app.state_maintenance.advance()
             self.assertGreater(check.call_count, first_checks)
         self.assertEqual(self.called, [])

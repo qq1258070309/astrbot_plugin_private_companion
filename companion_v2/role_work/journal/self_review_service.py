@@ -50,7 +50,10 @@ MIN_EVIDENCE = 2
 # few minutes later: the same model with the same prompt returns the same shape.
 # Back off for hours instead of burning a full request every five minutes.
 OUTPUT_FAILURE_RETRY_SECONDS = 6 * 3600
-TRANSIENT_FAILURE_RETRY_SECONDS = 5 * 60
+# A transient failure (upstream 504 / provider timeout) used to retry every
+# 5 minutes. With several contexts that becomes a retry storm competing with
+# foreground replies for the same provider connection.
+TRANSIENT_FAILURE_RETRY_SECONDS = 20 * 60
 
 
 def retry_delay(code):

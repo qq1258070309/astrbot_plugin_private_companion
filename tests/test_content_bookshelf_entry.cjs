@@ -1,4 +1,4 @@
-/* 创作书架不能把未装配的用户送进没有装配按钮的产出页。 */
+/* 创作书架与产出页都不能把未装配的用户留在没有装配按钮的地方。 */
 "use strict";
 
 const assert = require("node:assert/strict");
@@ -22,5 +22,15 @@ test("产出页 Content 卡片在未装配时也提供装配按钮", () => {
   assert.match(source, /装配 Content 拓展/);
   assert.match(source, /data-builtin-extension="content" data-builtin-extension-action="assemble"/);
   assert.match(source, /outputProviderLine\('content','Content 授权'\)\}\$\{contentAssembleButton\(\)\}/);
+  assert.match(source, /else if\(action==='assemble'\)render\(\);/);
+});
+
+test("产出页生成能力在未装配时提供图像拓展装配入口与触发说明", () => {
+  assert.match(source, /outputProviderLine\('image','图像生成'\)\}\$\{imageAssembleNotice\(\)\}/);
+  assert.match(source, /function imageAssembleNotice\(\)\{/);
+  assert.match(source, /product\.extension\('image'\)/);
+  assert.match(source, /装配图像拓展/);
+  assert.match(source, /data-builtin-extension="image" data-builtin-extension-action="assemble"/);
+  assert.match(source, /不会自行画图/);
   assert.match(source, /else if\(action==='assemble'\)render\(\);/);
 });

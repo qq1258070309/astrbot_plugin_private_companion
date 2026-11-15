@@ -135,6 +135,26 @@ class StorageRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_large_store_read_path_is_tuned_without_weakening_durability(self) -> None:
+        with TemporaryDirectory(prefix="companion-v2-storage-") as temporary:
+            runtime = StorageRuntime.open(data_root=Path(temporary) / "v2-data", installation_id=INSTALLATION_ID)
+            try:
+                # The checkpoint contract is unchanged: FULL sync + explicit passive checkpoints.
+                self.assertEqual(runtime.read_one("PRAGMA synchronous", ())[0], 2)
+                self.assertEqual(runtime.read_one("PRAGMA wal_autocheckpoint", ())[0], 0)
+                self.assertEqual(runtime.read_one("PRAGMA cache_size", ())[0],
+                                 -StorageRuntime.PAGE_CACHE_KIB)
+                self.assertEqual(runtime.read_one("PRAGMA temp_store", ())[0], 2)
+                self.assertEqual(runtime.read_one("PRAGMA journal_size_limit", ())[0],
+                                 StorageRuntime.WAL_SIZE_LIMIT_BYTES)
+                # Some platforms refuse mmap; requesting it must never break opening the store.
+                self.assertIn(runtime.read_one("PRAGMA mmap_size", ())[0],
+                              (0, StorageRuntime.MMAP_BYTES))
+                self.assertEqual(StorageRuntime.PAGE_CACHE_KIB, 64 * 1024)
+                self.assertEqual(StorageRuntime.MMAP_BYTES, 256 * 1024 * 1024)
+                self.assertEqual(StorageRuntime.WAL_SIZE_LIMIT_BYTES, 64 * 1024 * 1024)
+            finally:
+                runtime.close()
     def test_runtime_added_indexes_do_not_block_reopening_the_database(self) -> None:
         """Native conversation code adds optimization indexes at runtime.
 

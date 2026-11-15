@@ -176,10 +176,11 @@ class QzoneToolPort:
         except TaskError as error:
             if error.code == "qzone_delivery_unknown":
                 return ExternalToolResponse(invocation.invocation_id, invocation.context.key,
-                    invocation.arguments_hash, declaration.descriptor.binding, "unknown", effect="unknown")
+                    invocation.arguments_hash, declaration.descriptor.binding, "unknown", effect="unknown",
+                    error_code=error.code)
             return ExternalToolResponse(invocation.invocation_id, invocation.context.key,
                 invocation.arguments_hash, declaration.descriptor.binding, "failed", effect="not_committed",
-                receipt_ref=self._receipt(invocation, error.code))
+                receipt_ref=self._receipt(invocation, error.code), error_code=error.code)
         observed_at = service.now()
         effectful = action in (LIKE_ACTION, COMMENT_ACTION, PUBLISH_ACTION)
         operation_id = result.get("operation_id") if effectful else None

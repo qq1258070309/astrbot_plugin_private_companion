@@ -1,0 +1,231 @@
+name: Sync upstream, verify compatibility, and release
+
+# Every upstream release is merged into main, put through the upstream contract
+# tests plus fork-specific checks, reviewed by an LLM, and only then published.
+# Anything uncertain opens a PR instead of publishing. Nothing here touches a
+# running AstrBot instance.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Align to a specific upstream tag (blank = latest release)"
+        required: false
+        type: string
+      dry_run:
+        description: "Run all checks but publish nothing"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [upstream-release]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: companion-fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: menglimi/astrbot_plugin_private_companion
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install gate dependencies
+        run: |
+          python -m pip install -q PyYAML regex Pillow httpx aiohttp 'cryptography>=42' tzdata
+
+      - name: Configure git
+        run: |
+          git config user.name "fork-sync[bot]"
+          git config user.email "fork-sync[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream --tags --prune
+
+      - name: Resolve upstream tag
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED: ${{ inputs.upstream_tag }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            TAG="$REQUESTED"
+          else
+            TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          python -X utf8 tools/fork_release.py should-sync \
+            --upstream-tag "$TAG" --outputs "$GITHUB_OUTPUT"
+          if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/$TAG" --jq .body \
+               > "$RUNNER_TEMP/upstream-notes.md"; then
+            echo "(upstream release notes unavailable)" > "$RUNNER_TEMP/upstream-notes.md"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.target.outputs.needed == 'true'
+        env:
+          REPORT: ${{ runner.temp }}/conflicts.json
+        run: |
+          git checkout -B "sync/${{ steps.target.outputs.tag }}" origin/main
+          git merge --no-commit --no-ff "${{ steps.target.outputs.tag }}" || true
+          python -X utf8 tools/fork_release.py resolve-merge --report "$REPORT"
+          REVIEW="$(REPORT="$REPORT" python -X utf8 -c '
+          import json, os
+          print("true" if json.load(open(os.environ["REPORT"]))["needs_review"] else "false")
+          ')"
+          echo "review_needed=$REVIEW" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare fork release
+        if: steps.target.outputs.needed == 'true' && steps.merge.outputs.review_needed == 'false'
+        run: |
+          python -X utf8 tools/fork_release.py prepare \
+            --upstream-tag "${{ steps.target.outputs.tag }}"
+          python -X utf8 tools/sync_framework_page.py
+          python -X utf8 tools/fork_release.py check
+
+      - name: Mechanical gates
+        id: gates
+        if: steps.target.outputs.needed == 'true' && steps.merge.outputs.review_needed == 'false'
+        continue-on-error: true
+        run: |
+          bash tools/fork_gates.sh \
+            "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
+            2>&1 | tee "$RUNNER_TEMP/gates.log"
+          echo '{"result":"pass"}' > "$RUNNER_TEMP/gates.json"
+
+      - name: AI compatibility review
+        id: ai
+        if: >-
+          steps.target.outputs.needed == 'true' &&
+          steps.merge.outputs.review_needed == 'false' &&
+          steps.gates.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          git diff --cached --stat > "$RUNNER_TEMP/merge-diff.txt" || true
+          git diff --cached --name-status >> "$RUNNER_TEMP/merge-diff.txt" || true
+          VERSION="$(python -X utf8 tools/fork_release.py version)"
+          python -X utf8 tools/ai_compat_review.py \
+            --diff "$RUNNER_TEMP/merge-diff.txt" \
+            --notes "$RUNNER_TEMP/upstream-notes.md" \
+            --conflicts "$RUNNER_TEMP/conflicts.json" \
+            --customizations FORK_CUSTOMIZATIONS.md \
+            --gates "$RUNNER_TEMP/gates.json" \
+            --version "$VERSION" \
+            --upstream-tag "${{ steps.target.outputs.tag }}" \
+            --report "$RUNNER_TEMP/COMPAT_REPORT.md" \
+            --outputs "$GITHUB_OUTPUT"
+
+      - name: Decide
+        id: decide
+        if: steps.target.outputs.needed == 'true'
+        run: |
+          PUBLISH=false
+          if [ "${{ steps.merge.outputs.review_needed }}" = "false" ] \
+             && [ "${{ steps.gates.outcome }}" = "success" ] \
+             && [ "${{ steps.ai.outputs.compatible }}" = "true" ] \
+             && [ "${{ inputs.dry_run }}" != "true" ]; then
+            PUBLISH=true
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH review=${{ steps.merge.outputs.review_needed }} gates=${{ steps.gates.outcome }} ai=${{ steps.ai.outputs.compatible }}"
+
+      - name: Publish release
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          VERSION="$(python -X utf8 tools/fork_release.py version)"
+          {
+            echo "## $VERSION"
+            echo
+            echo "对齐上游 [$TAG](https://github.com/${UPSTREAM_REPO}/releases/tag/$TAG)，保留本地定制。"
+            echo
+            echo "机械门禁与 AI 兼容性审查均通过；完整结论见附件 COMPAT_REPORT.md。"
+            echo
+            echo "变更明细见 CHANGELOG.md。"
+          } > "$RUNNER_TEMP/release-notes.md"
+          git add -A
+          git commit -m "release: $VERSION (aligned with $TAG)"
+          git push origin HEAD:main
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" \
+            "$RUNNER_TEMP/fork-release"/*.zip \
+            "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
+            "$RUNNER_TEMP/COMPAT_REPORT.md" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Open review PR
+        if: >-
+          steps.target.outputs.needed == 'true' &&
+          steps.decide.outputs.publish != 'true' &&
+          inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          {
+            echo "## 上游同步待审（未发布）"
+            echo
+            echo "- 目标上游 tag: \`$TAG\`"
+            echo "- 当前对齐: \`$(cat UPSTREAM_BASE)\`"
+            echo "- 需人工裁决的冲突: \`${{ steps.merge.outputs.review_needed }}\`"
+            echo "- 机械门禁: \`${{ steps.gates.outcome }}\`"
+            echo "- AI 审查: \`${{ steps.ai.outputs.compatible }}\`（configured: \`${{ steps.ai.outputs.ai_configured }}\`）"
+            echo
+            echo "本分支为临时同步分支，**没有创建 Release**。请裁决冲突或补齐 Secrets 后重跑该 workflow。"
+            echo
+            if [ -f "$RUNNER_TEMP/conflicts.json" ]; then
+              echo "### 冲突报告"
+              echo '```json'
+              cat "$RUNNER_TEMP/conflicts.json"
+              echo '```'
+            fi
+            if [ -f "$RUNNER_TEMP/COMPAT_REPORT.md" ]; then
+              echo
+              echo "### 兼容性报告"
+              cat "$RUNNER_TEMP/COMPAT_REPORT.md"
+            fi
+            if [ -f "$RUNNER_TEMP/gates.log" ]; then
+              echo
+              echo "### 门禁日志（尾部）"
+              echo '```'
+              tail -60 "$RUNNER_TEMP/gates.log"
+              echo '```'
+            fi
+          } > "$RUNNER_TEMP/pr-body.md"
+          git add -A
+          git commit -m "sync: $TAG (pending review)" || echo "nothing to commit"
+          git push -f origin "HEAD:sync/$TAG"
+          if gh pr view "sync/$TAG" --json number >/dev/null 2>&1; then
+            gh pr edit "sync/$TAG" --body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            gh pr create --base main --head "sync/$TAG" \
+              --title "同步上游 $TAG（待审，未发布）" \
+              --body-file "$RUNNER_TEMP/pr-body.md"
+          fi

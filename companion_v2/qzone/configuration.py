@@ -48,6 +48,9 @@ DEFAULTS = {
     "life_publish_min_interval_hours": 24,
     "life_publish_max_daily": 1,
     "life_publish_style_prompt": "",
+    # 凭据坏了以后要不要私聊管理员。自动重取本身一直进行（1 分钟 → 24 小时逐级
+    # 递推，见 companion_v2/qzone/credential.py），这一项只决定"说不说"。
+    "credential_admin_notice": True,
 }
 for _topic in TOPIC_SPECS:
     _key = _topic.topic.value
@@ -74,7 +77,8 @@ for _topic in TOPIC_SPECS:
         f"{_key}_cooldown_minutes": (0, 1440),
     })
 BOOLEAN_FIELDS = ("enabled", "like_enabled", "comment_enabled", "publish_enabled",
-                  "topic_auto_enabled", "topic_require_confirmation", "life_publish_enabled") + tuple(
+                  "topic_auto_enabled", "topic_require_confirmation", "life_publish_enabled",
+                  "credential_admin_notice") + tuple(
                       f"{item.topic.value}_enabled" for item in TOPIC_SPECS)
 INTEGER_FIELDS = tuple(LIMITS)
 PROBABILITY_FIELDS = ("life_publish_probability",) + tuple(

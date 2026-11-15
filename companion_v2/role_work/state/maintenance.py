@@ -38,13 +38,16 @@ KIND = "role.state.maintain"
 STATE_BUDGET_SECONDS = 180
 STATE_MARGIN_SECONDS = 30
 STATE_PROVIDER_TIMEOUT_SECONDS = STATE_BUDGET_SECONDS - STATE_MARGIN_SECONDS
-PREFLIGHT_RETRY_SECONDS = 30
+# Failed preflight / budget deferrals used to retry every 30 s. Under an
+# upstream 504 that turns into a hot loop on the shared provider connection.
+PREFLIGHT_RETRY_SECONDS = 300
+BUDGET_DEFER_RETRY_SECONDS = 300
 # The local patrol reads state once per bound role and never calls a model; the
 # throttle only keeps the wake loop from re-reading configuration on every tick.
 PATROL_CHECK_SECONDS = 60
 INTERVENTION_DIALOGUE_WINDOW = timedelta(minutes=3)
 PROMPT = """本轮是角色状态的后台维护，只生成 role_state 数据，不给聊天对象写回复。原人格决定身体设定与生活习惯；maintenance_minutes 是观察间隔，不是状态必须变差的周期。
-健康、能够照顾自己的普通生活是常态。疾病应有具体情境和连续过程，不为更新而随机生病，也不把一次不适反复当成新发病。previous_simulation 和 simulation_history 都是此前模型的模拟，重复保存不构成新的病情证据；结合原始时间判断同一次不适如何平稳、缓解或结束，不把“昨天”“整夜”每天滚动续写。
+健康、能够照顾自己的普通生活是常态。疾病应有具体情境和连续过程，不为更新而随机生病，也不把一次不适反复当成新发病。previous_simulation 和 simulation_history 都是此前模型的模拟，重复保存不构成新的病情证据；结合原始时间判断同一次不适如何平稳、缓解或结束，不把“昨天”“整夜”每天滚动续写。health 是角色自己对身体的主观体感，不必等到不适才写：没有异常时也用一句简短的常态描述（如“身体没什么不舒服”“坐久了腰有点发紧”），不要因为“没有变化”长期留 null，也不要写成医学结论或体检报告。
 若异常只剩长期重复的旧描述、缺乏近期独立材料支持，可以逐步回到惯常体验或保留未知，不必等待不存在的进食或服药执行系统才允许感受好转。已知仍在持续的具体症状则保持合理连续性，不无故抹去。
 recent_dialogue 是带时间、说话者的完整互动。分清用户与角色，用户的经历不移到角色身上；用户以“我”陈述的身体、睡眠、饥饿或情绪只属于用户，不把任一方的状态移到另一方。角色在互动中接受食物、照顾、药物或表达舒服些，可以自然影响饥饿、健康、心情与精力的模拟感受，注意先后顺序和已经反映过的影响，不机械叠加奖励，也不要求用户特定措辞。仅提供药物不等于已服用，更不等于立即痊愈；角色表达药效或缓解是可参考的主观体验，不是医疗诊断或真实服药回执。
 sleep_execution 记录实际睡眠，sleep_profile.has_sleep_history=false 或 sleep_execution=null 表示没有执行记录，不表示没睡、失眠或睡眠不足。自动睡眠未启用也不表示角色通宵。缺少进食、饮水记录同样不表示一直挨饿；允许按角色日常节律模拟普通饥饿、困倦与舒缓，不补造具体吃饭、入睡、醒来或服药经过。不能根据时间经过宣称现实行动已完成，不从清晨、沉默或对话推断已睡足、醒来或休息完成。
@@ -53,13 +56,32 @@ energy 是 0 到 100 的主观精力。结合 previous_simulation 及 updated_at
 busy 描述注意力，不决定是否拒答。共享状态只写角色自己的概括感受与活动，不写对象、他人位置或私人日程。当前窗口没新消息不表示不忙、情绪归零或状态结束；没有变化依据时保留有效状态或 null。
 临时影响使用含时区的合理 expires_at，表示下次复核时点，不是固定康复时刻；到期后重新评估当前感受，既不自动痊愈也不无依据续期。共享字段只写角色自己的概括感受，不记录聊天对象、私人互动原文或他人情况。presence 是公开 QQ 短状态，最多 8 个字符，写泛化活动（如阅读中、休息中）。
 online_mode 是会实际改变 QQ 账号的在线状态，away 会触发 QQ 原生离开自动回复，busy 也会改变账号对外表现；本插件不会自动设置 away 或 busy。不能用这些模式表达普通困倦、待休息、看书、注意力变化或窗口暂时没有消息。这些生活感受写在 sleep/busy/presence 中。正常接话、近期仍在连续互动时保持 online；previous_simulation 中过时的 away/busy 不因沿用旧状态而续期，旧值也应通过在线状态恢复。隐身仍只在明确配置时使用。online_mode 通常只输出 online/invisible/null；null 只表示本轮不改变平台状态。
-仅输出 JSON：energy 为 0 到 100 的整数或 null；hunger、health、sleep、busy、mood、location、cycle、presence、online_mode 通常为简短文字或 null，mood/cycle 按本轮各自结构协议；conditions 是 kind/text/expires_at 对象数组，kind 选 hunger/health/sleep/busy/mood/cycle/other，无临时变化填空数组。
+仅输出 JSON：energy 为 0 到 100 的整数或 null；hunger、health、sleep、busy、mood、location、cycle、presence、online_mode 通常为简短文字或 null，mood/cycle 按本轮各自结构协议；location 写角色自己此刻的大致所在，可按角色设定、当前时段与日历行程给出泛化说法（如“自己屋里”“回家的路上”），有移动依据时更新，没有依据时沿用 previous_simulation 中的位置，不要长期留 null，也不写聊天对象或他人的位置；conditions 是 kind/text/expires_at 对象数组，kind 选 hunger/health/sleep/busy/mood/cycle/other，无临时变化填空数组。
 """
 STATE_INTERVENTION_INSTRUCTION = (
     "\n本轮是获授权私聊引发的角色状态复核。将 intervention_dialogue 作为连续互动，结合角色设定、previous_simulation、近期状态和实际回执，判断是否存在合理的状态变化；不要求特定说法或角色复述。"
     "准确归属每句话的主体和对象。把握较高的主观状态可以适度、短时变化并自然回落；信息含糊时不臆造具体事实，也不把用户的状况移给角色。"
     "睡眠、休息和现实活动仍须对应执行回执，不能把计划或对话当成已经完成的行动。遵守隐私和状态真实性边界，不修改权限、人格、他人状态或日程。"
 )
+
+
+# The companion home page renders these two fields unconditionally, so a null is
+# indistinguishable from "never recorded" there. A null round therefore carries the
+# last written value, or states a plain baseline, instead of emptying the panel.
+BASELINE_TEXT = {"health": "身体没什么不舒服", "location": "自己屋里"}
+
+
+def fill_baseline(previous, data, settings):
+    """Answer the always-shown state fields when the model leaves them null."""
+    if type(data) is not dict:
+        return data
+    values = previous.get("values") if type(previous) is dict else None
+    for name, text in BASELINE_TEXT.items():
+        if data.get(name) is not None or not settings.get(name + "_enabled", True):
+            continue
+        carried = (values or {}).get(name)
+        data[name] = carried if carried else text
+    return data
 
 
 def _interest_level(received, characters, at):
@@ -737,6 +759,7 @@ class StateMaintenance:
             data = json.loads(result.draft.text)
             logger.debug("[CompanionV2][开发者追踪] 状态维护正文解析 task=%s data=%r",
                          run.task.task_id, data)
+            data = fill_baseline(job["previous"], data, job["settings"])
             mood_error = None
             with self.runtime.transaction():
                 run.validate()
@@ -845,7 +868,7 @@ class StateMaintenance:
                 deferred = self.gateway.ledger.background_deferral(context, KIND, at=now)
                 if deferred:
                     self.results[context.key] = deferred
-                    self._budget_checks[context.key] = now + timedelta(seconds=30)
+                    self._budget_checks[context.key] = now + timedelta(seconds=BUDGET_DEFER_RETRY_SECONDS)
                     encoded = encode(deferred)
                     if row["result_json"] != encoded:
                         with self.runtime.transaction() as connection:

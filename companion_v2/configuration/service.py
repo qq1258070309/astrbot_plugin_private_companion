@@ -341,6 +341,12 @@ class ConfigurationService:
 
     def _status(self, snapshot: ConfigurationSnapshot) -> ApplicationStatus:
         consumer = self.store.read_one("SELECT generation FROM configuration_consumers WHERE consumer_id = ?", (snapshot.consumer_id,))
+        if consumer is None and snapshot.apply_mode is ApplyMode.IMMEDIATE:
+            # An IMMEDIATE group is read live by whoever needs it; there is no
+            # consumer to start and nothing to adopt. Reporting "not started"
+            # here was permanent for every such group (qzone among them), which
+            # reads like a dead execution side while the settings are in force.
+            return ApplicationStatus("applied", snapshot.consumer_id, None, snapshot.values)
         if consumer is None or self._active_generations.get(snapshot.consumer_id) != consumer["generation"]:
             return ApplicationStatus("consumer_not_started", snapshot.consumer_id, None, {})
         row = self.store.read_one(

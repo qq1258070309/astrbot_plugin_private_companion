@@ -225,8 +225,8 @@ window.CompanionReplyPage = (() => {
       group_wakeup_question_enabled: "默认关闭；明确开启后，未点名的实质问题或求助才可进入答疑候选。问号、反问和吐槽不自动唤醒。设置跟随角色，同一角色的群窗口共用。",
       group_wakeup_bot_name_enabled: "开启后，角色名称会并入直呼词。",
       group_wakeup_bot_name: "填写角色在群聊中使用的名称；同一角色的群聊共用，最多 40 字。",
-      group_wakeup_primary_member_ids: "只接受平台账号数字 ID；同一角色的群聊共用这份主要成员名单。",
-      group_wakeup_owner_direct_words: "只对上方主要成员账号生效。",
+      group_wakeup_primary_member_ids: "只接受平台账号数字 ID。名单跟随角色，同一角色的群聊共用；某个群聊单独设置过就以该群的值优先。",
+      group_wakeup_owner_direct_words: "只对上方主要成员账号生效；同样跟随角色，单个群聊可覆盖。",
       group_wakeup_interest_probability: "命中兴趣关键词后，按此概率进入模型参与判断；未抽中时不为该线索调用模型。0 表示关闭，1 表示全部进入，进入后仍可旁听。",
       group_tool_profile: "完整保留可用工具；常用只挂群聊常用能力；精简会移除其他插件提供的工具，包括外部记忆与搜索。选择精简可减少工具开销，也会减少模型可调用的能力。",
       group_wakeup_question_threshold: "答疑开启时，问题与求助候选评分需达到此值才进入决策。其他成员正在交流、已有回答及近期已接话会降权；达到阈值仍可旁听。范围 0–100。",
@@ -490,6 +490,9 @@ window.CompanionReplyPage = (() => {
     recall_request_invalid: "撤回请求格式有误，请刷新后重试。",
     bridge_timeout: "连接超时，请核对连接后重试。",
     invalid_response: "返回的数据不完整，请刷新核对。",
+    /* 后端在「这一项不属于当前对象可写的层」时回这个码。以前没有映射，页面
+       只能兜底成「没有返回保存确认」，用户会以为写入状态未知，其实一个字都没写。 */
+    configuration_scope_not_supported: "这一项不支持在当前对象上保存，请按它所属的范围切换对象后再修改。",
   };
   const isCode = value => typeof value === "string" && /^[a-z][a-z0-9_]{2,60}$/.test(value);
   const localized = (problem, fallback) => errors[problem?.code]

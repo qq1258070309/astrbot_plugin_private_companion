@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from companion_v2.agenda.annual_calendar import SCHEMA
 from companion_v2.agenda.models import Frequency, Schedule
-from companion_v2.agenda.planning import KIND, CalendarPlanning, planning_profile
+from companion_v2.agenda.planning import KIND, CalendarPlanning, planning_deadline, planning_profile
 from companion_v2.agenda.planning_config import configured_annual_calendars, planning_values
 from companion_v2.agenda.planning_inputs import capture, validate, MATERIAL_CHARS, planning_calendar_context
 from companion_v2.agenda.planning_output import INSTRUCTION, INTERVENTION_INSTRUCTION, parse_output
@@ -117,6 +117,14 @@ class PlanningOutputTests(unittest.TestCase):
         self.assertEqual([i[0]["title"] for i in items], ["读下一小节", "散步"])
         self.assertEqual(rejected, ({"index": 1, "code": "invalid_plan_item"},))
 
+    def test_public_presence_is_optional_and_never_costs_the_plan(self):
+        items, rejected = parse_output(json.dumps({"items": [
+            output(presence="晒着太阳"),
+            output(title="写两页笔记", presence="这一句公开文案明显超过了八个字"),
+        ]}, ensure_ascii=False), self.job())
+        self.assertEqual([item[0]["presence"] for item in items], ["晒着太阳", ""])
+        self.assertEqual(rejected, ())
+
     def test_no_identity_or_unknown_parent_or_naive_time_enters_calendar(self):
         for changes in ({"owner": "forged"}, {"goal_id": "unknown"}, {"parent_id": "unknown"},
                         {"start": "2026-09-21T10:00:00"}, {"minutes": True}):
@@ -167,6 +175,30 @@ class PlanningOutputTests(unittest.TestCase):
         self.assertIn("按上下文对安排影响的大小与确定程度", INTERVENTION_INSTRUCTION)
         self.assertNotIn("普通关心、建议、邀请或假设", INTERVENTION_INSTRUCTION)
         self.assertNotIn("只有角色真实送达的 assistant 回复", INTERVENTION_INSTRUCTION)
+
+
+class PlanningDeadlineTests(unittest.TestCase):
+    def test_daily_plan_stays_claimable_until_its_captured_window_ends(self):
+        zone = ZoneInfo("Asia/Shanghai")
+        at = datetime(2026, 10, 31, 6, 0, tzinfo=zone)
+        job = {"at": at, "end": datetime(2026, 11, 1, 0, 0, tzinfo=zone)}
+
+        self.assertEqual(planning_deadline(job), job["end"])
+        # One background lane stalled for 3h21m on a live install; the old
+        # three-minute budget had expired the plan long before the lane opened.
+        self.assertGreater(planning_deadline(job) - at, timedelta(hours=3, minutes=21))
+
+    def test_window_wider_than_the_submission_horizon_is_clamped(self):
+        at = datetime(2026, 10, 31, 6, 0, tzinfo=timezone.utc)
+        job = {"at": at, "end": at + timedelta(days=30)}
+
+        self.assertEqual(planning_deadline(job), at + timedelta(days=7))
+
+    def test_deadline_never_precedes_the_captured_start(self):
+        at = datetime(2026, 10, 31, 6, 0, tzinfo=timezone.utc)
+        for window in (timedelta(minutes=5), timedelta(hours=18), timedelta(days=30)):
+            with self.subTest(window=window):
+                self.assertGreater(planning_deadline({"at": at, "end": at + window}), at)
 
 
 class CalendarRefinementTests(StateFixture, unittest.IsolatedAsyncioTestCase):
@@ -382,6 +414,20 @@ class CalendarPlanningTests(StateFixture, unittest.IsolatedAsyncioTestCase):
                    manual=False, refresh=False):
         return await app.calendar_planning.run(context, app.state_maintenance.bindings[context.key][1],
             mode=mode, slot=slot, occurrence=occurrence, manual=manual, refresh=refresh)
+
+    async def test_submitted_plan_is_claimable_until_its_planning_window_ends(self):
+        app, context, _ = await self.ready()
+        result = await self.plan(app, context)
+        self.assertEqual(result["state"], "succeeded", result)
+        row = self.runtime.read_one("SELECT record_json FROM execution_tasks WHERE task_id = ?",
+                                    (result["task_id"],))
+        spec = json.loads(row["record_json"])["spec"]
+        at = datetime.fromisoformat(spec["not_before"])
+        zone = ZoneInfo(planning_values(app.role_state.settings(context)[0])["planning_timezone"])
+
+        expected = datetime.combine(at.astimezone(zone).date() + timedelta(days=1), time(), zone)
+        self.assertEqual(datetime.fromisoformat(spec["deadline_at"]), expected)
+        self.assertGreater(datetime.fromisoformat(spec["deadline_at"]) - at, timedelta(minutes=3))
 
     async def test_manual_plan_does_not_require_automatic_planning_and_refresh_replaces_only_generated_daily_plans(self):
         app, context, manager = await self.ready()

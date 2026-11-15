@@ -1,6 +1,11 @@
 """The contact planner is off the AstrBot event loop, but task activation stays on it."""
 
 import asyncio
+import sqlite3
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -78,6 +83,81 @@ class ContactScheduleOffloadTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.close()
         self.assertTrue(seen["closed_after_planner"], "planner must finish before sources close")
         self.assertTrue(planning.done())
+
+
+class ContactScheduleHoldTests(unittest.TestCase):
+    """A gated window must be parked at the lift time, not left looking overdue.
+
+    Without the write-back every following tick re-plans the same row, skips it
+    again, and the schedule row keeps showing a start time that is long past.
+    """
+
+    NOW = datetime(2026, 11, 3, 5, 56, 27, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.root = Path(tempfile.gettempdir()) / f"contact-hold-{os.urandom(6).hex()}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.root / "hold.sqlite3")
+        self.db.execute("CREATE TABLE role_state_schedules (context_key TEXT PRIMARY KEY, next_at TEXT, enabled INTEGER)")
+        self.db.execute("INSERT INTO role_state_schedules VALUES ('context-a', ?, 1)",
+                        (self.NOW.isoformat(),))
+        self.db.commit()
+
+        class Runtime:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def transaction(self):
+                db = self.connection
+
+                class Transaction:
+                    def __enter__(self):
+                        db.execute("BEGIN IMMEDIATE")
+                        return db
+
+                    def __exit__(self, *_error):
+                        db.commit()
+                        return False
+
+                return Transaction()
+
+        self.runtime = Runtime(self.db)
+
+    def tearDown(self):
+        self.db.close()
+
+    def scheduler(self, *, busy=None, sleep=None):
+        scheduler = object.__new__(ContactSchedule)
+        scheduler.runtime = self.runtime
+        scheduler._note_window = lambda *args, **kwargs: None
+        scheduler._busy_hold = lambda context, origin, now: busy
+        scheduler._sleep_hold = lambda context, origin, now: sleep
+        scheduler.contacts = SimpleNamespace(
+            platform_circuit=SimpleNamespace(cooldown_until=lambda context, at: None))
+        return scheduler
+
+    def parked(self):
+        row = self.db.execute("SELECT next_at FROM role_state_schedules WHERE context_key = 'context-a'").fetchone()
+        return datetime.fromisoformat(row[0])
+
+    @staticmethod
+    def context():
+        return SimpleNamespace(key="context-a")
+
+    def test_a_busy_gate_parks_the_row_at_its_lift_time(self):
+        lift = self.NOW + timedelta(minutes=12)
+        scheduler = self.scheduler(busy=lift)
+        available = scheduler._activate_plan({"origin_key": "context-a"}, (self.context(), None, (), "", {}),
+                                             1, self.NOW)
+        self.assertEqual(available, 1)  # A gate queues nothing, so it consumes no capacity.
+        self.assertEqual(self.parked(), lift)
+
+    def test_a_sleep_gate_parks_the_row_at_its_wake_time(self):
+        wake = self.NOW + timedelta(hours=7)
+        scheduler = self.scheduler(sleep=wake)
+        self.assertEqual(
+            scheduler._activate_plan({"origin_key": "context-a"}, (self.context(), None, (), "", {}), 1, self.NOW), 1)
+        self.assertEqual(self.parked(), wake)
 
 
 if __name__ == "__main__":

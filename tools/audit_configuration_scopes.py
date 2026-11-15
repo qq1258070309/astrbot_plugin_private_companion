@@ -47,7 +47,12 @@ GAPS = {
     "screen": "administrator_window_privacy_with_explicit_sharing",
 }
 EXCEPTIONS = {
-    "conversation.presentation.group_wakeup_primary_member_ids": "stable_group",
+    # 2026-11-03：主要成员名单不再算 stable_group。它原先只注册在群窗口上，
+    # 而决策页（回应判断）编辑的是角色默认值、页面顶部只能切角色不能切对象，
+    # 于是这份名单在界面上根本存不进去（保存必被 role_settings.write 以
+    # configuration_scope_not_supported 拒绝）。现在按 conversation.presentation
+    # 的 reviewed scope 走 role_defaults_with_group_exceptions：角色层写默认名单，
+    # 单个群窗口仍可各自覆盖。
     "expression.learning.group_member_mode": "stable_group",
     "expression.learning.group_member_ids": "stable_group",
     "conversation.recall.transcribe_enabled": "role_policy_and_relationship_privacy",

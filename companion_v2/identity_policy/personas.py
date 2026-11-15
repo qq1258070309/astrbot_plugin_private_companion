@@ -263,6 +263,19 @@ class PersonaDirectory:
         row = self.runtime.read_one("SELECT record_json FROM conversation_routes WHERE scope_key = ?", (scope.key,))
         return ConversationRoute.restore(json.loads(row["record_json"])) if row else None
 
+    def routes(self, *, installation_id: str | None = None) -> tuple[ConversationRoute, ...]:
+        """Every registered route of this installation, in a stable order.
+
+        Callers use this to answer "which of this person's own windows exist",
+        never to widen a group or someone else's window into an owner scope.
+        """
+        installation = installation_id or self.runtime.installation_id
+        self._installation(installation)
+        rows = self.runtime.read_all(
+            "SELECT record_json FROM conversation_routes ORDER BY scope_key", ())
+        routes = (ConversationRoute.restore(json.loads(row["record_json"])) for row in rows)
+        return tuple(route for route in routes if route.scope.installation_id == installation)
+
     def _installation(self, installation_id: str) -> None:
         if installation_id != self.runtime.installation_id:
             raise ReferenceValidationError("scope_installation_mismatch")
