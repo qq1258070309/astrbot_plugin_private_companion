@@ -104,9 +104,12 @@ def upstream_version(tag: str) -> str:
 
 
 def next_revision(tag: str, explicit: str | None) -> str:
-    if explicit:
+    # An explicitly empty revision ("") means "plain X.Y.Z", which is the only
+    # shape AstrBot's VersionComparator can parse (a trailing letter makes it
+    # fall back to 0.0.0, so the dashboard would never report an update).
+    if explicit is not None:
         if not re.fullmatch(r"[a-z]?", explicit):
-            raise SystemExit("revision must be a single lowercase letter")
+            raise SystemExit("revision must be a single lowercase letter or empty")
         return explicit
     if current_base() == tag:
         version = current_version()
