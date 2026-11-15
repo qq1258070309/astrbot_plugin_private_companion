@@ -116,8 +116,13 @@ def next_revision(tag: str, explicit: str | None) -> str:
         match = re.fullmatch(r"(\d+\.\d+\.\d+)([a-z])", version)
         if match and match.group(2) < "z":
             return chr(ord(match.group(2)) + 1)
-        raise SystemExit("cannot auto-advance revision past z; pass --revision")
-    return "a"
+        # Plain X.Y.Z cannot be auto-advanced; a second release on the same
+        # upstream base needs an explicit --revision or a patch bump.
+        raise SystemExit("cannot auto-advance a plain X.Y.Z version; pass --revision")
+    # Default to a plain version: AstrBot's VersionComparator cannot parse a
+    # trailing letter, so `7.1.21a` would compare as 0.0.0 and break update
+    # detection. Fork revisions live in the tag (`vX.Y.Z-fork.N`) instead.
+    return ""
 
 
 def apply_version(version: str) -> None:
