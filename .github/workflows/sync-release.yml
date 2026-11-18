@@ -173,7 +173,7 @@ jobs:
           git push origin HEAD:main
           git tag "v$VERSION"
           git push origin "v$VERSION"
-          gh release create "v$VERSION" \
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/fork-release"/*.zip \
             "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
             "$RUNNER_TEMP/COMPAT_REPORT.md" \
@@ -222,10 +222,10 @@ jobs:
           git add -A
           git commit -m "sync: $TAG (pending review)" || echo "nothing to commit"
           git push -f origin "HEAD:sync/$TAG"
-          if gh pr view "sync/$TAG" --json number >/dev/null 2>&1; then
-            gh pr edit "sync/$TAG" --body-file "$RUNNER_TEMP/pr-body.md"
+          if gh pr view "sync/$TAG" --repo "$GITHUB_REPOSITORY" --json number >/dev/null 2>&1; then
+            gh pr edit "sync/$TAG" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/pr-body.md"
           else
-            gh pr create --base main --head "sync/$TAG" \
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "sync/$TAG" \
               --title "同步上游 $TAG（待审，未发布）" \
               --body-file "$RUNNER_TEMP/pr-body.md"
           fi
