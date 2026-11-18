@@ -124,8 +124,18 @@ jobs:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
-          git diff --cached --stat > "$RUNNER_TEMP/merge-diff.txt" || true
-          git diff --cached --name-status >> "$RUNNER_TEMP/merge-diff.txt" || true
+          # 合并结果已固化在 main（fork 冲突裁决已合入），故 workflow 内 git merge
+          # 为 no-op，git diff --cached 为空。改用「同步前的 fork main (HEAD^1) →
+          # 当前工作区」的完整 diff，作为本次同步真实引入改动的证据；并附上
+          # prepare 步骤已执行的 check 校验输出，供 AI 核对发布契约与定制锚点。
+          git diff --stat HEAD^1 > "$RUNNER_TEMP/merge-diff.txt" || true
+          git diff --name-status HEAD^1 >> "$RUNNER_TEMP/merge-diff.txt" || true
+          {
+            echo ""
+            echo "=== prepare / check 校验输出（Prepare fork release 步骤已执行）==="
+            echo "UPSTREAM_BASE: $(cat UPSTREAM_BASE)"
+            python -X utf8 tools/fork_release.py check || true
+          } >> "$RUNNER_TEMP/merge-diff.txt" 2>&1
           VERSION="$(python -X utf8 tools/fork_release.py version)"
           python -X utf8 tools/ai_compat_review.py \
             --diff "$RUNNER_TEMP/merge-diff.txt" \
