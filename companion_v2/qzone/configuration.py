@@ -33,8 +33,9 @@ DEFAULTS = {
     "max_actions_per_tick": 1,
     # How many of the role's own posts a comment reply may scan.
     "comment_recent_posts": 5,
-    # Daily ceiling for self-published posts. The wording of a post is a separate
-    # decision; this is only the safety cap.
+    # One switch governs the total, per-topic and life-publish daily ceilings.
+    "daily_limits_enabled": True,
+    # Daily ceiling for self-published posts when daily limits are enabled.
     "publish_max_daily": 1,
     # Topic classification is model guided.  The explicit confirmation gate
     # keeps an automatically drafted public post in a reviewable state.
@@ -44,9 +45,10 @@ DEFAULTS = {
     # V1 的「生活说说」：低频率、按概率把角色自己的生活发到空间。它不替代
     # 上面的 publish_enabled（总闸），也不绕过 policy 的间隔/每日上限/去重。
     "life_publish_enabled": False,
-    "life_publish_probability": 0.18,
-    "life_publish_min_interval_hours": 24,
+    "life_publish_probability": 0.5,
+    "life_publish_min_interval_hours": 6,
     "life_publish_max_daily": 1,
+    "life_publish_retry_minutes": 30,
     "life_publish_style_prompt": "",
     # 凭据坏了以后要不要私聊管理员。自动重取本身一直进行（1 分钟 → 24 小时逐级
     # 递推，见 companion_v2/qzone/credential.py），这一项只决定"说不说"。
@@ -69,6 +71,7 @@ LIMITS = {
     "publish_max_daily": (1, 10),
     "life_publish_min_interval_hours": (1, 168),
     "life_publish_max_daily": (1, 10),
+    "life_publish_retry_minutes": (5, 180),
 }
 for _topic in TOPIC_SPECS:
     _key = _topic.topic.value
@@ -77,8 +80,8 @@ for _topic in TOPIC_SPECS:
         f"{_key}_cooldown_minutes": (0, 1440),
     })
 BOOLEAN_FIELDS = ("enabled", "like_enabled", "comment_enabled", "publish_enabled",
-                  "topic_auto_enabled", "topic_require_confirmation", "life_publish_enabled",
-                  "credential_admin_notice") + tuple(
+                  "daily_limits_enabled", "topic_auto_enabled", "topic_require_confirmation",
+                    "credential_admin_notice") + tuple(
                       f"{item.topic.value}_enabled" for item in TOPIC_SPECS)
 INTEGER_FIELDS = tuple(LIMITS)
 PROBABILITY_FIELDS = ("life_publish_probability",) + tuple(

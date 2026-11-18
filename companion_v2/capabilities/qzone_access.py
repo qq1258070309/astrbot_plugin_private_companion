@@ -18,7 +18,7 @@ from companion_v2.identity_policy.models import AuthorizationTier, GrantState
 from companion_v2.identity_policy.object_access import ObjectAccessPolicy
 from companion_v2.identity_policy.personas import PersonaDirectory
 from companion_v2.identity_policy.repository import PersistentIdentityDirectory
-from companion_v2.qzone.capability import CAPABILITIES, EXTENSION
+from companion_v2.qzone.capability import CAPABILITIES, EXTENSION, PUBLISH_ACTION
 from companion_v2.qzone.capability import package_descriptor
 from companion_v2.qzone.topics import SCENES, TOPIC_SPECS, allowed_scenes
 from companion_v2.storage.codec import scope_values
@@ -217,12 +217,14 @@ class QzoneAccess:
                          for capability, row in consents.items()}
             granted = self.identities.authorize(self.context.actor, scope=self.context.scope,
                                                 capability=INVOKE_CAPABILITY, observed_at=at).is_success
+            publish_granted = self.identities.authorize(self.context.actor, scope=self.context.scope,
+                                                        capability=PUBLISH_ACTION, observed_at=at).is_success
             reason = ("qzone_not_installed" if installed is None else
                       "qzone_package_changed" if not same else
                       "qzone_not_active" if not active else
                       "qzone_role_disabled" if not role_enabled else
                       "qzone_consent_missing" if not any(consented.values()) else
-                      "qzone_grant_missing" if not granted else "")
+                      "qzone_grant_missing" if not (granted and publish_granted) else "")
             runtime = self.service.status(self.context, at) if self.service is not None else {}
             runtime = dict(runtime or {})
             # ``QzoneService.status`` states the credential conclusion in the same
@@ -234,7 +236,7 @@ class QzoneAccess:
                 credential = self._credential()
             return {"extension_id": EXTENSION, "package_version": self.package.package_version,
                     "installed": installed is not None, "active": active, "role_enabled": role_enabled,
-                    "consented": consented, "invoke_granted": granted, "reason": reason,
+                    "consented": consented, "invoke_granted": granted, "publish_granted": publish_granted,
                     "grant_zones": [self._zone(scope) for scope in _person_scope(self.runtime, self.context)],
                     "credential": dict(self.credential_state or {}), "runtime": runtime,
                     "credential": dict(credential or {}), "runtime": runtime,
