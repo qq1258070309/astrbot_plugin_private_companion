@@ -232,9 +232,11 @@ def resolve_merge(args: argparse.Namespace) -> None:
     Whitelisted files take the upstream side; every other conflict takes our
     side so the tree stays committable, and is reported for human review.
     """
-    result = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
+    # -z emits raw NUL-separated paths, bypassing git's core.quotePath escaping
+    # of non-ASCII paths (e.g. 陪伴小屋) that is the default on ubuntu-latest.
+    result = subprocess.run(["git", "diff", "--name-only", "-z", "--diff-filter=U"],
                             cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
-    conflicts = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    conflicts = [part for part in result.stdout.split("\0") if part]
     upstream_side, ours_side = [], []
     for rel in conflicts:
         side = "--theirs" if rel in UPSTREAM_SIDE_FILES else "--ours"
