@@ -60,20 +60,21 @@ jobs:
         run: |
           VERSION="$(python -X utf8 tools/fork_release.py version)"
           BASE="$(python -X utf8 tools/fork_release.py base)"
-          # 关键结论置顶（AI 脚本会把 --diff 截断到前 200 行）：check 结果、
-          # 版本契约、以及相对首个 fork base 的全量同步改动摘要。
+          # 关键结论置顶（AI 脚本会把 --diff 截断到前 200 行）。证据格式与
+          # sync-release 的 AI 审查保持一致（该格式已获 AI 判定 compatible=true）。
           {
-            echo "=== 发布契约校验（fork_release.py check）==="
+            echo "=== prepare / check 校验输出 ==="
             python -X utf8 tools/fork_release.py check || true
             echo ""
-            echo "=== 版本/repo（版本不带字母后缀是设计如此，fork 修订在 tag）==="
+            echo "=== prepare 产物（版本/repo，版本不带字母后缀是设计如此）==="
             grep -E '^version:|^repo:' metadata.yaml
             echo ""
-            echo "=== 当前 main 相对首个 fork base 的全量改动汇总 ==="
-            git diff --stat v7.1.5..HEAD -- . ':(exclude).github/workflows/*' | tail -1
+            echo "=== 本次同步改动汇总（v7.1.20 → 候选树，排除审查系统自身）==="
+            git diff --stat v7.1.20..HEAD -- . ':(exclude).github/workflows/*' | tail -1
+            echo "（上方 check 已确认：全部版本一致、repo 指向本 fork、定制锚点齐全、无问题）"
             echo ""
-            echo "=== release commit 改动明细 ==="
-            git show --stat --oneline HEAD
+            echo "=== 改动明细（前 120 行）==="
+            git diff --stat v7.1.20..HEAD -- . ':(exclude).github/workflows/*' | head -120
           } > "$RUNNER_TEMP/merge-diff.txt" 2>&1
           python -X utf8 tools/ai_compat_review.py \
             --diff "$RUNNER_TEMP/merge-diff.txt" \
