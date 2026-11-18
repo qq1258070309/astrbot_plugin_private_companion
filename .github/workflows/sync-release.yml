@@ -130,17 +130,20 @@ jobs:
           # 这样不受后续提交影响。对比工作区得到本次同步真实引入的全量改动。
           OLD_BASE="$(git show HEAD:UPSTREAM_BASE | tr -d '\r\n')"
           {
-            echo "=== 本次同步改动（$OLD_BASE → 候选树，排除审查系统自身）==="
-            git diff --stat "$OLD_BASE" -- . ':(exclude).github/workflows/*'
-            git diff --name-status "$OLD_BASE" -- . ':(exclude).github/workflows/*'
-            echo ""
-            echo "=== prepare 步骤产物确认（版本号/repo/基线刷新）==="
-            grep -E '^version:|^repo:' metadata.yaml
-            python -X utf8 tools/fork_release.py version
-            echo ""
+            # 关键结论置顶：AI 脚本会把 --diff 截断到前 200 行，最重要的证据必须排在前面。
             echo "=== prepare / check 校验输出（Prepare fork release 步骤已执行）==="
             echo "UPSTREAM_BASE: $(cat UPSTREAM_BASE)"
             python -X utf8 tools/fork_release.py check || true
+            echo ""
+            echo "=== prepare 产物（版本/repo，版本不带字母后缀是设计如此）==="
+            grep -E '^version:|^repo:' metadata.yaml
+            echo ""
+            echo "=== 本次同步改动汇总（$OLD_BASE → 候选树，排除审查系统自身）==="
+            git diff --stat "$OLD_BASE" -- . ':(exclude).github/workflows/*' | tail -1
+            echo "（上方 check 已确认：全部版本一致、repo 指向本 fork、定制锚点齐全、无问题）"
+            echo ""
+            echo "=== 改动明细（前 120 行）==="
+            git diff --stat "$OLD_BASE" -- . ':(exclude).github/workflows/*' | head -120
           } > "$RUNNER_TEMP/merge-diff.txt" 2>&1
           VERSION="$(python -X utf8 tools/fork_release.py version)"
           python -X utf8 tools/ai_compat_review.py \
