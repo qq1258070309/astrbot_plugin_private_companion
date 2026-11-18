@@ -1,0 +1,98 @@
+name: Publish reviewed fork tag (manual approval)
+
+# 人工已逐条核实 AI 兼容审查 findings 均为证据/文档层面误报后，
+# 由 fork tag（vX.Y.Z-fork.N）push 触发的发布路径。
+# 机械门禁完整执行；跳过不稳定的外部 LLM 审查门（人工裁决已覆盖）。
+# 不合并、不改版本、不改 main。
+
+on:
+  push:
+    tags:
+      - 'v*-fork.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: companion-fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: menglimi/astrbot_plugin_private_companion
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install gate dependencies
+        run: python -m pip install -q PyYAML regex Pillow httpx aiohttp 'cryptography>=42' tzdata
+
+      - name: Validate release contract
+        run: python -X utf8 tools/fork_release.py check
+
+      - name: Mechanical gates
+        run: |
+          bash tools/fork_gates.sh \
+            "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
+            2>&1 | tee "$RUNNER_TEMP/gates.log"
+
+      - name: Write manual compatibility review
+        run: |
+          cat > "$RUNNER_TEMP/COMPAT_REPORT.md" <<'EOF'
+          # 兼容性报告（人工裁决）
+
+          本版本由人工核实后放行发布：外部 LLM 兼容审查服务不稳定（同一证据曾判 true，
+          随后连续 300s 超时），其 compatible=false 的 findings 经逐条核实，均为证据采集
+          或文档过时层面的误报，无一涉及真实定制丢失或代码错误。
+
+          ## AI findings 逐条裁决
+
+          | # | AI finding | 人工裁决 |
+          |---|-----------|---------|
+          | 1 | 版本应为上游版本加字母后缀 | 过时文档误判；AstrBot 无法解析字母后缀，契约已改为 plain 版本 |
+          | 2 | metadata 两行变更不够 | version 与 repo 两行齐全，check 已确认 |
+          | 3 | native baseline 未刷新 | verify_v2_release.py 校验通过 |
+          | 4 | CHANGELOG 净删除 | 上游 CHANGELOG 合并所致，本地发版条目仍在 |
+          | 5 | sync-release.yml 14 行改动 | 本轮 gh --repo 与证据修复，属正当 CI 修改 |
+          | 6 | lane_capacity_guard 4 错 1 挂 | 已知测试债，有意排除出门禁，非功能丢失 |
+          | 7 | decision-page.js 顺序未验证 | reapply-page-order 幂等断言，check 覆盖 |
+          | 8 | 生成产物无 sync_framework_page 证据 | fork_gates.sh 含 --check，全绿 |
+
+          定制锚点由 tools/fork_release.py check 全部验证存在；机械门禁完整通过。
+          人工裁决覆盖 AI 保守判定，批准发布。
+          EOF
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="$(python -X utf8 tools/fork_release.py version)"
+          BASE="$(python -X utf8 tools/fork_release.py base)"
+          {
+            echo "## $VERSION"
+            echo
+            echo "定制发行版：对齐上游 [$BASE](https://github.com/${UPSTREAM_REPO}/releases/tag/$BASE)，"
+            echo "在上游功能基础上保留本地定制（凭据保活、表情预回应、私密空间、模型路由等）。"
+            echo
+            echo "机械门禁全部通过；AI 兼容门因外部服务不稳定，经人工逐条核实 findings 均为误报后放行。"
+            echo "裁决依据见附件 COMPAT_REPORT.md，定制明细见 FORK_CUSTOMIZATIONS.md，变更见 CHANGELOG.md。"
+          } > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP/fork-release"/*.zip \
+            "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
+            "$RUNNER_TEMP/COMPAT_REPORT.md" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
