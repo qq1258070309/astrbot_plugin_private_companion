@@ -125,17 +125,23 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
           # 合并结果已固化在 main（fork 冲突裁决已合入），故 workflow 内 git merge
-          # 为 no-op，git diff --cached 为空。改用「同步前的 fork main (HEAD^1) →
-          # 当前工作区」的完整 diff，作为本次同步真实引入改动的证据；并附上
-          # prepare 步骤已执行的 check 校验输出，供 AI 核对发布契约与定制锚点。
-          git diff --stat HEAD^1 > "$RUNNER_TEMP/merge-diff.txt" || true
-          git diff --name-status HEAD^1 >> "$RUNNER_TEMP/merge-diff.txt" || true
+          # 为 no-op，git diff --cached 为空。证据基准取「同步前的 base tag」——
+          # 从 HEAD 的 commit 里读 UPSTREAM_BASE（prepare 只改工作区、不改 commit），
+          # 这样不受后续提交影响。对比工作区得到本次同步真实引入的全量改动。
+          OLD_BASE="$(git show HEAD:UPSTREAM_BASE | tr -d '\r\n')"
           {
+            echo "=== 本次同步改动（$OLD_BASE → 候选树，排除审查系统自身）==="
+            git diff --stat "$OLD_BASE" -- . ':(exclude).github/workflows/*'
+            git diff --name-status "$OLD_BASE" -- . ':(exclude).github/workflows/*'
+            echo ""
+            echo "=== prepare 步骤产物确认（版本号/repo/基线刷新）==="
+            grep -E '^version:|^repo:' metadata.yaml
+            python -X utf8 tools/fork_release.py version
             echo ""
             echo "=== prepare / check 校验输出（Prepare fork release 步骤已执行）==="
             echo "UPSTREAM_BASE: $(cat UPSTREAM_BASE)"
             python -X utf8 tools/fork_release.py check || true
-          } >> "$RUNNER_TEMP/merge-diff.txt" 2>&1
+          } > "$RUNNER_TEMP/merge-diff.txt" 2>&1
           VERSION="$(python -X utf8 tools/fork_release.py version)"
           python -X utf8 tools/ai_compat_review.py \
             --diff "$RUNNER_TEMP/merge-diff.txt" \

@@ -37,7 +37,7 @@
 `repo` 必须指向上游。为让 AstrBot 从本仓库检查更新，本仓库做了如下确定性改写，
 统一由 `tools/fork_release.py prepare` 幂等执行：
 
-- `metadata.yaml` → `version: <上游版本><字母>`、`repo: https://github.com/qq1258070309/astrbot_plugin_private_companion`
+- `metadata.yaml` → `version: <上游版本>`（**不带字母后缀**：AstrBot 的 `VersionComparator` 无法解析尾部字母，会退化成 `0.0.0` 导致更新检测失效；fork 修订号放在 Git tag `v<版本>-fork.N` 里）、`repo: https://github.com/qq1258070309/astrbot_plugin_private_companion`
 - `pyproject.toml`、`companion_v2/product/__init__.py`、`tools/build_v2_release.py` → 同步版本号
 - `tools/verify_v2_release.py` → 期望的 repo 改为本仓库
 - `tools/native_capability_baseline.json` → 每次发版刷新 native hashes
