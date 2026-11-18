@@ -58,9 +58,23 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git show --stat --oneline HEAD > "$RUNNER_TEMP/merge-diff.txt"
           VERSION="$(python -X utf8 tools/fork_release.py version)"
           BASE="$(python -X utf8 tools/fork_release.py base)"
+          # 关键结论置顶（AI 脚本会把 --diff 截断到前 200 行）：check 结果、
+          # 版本契约、以及相对首个 fork base 的全量同步改动摘要。
+          {
+            echo "=== 发布契约校验（fork_release.py check）==="
+            python -X utf8 tools/fork_release.py check || true
+            echo ""
+            echo "=== 版本/repo（版本不带字母后缀是设计如此，fork 修订在 tag）==="
+            grep -E '^version:|^repo:' metadata.yaml
+            echo ""
+            echo "=== 当前 main 相对首个 fork base 的全量改动汇总 ==="
+            git diff --stat v7.1.5..HEAD -- . ':(exclude).github/workflows/*' | tail -1
+            echo ""
+            echo "=== release commit 改动明细 ==="
+            git show --stat --oneline HEAD
+          } > "$RUNNER_TEMP/merge-diff.txt" 2>&1
           python -X utf8 tools/ai_compat_review.py \
             --diff "$RUNNER_TEMP/merge-diff.txt" \
             --notes CHANGELOG.md \
@@ -81,25 +95,27 @@ jobs:
           {
             echo "## $VERSION"
             echo
-            echo "首个定制发行版：对齐上游 [$BASE](https://github.com/${UPSTREAM_REPO}/releases/tag/$BASE)，"
-            echo "合并 7.1.5 之后 15 个上游版本并保留本地定制。"
+            echo "定制发行版：对齐上游 [$BASE](https://github.com/${UPSTREAM_REPO}/releases/tag/$BASE)，"
+            echo "在上游功能基础上保留本地定制（凭据保活、表情预回应、私密空间、模型路由等）。"
             echo
             echo "机械门禁与 AI 兼容性审查均通过；结论见附件 COMPAT_REPORT.md，"
             echo "定制明细见 FORK_CUSTOMIZATIONS.md，变更见 CHANGELOG.md。"
           } > "$RUNNER_TEMP/release-notes.md"
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
-            gh release upload "v$VERSION" \
-              "$RUNNER_TEMP/fork-release"/*.zip \
-              "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
-              "$RUNNER_TEMP/COMPAT_REPORT.md" --clobber
-          else
-            gh release create "v$VERSION" \
-              "$RUNNER_TEMP/fork-release"/*.zip \
-              "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
-              "$RUNNER_TEMP/COMPAT_REPORT.md" \
-              --title "$VERSION" \
-              --notes-file "$RUNNER_TEMP/release-notes.md"
-          fi
+          # fork tag 必须带 -fork.N，否则与上游同名 tag 冲突（上游已有 v7.2.4）。
+          N=$(git ls-remote --tags origin "refs/tags/v${VERSION}-fork.*" \
+               | sed -n 's/.*v'"$VERSION"'-fork\.\([0-9]*\).*/\1/p' \
+               | sort -n | tail -1)
+          N=$(( ${N:-0} + 1 ))
+          RELEASE_TAG="v${VERSION}-fork.${N}"
+          echo "release tag: $RELEASE_TAG"
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP/fork-release"/*.zip \
+            "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
+            "$RUNNER_TEMP/COMPAT_REPORT.md" \
+            --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
 
       - name: Refuse to publish
         if: steps.ai.outputs.compatible != 'true'
