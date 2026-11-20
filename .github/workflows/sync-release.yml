@@ -190,9 +190,17 @@ jobs:
           git add -A
           git commit -m "release: $VERSION (aligned with $TAG)"
           git push origin HEAD:main
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
-          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+          # fork tag 必须带 -fork.N，否则与上游同名 tag 冲突（Configure git 已 fetch upstream --tags）。
+          # 与 release-current.yml / release-tag.yml 保持同一命名契约。
+          N=$(git ls-remote --tags origin "refs/tags/v${VERSION}-fork.*" \
+               | sed -n 's/.*v'"$VERSION"'-fork\.\([0-9]*\).*/\1/p' \
+               | sort -n | tail -1)
+          N=$(( ${N:-0} + 1 ))
+          RELEASE_TAG="v${VERSION}-fork.${N}"
+          echo "release tag: $RELEASE_TAG"
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/fork-release"/*.zip \
             "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
             "$RUNNER_TEMP/COMPAT_REPORT.md" \
