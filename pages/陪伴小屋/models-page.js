@@ -13,9 +13,10 @@ window.CompanionModelsPage = (() => {
     fallback_on_refusal: "拒答替代", refusal_terms: "拒答匹配词", replacement_scope: "替换作用范围" };
   const groups = [
     ["对话", [["conversation.reply", "对话回复", "AstrBot 核心回复与 V2 附加提示"],
+      ["conversation.poke_reply", "戳一戳回复", "收到戳一戳时生成简短自然的回应"],
       ["conversation.context_image_caption", "图片摘要", "为已授权的历史图片提取可见内容"],
       ["conversation.image_narration", "当前图片转述", "为本轮已授权图片生成简短文字描述"],
-      ["conversation.video_narration", "原生视频转述", "将原视频交给支持视频输入的模型直接理解"]]],
+      ["conversation.video_narration", "原生视频转述", "将原视频或压缩视频交给原生视频（如 Gemini）或 OpenAI 兼容视觉中转模型理解；支持主备降级与外置插件避让"]]],
     ["感知", [["screen.interpretation", "屏幕解读", "分析已授权截图与摄像头单帧，需要支持图片的模型"],
       ["conversation.image_review", "图片审核", "检查群聊成图的可见内容"],
       ["reality.text", "现实提醒文案", "现实提醒、唤醒回执和短回复的文字生成"]]],
@@ -79,7 +80,10 @@ window.CompanionModelsPage = (() => {
   };
   /* Real dashboard bridges reject failed requests with the error code carried in
      Error.message; the mocked bridge resolves error envelopes with Error.code. */
-  const fail = (err, fallback) => errors[err.code] || errors[err.message] || err?.reason || fallback;
+  const fail = (err, fallback) => errors[err.code] || errors[err.message]
+    || window.CompanionPricingWorkbench?.ERRORS?.[err.code]
+    || window.CompanionPricingWorkbench?.ERRORS?.[err.message]
+    || err?.reason || fallback;
   /* 后端把机器码放在信封的 message 上（页面桥只转发 message），所以取码要同时
      看 data.code 与 message；reason 里若是人话则原样保留。 */
   const CODE = /^[a-z][a-z0-9_]{2,60}$/;
@@ -130,16 +134,107 @@ window.CompanionModelsPage = (() => {
   const snapshot = s => s?.status?.tasks || [];
   const coreReply = task => task?.execution_path === "astrbot_core";
   const taskFields = task => coreReply(task) ? ["prompt", "replacement_rules"] : fields;
+  /* A cleared field still has a row saved on this layer, so it counts as
+     "configured here" exactly like an explicit one; the editor card already
+     treats it that way (its draft is not inherited). */
+  const ownsField = (task, name) => !!(task.fields[name]?.explicit
+    || task.fields[name]?.cleared || task.fields[name]?.replaced);
   const fallbackFor = task => {
     if (coreReply(task)) return "";
     const field = task.fields.fallback;
+    /* Recovery cleared a stored fallback that duplicated the primary; the task
+       really has no fallback even though the inherited value is still visible.
+       ``emptied`` covers rows inherited from another layer, which are not the
+       editor's own choice but are just as unusable. */
+    if (field?.cleared || field?.emptied) return "";
     if (field?.explicit) return field.value || "";
     return field?.value || field?.inherited_value || task.fields.provider?.inherited_value
       || task.fields.provider?.value || "";
   };
-  const available = (s, task) => s.status.providers.filter(p => task.capabilities.every(cap => p.capabilities.includes(cap)));
-  const effective = (task, draft, name) => draft.inherited[name] ? task.fields[name].inherited_value : draft.values[name];
+  const providerSupportsTask = (task, provider) => Boolean(provider) && (
+    task.capabilities.every(cap => provider.capabilities.includes(cap))
+    || (task.kind === "conversation.video_narration"
+        && provider.supports_video_relay === true
+        && provider.capabilities.includes("text"))
+  );
+  const available = (s, task) => s.status.providers.filter(p => providerSupportsTask(task, p));
+  /* The inherited value is computed for the parent layer alone, so with a local
+     primary override it can differ from the fallback this route actually runs.
+     The projected value already reflects the real route; prefer it and fall back
+     to the inherited value only when it is empty. */
+  /* Output use of a field. An emptied fallback is not a fallback even though the
+     parent view still carries a value for it, and for a settled primary the
+     inherited value can be a route this layer will never try. */
+  const effective = (task, draft, name) => {
+    if (!draft.inherited[name]) return draft.values[name];
+    if (name === "fallback") return fallbackShown(task, draft);
+    return task.fields[name].inherited_value;
+  };
   const providerFor = (task, draft) => coreReply(task) ? "" : effective(task, draft, "provider");
+  /* The primary this draft would save: a local value, or the parent value when
+     the user switches back to following it. */
+  const draftedProvider = (task, draft) => draft.inherited.provider
+    ? task.fields.provider.inherited_value : draft.values.provider;
+  /* Recovery emptied an inherited fallback only because it collided with the
+     primary this layer inherits. Moving the primary here — explicitly or by
+     following the parent instead — makes it live again, so the draft has to
+     account for it before saving. */
+  const primaryMoved = (task, draft) =>
+    draftedProvider(task, draft) !== task.fields.provider.value;
+  /* Recovery emptied an inherited fallback because it collided with the primary
+     this layer inherits. Moving the primary makes it live again as the profile's
+     fallback default — unless that default is the new primary, which collides
+     again. Returns null when the field is not an emptied inherited fallback. */
+  const emptiedFallback = (task, draft, name) => {
+    const field = task.fields[name];
+    if (!field.emptied || field.cleared) return null;
+    if (!primaryMoved(task, draft)) return "";
+    const value = field.recovered_value || field.stored_value || "";
+    return value === draftedProvider(task, draft) ? "" : value;
+  };
+  /* True when the draft resets a local fallback row but routing may still
+     resolve it to something this page cannot name (stale parent row, changed
+     primary). The host validates the save against the real route. */
+  const fallbackUnknown = (task, draft) => {
+    const field = task.fields.fallback;
+    if (!draft.inherited.fallback) return false;
+    if (field.explicit || field.replaced || field.cleared) {
+      /* The draft decides the primary, not the saved snapshot: switching it to
+         follow the parent is just as much a change as picking a value. */
+      const primarySettledHere = !draft.inherited.provider;
+      return !(primarySettledHere && field.parent_stored_usable);
+    }
+    if (primaryMoved(task, draft) && field.parent_stored && field.parent_stored_usable) {
+      const parentPrimaryStable = ["role", "window"].includes(task.fields.provider.inherited_source);
+      return draft.inherited.provider && !parentPrimaryStable;
+    }
+    return false;
+  };
+  /* The fallback the card should show and validate for this draft. A local row
+     that is being reset gives way to the parent's *stored* value when that row
+     is usable as-is; otherwise it is left unnamed rather than guessed. */
+  const fallbackShown = (task, draft) => {
+    if (!draft.inherited.fallback) return draft.values.fallback;
+    const field = task.fields.fallback;
+    const emptied = emptiedFallback(task, draft, "fallback");
+    if (emptied !== null) return emptied;
+    if (field.explicit || field.replaced || field.cleared) {
+      return fallbackUnknown(task, draft) ? "" : field.parent_stored;
+    }
+    /* An inherited row can be repointed by recovery too; once this draft moves
+       the primary, the parent's stored row is what runs again — unless that row
+       is stale, in which case recovery keeps the value already projected. */
+    if (primaryMoved(task, draft) && field.parent_stored) {
+      if (!field.parent_stored_usable) return field.value || "";
+      /* Following the parent re-runs recovery for the parent's primary. If that
+         primary itself came back from recovery, the stored fallback may collide
+         with it and be dropped; don't name a value the host will discard. */
+      const parentPrimaryStable = ["role", "window"].includes(task.fields.provider.inherited_source);
+      if (draft.inherited.provider && !parentPrimaryStable) return "";
+      return field.parent_stored;
+    }
+    return field.value || field.inherited_value;
+  };
   /* The routing ceiling of one draft: the strictest output capability among the
      providers this task can be sent to. Replacement-rule targets count too,
      because routing may pick one of them for the same task. */
@@ -228,7 +323,14 @@ window.CompanionModelsPage = (() => {
   const newDraft = task => ({ layer: task.configuration_layer || "role", token: task.edit_token,
     base: Object.fromEntries(Object.entries(task.fields).map(([name, field]) => [name, {...field}])),
     values: Object.fromEntries(fields.map(name => [name, task.fields[name].value])),
-    inherited: Object.fromEntries(fields.map(name => [name, !task.fields[name].explicit])), touched: false, stale: false, conflicts: [], pending: readPending(task.kind) });
+    /* ``cleared`` marks a stored value recovery stopped using: still in the
+       layer, but not what dispatch runs, so it is not "following the parent". */
+    inherited: Object.fromEntries(fields.map(name => [name, !task.fields[name].explicit
+      && !task.fields[name].cleared && !task.fields[name].replaced])),
+    /* Fields the user picked explicitly even though the value equals the
+       projection (a cleared fallback reset to "no fallback"): patchFor must
+       send them, otherwise the stored row survives untouched. */
+    chosen: {}, touched: false, stale: false, conflicts: [], pending: readPending(task.kind) });
   /* The replacement fields are optional in the payload: newer hosts expose them,
      older ones only ship the routing fields. Missing ones degrade to inherited. */
   const plainField = value => ({ value, inherited_value: value, source: "default", inherited_source: "default", explicit: false });
@@ -243,8 +345,24 @@ window.CompanionModelsPage = (() => {
       if (task.fields.replacement_scope === undefined) task.fields.replacement_scope = plainField("all"); }
     return data; }
   function patchFor(task, draft) { const changes = {}, reset = [];
-    for (const name of taskFields(task)) { const field = task.fields[name]; if (draft.inherited[name]) { if (field.explicit) reset.push(name); }
-      else if (!field.explicit || draft.values[name] !== field.value) changes[name] = draft.values[name]; }
+    for (const name of taskFields(task)) { const field = task.fields[name];
+      /* A cleared field still has a stored row even though the projection marks
+         it non-explicit: following the parent must reset it, and leaving it
+         alone must not rewrite the row with the routed placeholder. */
+      const stored = !!field.explicit || !!field.cleared || !!field.replaced;
+      if (draft.inherited[name]) { if (stored) reset.push(name); }
+      else if (!stored || draft.values[name] !== field.value || draft.chosen?.[name]) changes[name] = draft.values[name]; }
+    /* A cleared row is only rewritten when this draft moves the primary: an
+       untouched card must not report itself dirty and rewrite the row on the
+       next navigation. */
+    const primaryTouched = Object.hasOwn(changes, "provider") || reset.includes("provider");
+    if (primaryTouched) for (const name of taskFields(task)) { const field = task.fields[name];
+      if (!(field.cleared || field.replaced) || draft.inherited[name] || draft.chosen?.[name]) continue;
+      if (draft.values[name] !== field.value) continue;
+      /* An emptied row stays off; a substituted row is written back as the
+         value the card shows, so changing the primary does not silently
+         disable a fallback the operator can see. */
+      changes[name] = field.replaced && field.value ? field.value : ""; }
     // A fallback identical to the primary provider is not a fallback.  Keeping
     // it explicit makes every later edit fail the page's duplicate check and
     // the host's model_fallback_duplicate guard; normalize it to "no fallback".
@@ -262,6 +380,9 @@ window.CompanionModelsPage = (() => {
     const edited = [...Object.keys(patch.changes), ...patch.reset], next = newDraft(task);
     for (const name of edited) {
       next.values[name] = draft.values[name]; next.inherited[name] = draft.inherited[name];
+      /* Keep an explicit choice (clearing a recovered-away fallback): without it
+         the rebuilt draft matches the projection and the save would drop it. */
+      if (draft.chosen?.[name]) next.chosen[name] = true;
       const alreadyCurrent = draft.inherited[name] ? !task.fields[name].explicit
         : task.fields[name].explicit && draft.values[name] === task.fields[name].value;
       if ((!sameField(base[name], task.fields[name]) || draft.conflicts?.includes(name)) && !alreadyCurrent) next.conflicts.push(name);
@@ -343,7 +464,8 @@ window.CompanionModelsPage = (() => {
     const primary = projected(task, p, "provider"), fallback = projected(task, p, "fallback"), limit = projected(task, p, "max_output_tokens");
     const picked = [primary, ...(fallback ? [fallback] : [])], providers = picked.map(id => state.status.providers.find(provider => provider.id === id));
     const fallbackExplicit = Object.hasOwn(p.changes, "fallback")
-      || (!p.reset.includes("fallback") && task.fields.fallback.explicit);
+      || (!p.reset.includes("fallback")
+        && (task.fields.fallback.explicit || task.fields.fallback.replaced));
     /* A registry default is clamped by routing at send time, so a task may keep
        following it even when the selected provider is smaller: the save only
        carries the provider, and the sent envelope fits. */
@@ -351,7 +473,7 @@ window.CompanionModelsPage = (() => {
       && (p.reset.includes("max_output_tokens") || !task.fields.max_output_tokens.explicit)
       && limitIsDefault(task);
     return (!fallbackExplicit || !fallback || fallback !== primary)
-      && providers.every(provider => provider && task.capabilities.every(cap => provider.capabilities.includes(cap)))
+      && providers.every(provider => providerSupportsTask(task, provider))
       && (limitDefault || limit <= limitFor(state, task, draft)); }
   /* ---------- functional markup (design alignment: MODEL_CONFIG_UI_UX_DESIGN_20260926) ---------- */
   /* Stable per-provider hue for the colored routing pills and map dots. */
@@ -371,13 +493,14 @@ window.CompanionModelsPage = (() => {
     life: '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4M16 2v4M3 10h18"/>',
     write: '<path d="M4 20l4-1 10-10-3-3L5 16l-1 4Z"/>',
     lane: '<path d="M4 6h16M4 12h16M4 18h16"/>',
-    decision: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><circle cx="12" cy="12" r="5"/><path d="m8.5 8.5 7 7M15.5 8.5l-7 7"/>' };
+    decision: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><circle cx="12" cy="12" r="5"/><path d="m8.5 8.5 7 7M15.5 8.5l-7 7"/>',
+    pricing: '<circle cx="12" cy="12" r="9"/><path d="M9 8.5 12 12l3-3.5M8.5 12.5h7M8.5 15.5h7M12 12v6"/>' };
   const groupIcon = name => ({ "对话": ICONS.reply, "主动与整理": ICONS.memory, "生活与成长": ICONS.life, "私人书写": ICONS.write }[name] || ICONS.lane);
   function topbar(s) {
     return `<div class="model-topbar"><span class="model-topbar-t">任务模型</span>${window.CompanionWorkbench.scopeHintMarkup(Object.entries(window.CompanionWorkbench.scopeObjectForEndpoint(PREFIX + taskPath)).filter(([name,value]) => value && (name !== "target" || windowAvailable)).map(([,value]) => value).join(" · ") || "当前配置", "查看任务模型配置对象")}
       <span class="model-pill ${s.status?.host_state === "running" ? "ok" : "warn"}">${esc(s.status?.host_state === "running" ? "运行中" : s.status?.host_state || "未连接")}</span>
       <button type="button" class="button small" data-model-action="refresh" ${s.loading || s.busy ? "disabled" : ""}>刷新配置</button></div>`; }
-  function overview(s) { const tasks = snapshot(s), custom = tasks.filter(task => taskFields(task).some(name => task.fields[name].explicit)).length;
+  function overview(s) { const tasks = snapshot(s), custom = tasks.filter(task => taskFields(task).some(name => ownsField(task, name))).length;
     const withFb = tasks.filter(task => fallbackFor(task)).length;
     return `<div class="model-overview"><div><strong>${tasks.length}</strong><span>已注册任务</span></div>
       <div><strong>${s.status?.providers.length || 0}</strong><span>可用模型提供方</span></div>
@@ -413,14 +536,72 @@ window.CompanionModelsPage = (() => {
      模型名允许为空（本地测试适配器没有这个概念），所以后缀是可选的而不是拼死的。 */
   const providerLabel = provider => provider && provider.model
     ? `${provider.id} · ${provider.model}` : provider ? provider.id : "";
+  /* "上级"不是一个抽象层级：一个任务可能继承窗口、角色或安装级配置，也可能
+     落到 AstrBot 当前会话模型。标签必须说清是哪一层，否则用户无法判断自己
+     到底在跟随谁。失效的旧值会被后端替换成宿主模型，这里无需特判。
+     层名复用 configSource：同一来源在同一张卡片上只能有一种说法。 */
+  const parentRoute = field => {
+    const layer = configSource(field?.inherited_source || "default");
+    return field?.inherited_value ? `${layer}：${field.inherited_value}` : `${layer}（未设置）`;
+  };
+  /* The backend keeps a blank or unavailable provider on editable layers (role
+     and window) as a live failure and only recovers installation-layer values,
+     so following one produces a draft that cannot be saved. Mirror only that
+     layer distinction: projection already fills default/host blanks. Every
+     follow-parent entry point refuses it the same way. */
+  const unfollowableParent = (s, task) => {
+    const field = task.fields.provider;
+    if (field.inherited_source !== "role" && field.inherited_source !== "window") return null;
+    if (!field.inherited_value) return field;
+    /* Same capability filter the preview and the save path use: a provider that
+       exists but cannot serve this task is just as unusable as a removed one. */
+    return available(s, task).some(provider => provider.id === field.inherited_value) ? null : field;
+  };
+  const unfollowableNotice = field => !field.inherited_value
+    ? `上级（${configSource(field.inherited_source)}）保存的主模型是空值，跟随它无法路由；请先到上级修复。`
+    : `上级（${configSource(field.inherited_source)}）保存的主模型 ${field.inherited_value} 当前不可用，跟随它无法保存；请先到上级修复。`;
   const capabilityLabel = capability => ({
     text: "文本生成", image: "图片输入", audio: "音频输入", tools: "工具调用",
-    embedding: "向量嵌入", video: "视频理解", vision: "图像理解", "conversation.reply": "对话回复",
+    embedding: "向量嵌入", video: "视频理解", video_relay: "视觉转接视频", vision: "图像理解", "conversation.reply": "对话回复",
   }[capability] || capability);
   function providerOptions(s, task, draft, name) { const providers = available(s, task);
-    const selected = draft.inherited[name] ? task.fields[name].inherited_value : draft.values[name];
-    return `${name === "fallback" ? '<option value="">不使用备用模型</option>' : ''}${providers.map(provider => `<option value="${esc(provider.id)}" ${selected === provider.id ? "selected" : ""}>${esc(providerLabel(provider))}</option>`).join("")}
-      ${selected && !providers.some(p => p.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)} · 当前不可用</option>` : ""}`; }
+    const inherited = draft.inherited[name];
+    /* The primary select carries an explicit "follow the parent" option so a
+       task can leave its own value without hunting for the checkbox below.
+       Its value is a sentinel, not the empty string: a legacy converter may
+       have stored an explicit empty provider, and that broken state must not
+       render as if it followed the parent. */
+    /* A stored value recovery stopped using (it collided with the recovered
+       primary) is neither an explicit nor an inherited value. Show it as a
+       disabled marker so the user can see and replace the row that is still
+       saved. It only applies while the draft still holds the routed value: the
+       moment the user picks a provider, that choice must win in the select. */
+    const cleared = !!task.fields[name]?.cleared && !inherited && !draft.chosen?.[name]
+      && draft.values[name] === task.fields[name].value;
+    const selected = cleared ? "__cleared__"
+      : name === "provider"
+        ? (inherited ? "__inherit__" : draft.values[name])
+        : (inherited ? fallbackShown(task, draft) : draft.values[name]);
+    let empty;
+    if (name === "fallback") empty =
+      (cleared ? '<option value="__cleared__" selected disabled>已停用（本层保存的备用与主模型重复）</option>' : "")
+      /* Recovery may substitute a usable default; the stored row is still there
+         and must stay visible so it can be removed. */
+      + (task.fields[name].replaced
+        ? `<option value="__replaced__" disabled>本层保存的 ${esc(task.fields[name].stored_value)} 已被恢复替换</option>` : "")
+      + (fallbackUnknown(task, draft)
+        ? '<option value="" selected disabled>跟随上级（保存后按当前主模型解析）</option>'
+        : '<option value="">不使用备用模型</option>');
+    else {
+      const inheritedValue = task.fields.provider.inherited_value;
+      const unavailable = !!inheritedValue && !providers.some(provider => provider.id === inheritedValue);
+      empty = `${cleared ? '<option value="__cleared__" selected disabled>已停用（本层保存的主模型与备用冲突）</option>' : ""}`
+        + `<option value="__inherit__" ${selected === "__inherit__" ? "selected" : ""}>跟随上级（${esc(parentRoute(task.fields.provider))}${unavailable ? " · 当前不可用" : ""}）</option>`;
+    }
+    const blank = name === "provider" && !inherited && selected === ""
+      ? '<option value="" selected>未设置（本层保存为空值）· 当前不可用</option>' : "";
+    return `${empty}${blank}${providers.map(provider => `<option value="${esc(provider.id)}" ${selected === provider.id ? "selected" : ""}>${esc(providerLabel(provider))}</option>`).join("")}
+      ${selected && selected !== "__inherit__" && selected !== "__cleared__" && !providers.some(p => p.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)} · 当前不可用</option>` : ""}`; }
   function conflictNotice(task, draft) {
     if (!draft.stale) return "";
     const value = field => String(field ?? "").slice(0, 200) || "空";
@@ -469,7 +650,7 @@ window.CompanionModelsPage = (() => {
       <div class="model-sc-bd">
         ${conflictNotice(task, draft)}
         ${draft.pending ? '<div class="model-alert">上次保存结果未确认。请核对原操作，避免重复提交。</div>' : ""}
-        <label class="model-fd"><span class="model-cap">主模型提供方 <em>上级默认 ${esc(task.fields.provider.inherited_value || "未设置")}</em></span>
+        <label class="model-fd"><span class="model-cap">主模型提供方 <em>跟随上级时为 ${esc(parentRoute(task.fields.provider))}</em></span>
           <span class="model-msel"><i style="background:${pillColor(main)}"></i><select data-model-field="provider" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 主模型提供方" ${fieldLocked ? "disabled" : ""}>${providerOptions(s, task, draft, "provider")}</select></span></label>
         <label class="model-fd"><span class="model-cap">备用模型提供方 <em>主模型失败、超时或拒答时尝试一次</em></span>
           <span class="model-msel"><i style="background:${pillColor(fallback)}"></i><select data-model-field="fallback" data-model-kind="${esc(task.kind)}" aria-label="${esc(info.label)} 备用模型提供方" ${fieldLocked ? "disabled" : ""}>${providerOptions(s, task, draft, "fallback")}</select></span></label>
@@ -503,13 +684,15 @@ window.CompanionModelsPage = (() => {
   function providerView(s) { const providers = s.status?.providers || []; if (!providers.length) return '<p class="model-empty">尚未读取到模型提供方。</p>';
     const tasks = visible(s).filter(task => !coreReply(task)), filtered = !!(s.query || s.custom || s.lane !== "all" || s.providerFilter);
     const panels = providers.filter(provider => !s.providerFilter || s.providerFilter === provider.id).map(provider => {
-      const capable = tasks.filter(task => task.capabilities.every(cap => provider.capabilities.includes(cap)));
+      const capable = tasks.filter(task => providerSupportsTask(task, provider));
       const routed = tasks.filter(task => providerFor(task, s.drafts.get(task.kind)) === provider.id);
       if (filtered && !routed.length && s.providerFilter !== provider.id) return "";
+      const caps = provider.supports_video_relay && !provider.capabilities.includes("video")
+        ? [...provider.capabilities, "video_relay"] : provider.capabilities;
       return `<article class="model-provider-panel"><header><span><strong>${esc(provider.id)}</strong><em>${routed.length} / ${capable.length} 项任务走这里</em></span>
           <span class="model-state">上限 ${provider.max_output_tokens}</span></header>
         ${provider.model ? `<p class="model-provider-model">${esc(provider.model)}</p>` : ""}
-        <p class="model-provider-caps">${provider.capabilities.map(cap => `<small>${esc(capabilityLabel(cap))}</small>`).join("") || "<small>无能力声明</small>"}</p>
+        <p class="model-provider-caps">${caps.map(cap => `<small>${esc(capabilityLabel(cap))}</small>`).join("") || "<small>无能力声明</small>"}</p>
          <ul class="model-provider-tasks">${routed.map(task => { const info = taskName(task.kind);
            return `<li><button type="button" data-model-open="${esc(task.kind)}" aria-label="编辑 ${esc(info.label)} 的模型配置">${esc(info.label)}</button></li>`; }).join("") || '<li class="model-empty">还没有任务走这个模型提供方。</li>'}</ul>
          ${capable.length > routed.length ? `<p class="model-provider-note">还有 ${capable.length - routed.length} 项能力相符的任务由其他模型提供方承担。</p>` : ""}</article>`; }).filter(Boolean);
@@ -630,7 +813,7 @@ window.CompanionModelsPage = (() => {
   function assign(s, providerId) { const kinds = selected(s); if (!providerId || !kinds.length) return;
     const skipped = []; let changed = 0;
     for (const kind of kinds) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || !draft || draft.pending || draft.stale) continue;
-      if (!task.capabilities.every(cap => s.status.providers.find(p => p.id === providerId)?.capabilities.includes(cap))) { skipped.push(taskName(kind).label); continue; }
+      if (!providerSupportsTask(task, s.status.providers.find(p => p.id === providerId))) { skipped.push(taskName(kind).label); continue; }
       if (draft.values.provider === providerId && !draft.inherited.provider) continue;
       draft.inherited.provider = false; draft.values.provider = providerId; draft.touched = true; fitLimit(s, task, draft); changed++; }
     s.bad = skipped.length > 0;
@@ -641,91 +824,27 @@ window.CompanionModelsPage = (() => {
     for (const kind of kinds) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || !draft || draft.pending) continue;
       s.drafts.set(kind, newDraft(task)); count++; }
     s.bad = false; s.notice = count ? `已放弃 ${count} 项任务的草稿。` : '没有可放弃的草稿。'; render(); }
-  function restoreInherit(s, kinds) { let count = 0;
+  function restoreInherit(s, kinds) { let count = 0; const blocked = [];
     for (const kind of kinds) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || !draft || draft.pending) continue;
+      /* Same guard as the per-field entry points: a blank parent provider keeps
+         its failure, so following it would only produce an unsaveable draft. */
+      const blockedParent = unfollowableParent(s, task);
+      if (blockedParent) {
+        blocked.push(`${taskName(kind).label}（${blockedParent.inherited_value ? "上级模型不可用" : "上级主模型为空"}）`);
+        continue;
+      }
+      /* Every field, the output limit included, follows the parent again, so
+         there is nothing to re-fit: the ceiling comes from the same layer. */
       for (const name of taskFields(task)) draft.inherited[name] = true;
       draft.touched = true; count++; }
-    s.bad = false; s.notice = count ? `已把 ${count} 项任务改为跟随上级配置，保存后生效。` : '没有可调整的任务。'; render(); }
-  /* ---------- bulk default / fallback assignment ----------
-     One place to choose the default model and the fallback model, then apply
-     both to every functional task. It writes the same drafts the per-task
-     selects do and reuses saveTasks(), so validation, operation keys, pending
-     confirmation and failure recovery all stay on the existing path. */
-  function bulkConsensus(s, name) {
-    const counts = new Map();
-    for (const task of snapshot(s)) {
-      if (coreReply(task)) continue;
-      const draft = s.drafts.get(task.kind);
-      if (!draft) continue;
-      const value = name === "provider" ? providerFor(task, draft) : effective(task, draft, "fallback");
-      if (value) counts.set(value, (counts.get(value) || 0) + 1);
-    }
-    let best = "", bestCount = 0;
-    for (const [value, count] of counts) if (count > bestCount) { best = value; bestCount = count; }
-    return best;
-  }
-  /* Undefined means "show the current consensus"; an explicit empty string is a
-     real choice (no fallback), so ?? must not swallow it. */
-  function bulkChoice(s) {
-    return {
-      primary: s.bulk?.primary ?? bulkConsensus(s, "provider"),
-      fallback: s.bulk?.fallback ?? bulkConsensus(s, "fallback"),
-    };
-  }
-  function bulkBar(s) {
-    if (!s.status?.providers?.length) return "";
-    const providers = s.status.providers, {primary, fallback} = bulkChoice(s);
-    const count = snapshot(s).filter(task => !coreReply(task)).length;
-    const locked = s.busy || s.loading || s.denied;
-    const options = (value, emptyLabel) => `<option value="" ${value ? "" : "selected"}>${esc(emptyLabel)}</option>`
-      + providers.map(provider => `<option value="${esc(provider.id)}" ${provider.id === value ? "selected" : ""}>${esc(providerLabel(provider))}</option>`).join("");
-    return `<div class="model-selbar"><b>统一模型设置</b>
-      <label><span>默认模型</span><select data-model-bulk="primary" aria-label="统一默认模型" ${locked ? "disabled" : ""}>${options(primary, "选择模型…")}</select></label>
-      <label><span>备用模型</span><select data-model-bulk="fallback" aria-label="统一备用模型" ${locked ? "disabled" : ""}>${options(fallback, "不使用备用模型")}</select></label>
-      <button type="button" class="button small primary" data-model-bulk-apply ${locked || !primary || primary === fallback ? "disabled" : ""}>应用到全部并保存</button>
-      <small>覆盖 ${count} 项功能的单独设置 · 核心回复由 AstrBot 管理，不参与</small></div>`;
-  }
-  function applyBulk(s) {
-    const {primary, fallback} = bulkChoice(s);
-    const providers = s.status?.providers || [];
-    const main = providers.find(provider => provider.id === primary);
-    const spare = fallback ? providers.find(provider => provider.id === fallback) : null;
-    if (!primary || !main || primary === fallback || (fallback && !spare)) {
-      s.bad = true; s.notice = "请先选择两个不同、且已在 AstrBot 加载的模型（备用可留空）。"; render(); return;
-    }
-    if (s.busy || s.loading || s.denied) return;
-    const kinds = [], skipped = [];
-    for (const task of snapshot(s)) {
-      if (coreReply(task)) continue;
-      const draft = s.drafts.get(task.kind);
-      if (!draft || draft.pending || draft.stale) { skipped.push(taskName(task.kind).label); continue; }
-      const fits = provider => task.capabilities.every(cap => provider.capabilities.includes(cap));
-      if (!fits(main) || (spare && !fits(spare))) { skipped.push(taskName(task.kind).label); continue; }
-      draft.values.provider = primary;
-      draft.values.fallback = fallback;
-      draft.inherited.provider = false;
-      draft.inherited.fallback = false;
-      draft.touched = true;
-      fitLimit(s, task, draft);
-      kinds.push(task.kind);
-    }
-    if (!kinds.length) { s.bad = true; s.notice = "没有可统一设置的任务，请刷新配置后重试。"; render(); return; }
     s.bad = false;
-    s.notice = `正在把 ${kinds.length} 项功能统一为 ${primary}${fallback ? " → " + fallback : "（不使用备用）"}…`;
-    if (skipped.length) s.notice += ` ${skipped.length} 项能力不符或待核对，已跳过。`;
-    render();
-    saveTasks(s, kinds);
-  }
+    s.notice = (count ? `已把 ${count} 项任务改为跟随上级配置，保存后生效。` : '没有可调整的任务。')
+      + (blocked.length ? `${count ? "" : " "}${blocked.length} 项已跳过：${blocked.join("、")}。` : "");
+    render(); }
   /* ---------- functional events ---------- */
   function fnInput(event) { const s = state; if (!s || s.busy || s.loading || s.denied) return; const target = event.target;
     /* The policy pane owns toggles and selects, so it gets every input event. */
     if (s.sub === "pol") { event.type === "change" ? ruleChange(s, event) : ruleInput(s, event); return; }
-    if (target.matches("[data-model-bulk]")) {
-      if (event.type !== "change") return;
-      s.bulk = s.bulk || {};
-      s.bulk[target.dataset.modelBulk] = target.value;
-      render(); return;
-    }
     if (target.matches("[data-model-search]")) { s.query = target.value; render(); const next = root.querySelector("[data-model-search]");
       if (next) { next.focus(); next.setSelectionRange(next.value.length, next.value.length); } return; }
     if (target.matches("[data-model-provider-filter]")) { if (event.type !== "change") return; s.providerFilter = target.value || null; render(); return; }
@@ -734,13 +853,44 @@ window.CompanionModelsPage = (() => {
     if (target.matches("[data-model-assign]")) { assign(s, target.value); target.value = ""; return; }
     if (!kind) return;
     const inheritName = target.dataset.modelInherit;
-    if (inheritName) { const draft = s.drafts.get(kind); if (draft && !draft.pending && taskFields(taskOf(s, kind)).includes(inheritName)) { draft.inherited[inheritName] = target.checked; draft.touched = true; render(); } return; }
+    if (inheritName) { const draft = s.drafts.get(kind), task = taskOf(s, kind);
+      if (draft && !draft.pending && task && taskFields(task).includes(inheritName)) {
+        if (target.checked && inheritName === "provider" && unfollowableParent(s, task)) {
+          s.notice = unfollowableNotice(unfollowableParent(s, task));
+          s.bad = false; render(); return;
+        }
+        draft.inherited[inheritName] = target.checked; draft.touched = true;
+        /* The checkbox is the same provider switch as the select's follow-parent
+           option; both must re-fit a saved limit against the parent ceiling. */
+        if (target.checked && (inheritName === "provider" || inheritName === "fallback")) {
+          const adjusted = fitLimit(s, task, draft);
+          if (adjusted) { s.notice = limitNotice(task, draft, adjusted); s.bad = false; }
+        }
+        render(); } return; }
     const name = target.dataset.modelField; if (!name || !fields.includes(name)) return;
     const draft = s.drafts.get(kind), task = taskOf(s, kind); if (!draft || !task || draft.pending) return;
     if (!taskFields(task).includes(name)) return;
+    if (name === "provider" && target.value === "__inherit__") {
+      const parent = unfollowableParent(s, task);
+      if (parent) { s.notice = unfollowableNotice(parent); s.bad = false; render(); return; }
+      /* The follow-parent sentinel sets the same state as the inherit
+         checkbox; it never stands for a real provider id. Choosing a provider
+         re-fits the saved output limit, and the parent route is a provider
+         change too: without the same pass an explicit limit above the parent's
+         ceiling would keep Save disabled for a value the user did not touch. */
+      draft.inherited.provider = true; draft.touched = true;
+      const adjusted = fitLimit(s, task, draft);
+      if (adjusted) { s.notice = limitNotice(task, draft, adjusted); s.bad = false; }
+      render(); return;
+    }
     draft.values[name] = ["max_output_tokens", "timeout_seconds"].includes(name)
       ? (Number.isFinite(target.valueAsNumber) ? target.valueAsNumber : draft.values[name]) : target.value;
     draft.inherited[name] = false;
+    /* The user may deliberately choose the same value the projection shows
+       (clearing or confirming a recovered row); remember it so the save emits
+       it instead of leaving the old stored row in place. */
+    if ((task.fields[name]?.cleared || task.fields[name]?.replaced)
+        && draft.values[name] === task.fields[name].value) draft.chosen[name] = true;
     const adjusted = (name === "provider" || name === "fallback") && fitLimit(s, task, draft);
     if (adjusted) { s.notice = limitNotice(task, draft, adjusted); s.bad = false; }
     draft.touched = true;
@@ -749,8 +899,6 @@ window.CompanionModelsPage = (() => {
     if (event.target.closest("[data-drawer-close]")) { s.drawer = null; render(); return; }
     const pill = event.target.closest("[data-provider-pill]");
     if (pill) { s.drawer = s.drawer === pill.dataset.providerPill ? null : pill.dataset.providerPill; render(); return; }
-    const bulkApply = event.target.closest("[data-model-bulk-apply]");
-    if (bulkApply) { applyBulk(s); return; }
     const goto = event.target.closest("[data-drawer-goto]");
     if (goto) { s.drawer = null; s.sub = "cfg"; s.cm = "precise"; s.view = "tasks"; s.providerFilter = goto.dataset.drawerGoto; render(); return; }
     const exp = event.target.closest("[data-model-exp]");
@@ -1224,18 +1372,44 @@ window.CompanionModelsPage = (() => {
     if (mode === "remote" && path.endsWith("/v1/chat/completions"))
       return '<div class="model-alert">当前接入方式是「远程 HTTP 服务」，但地址以 <code>/v1/chat/completions</code> 结尾。请改为 <code>/v1/systemone</code>，或切换到「OpenAI 兼容网关」；后端会拒绝这种跨协议配置。</div>';
     return ""; }
+  const isGroupLaya = s => s?.status?.scope_kind === "group" || s?.laya?.logsScopeKind === "group" || s?.laya?.logsUnavailable === true;
+  const layaLogsParams = s => (isGroupLaya(s) ? undefined : {scope: s?.laya?.logsScope || "all"});
   async function layaRefresh(s) { const l = s.laya, ticket = version; if (l.loading) return; l.loading = true; l.notice = "正在读取 Laya 配置…"; render();
-    try { const [config, history] = await Promise.allSettled([api("GET", path + "/laya"), api("GET", path + "/laya/logs")]); if (!current(ticket, s)) return;
+    try { const [config, history] = await Promise.allSettled([api("GET", path + "/laya"), api("GET", path + "/laya/logs", layaLogsParams(s))]); if (!current(ticket, s)) return;
       if (config.status === "rejected") throw config.reason;
       const data = config.value;
       if (!layaDirty(l) || l.stale) l.draft = layaDraftFrom(data); l.data = {...data, decision_fields: layaDraftFrom(data).decision_fields};
       l.logs = history.status === "fulfilled" ? history.value.events || [] : [];
       l.logsUnavailable = history.status === "fulfilled" && history.value.available === false;
+      l.logsScopeKind = history.status === "fulfilled" ? history.value.scope_kind || "" : "";
+      if (history.status === "fulfilled" && !isGroupLaya(s) && ["all", "current"].includes(history.value.scope)) l.logsScope = history.value.scope;
       l.logsError = history.status === "rejected";
       l.loaded = true; l.stale = false; l.bad = false;
       l.notice = l.logsError ? "Laya 配置已读取；近期记录暂不可用。" : "已读取 Laya 接入状态。"; }
     catch (err) { if (!current(ticket, s)) return; l.bad = true; l.notice = fail(err, "无法读取 Laya 配置。"); }
     finally { l.loading = false; if (current(ticket, s)) render(); } }
+  async function layaSwitchLogsScope(s, nextScope) {
+    const l = s.laya;
+    if (!["all", "current"].includes(nextScope) || l.logsScope === nextScope || l.loading || isGroupLaya(s)) return;
+    const ticket = version;
+    l.logsScope = nextScope;
+    l.logsError = false;
+    l.logsLoading = true;
+    render();
+    try {
+      const history = await api("GET", path + "/laya/logs", {scope: nextScope});
+      if (!current(ticket, s) || l.logsScope !== nextScope) return;
+      l.logs = history.events || [];
+      l.logsUnavailable = history.available === false;
+      l.logsScopeKind = history.scope_kind || "";
+      l.logsError = false;
+    } catch {
+      if (!current(ticket, s) || l.logsScope !== nextScope) return;
+      l.logsError = true;
+    } finally {
+      if (current(ticket, s) && l.logsScope === nextScope) { l.logsLoading = false; render(); }
+    }
+  }
   async function layaSave(s) { const l = s.laya; if (l.busy || l.loading || !l.data || l.stale || !layaDirty(l)) return;
     /* 保存时总是带上代理地址（含空串）：空串就是直连，不能让「没提交」被误读成
        「保持原值」。 */
@@ -1247,6 +1421,7 @@ window.CompanionModelsPage = (() => {
   /* 远程服务返回的 reason 已由后端脱敏，比 codes 里的通用文案更有诊断价值；
      状态码解释只在 Laya 这里使用，避免影响其他配置页的错误提示。 */
   const LAYA_HTTP_HINTS = {
+    401: "鉴权失败（401 Unauthorized），请核对 API Key 是否有效或已过期",
     403: "服务端拒绝访问（403 Forbidden），请核对 API Key、访问权限或服务端白名单",
     404: "接口路径不存在（404 Not Found），请核对服务地址是否带有正确的接口前缀",
     407: "代理要求先完成鉴权（407 Proxy Authentication Required），请核对代理账号与密码",
@@ -1267,7 +1442,7 @@ window.CompanionModelsPage = (() => {
     const http = /^Laya HTTP (\d{3})/.exec(detail);
     if (http) {
       const status = Number(http[1]);
-      const body = detail.slice(http[0].length).replace(/^[：:\s]+/, "").slice(0, 200);
+      const body = detail.slice(http[0].length).replace(/^[：:\s·]+/, "").slice(0, 200);
       return `Laya HTTP ${status} · ${layaHttpHint(status)}${body ? `；服务端原文：${body}` : ""}`;
     }
     if (detail && !CODE.test(detail)) return detail;
@@ -1282,15 +1457,25 @@ window.CompanionModelsPage = (() => {
     }
     const ticket = version; l.busy = true; l.test = {status: "testing"}; l.notice = l.data.mode === "local" ? "正在调用官方 Router；首次测试会自动下载检查点…" : l.data.mode === "jev" ? "正在调用 OpenAI 兼容网关…" : l.data.mode === "workers_ai" ? "正在调用 Cloudflare Workers AI…" : "正在调用官方 SystemOne HTTP 接口…"; render();
     try { const result = await api("POST", path + "/laya/test", {}, 600000); if (!current(ticket, s)) return;
+      if (result?.status === "failed") {
+        l.test = result; l.bad = true; l.notice = layaErrorText(result, "Laya 连接测试未完成。");
+        render(); await layaRefreshQuiet(s, ticket); return;
+      }
       l.test = result; l.notice = "Laya 调用完成；当前模式和检查点已验证。"; l.bad = false; await layaRefreshQuiet(s, ticket); }
     catch (err) { if (!current(ticket, s)) return; l.test = {status: "unknown", code: err.code || err.message, reason: err.reason || ""}; l.bad = true; l.notice = layaErrorText(err, "Laya 连接测试未完成。");
       /* 先把失败原因画出来，再补拉运行记录；日志读取慢时用户也不会一直停在等待态。 */
       render(); await layaRefreshQuiet(s, ticket); }
     finally { l.busy = false; if (current(ticket, s)) render(); } }
-  async function layaRefreshQuiet(s, ticket) { const [config, history] = await Promise.allSettled([api("GET", path + "/laya"), api("GET", path + "/laya/logs")]);
+  async function layaRefreshQuiet(s, ticket) { const [config, history] = await Promise.allSettled([api("GET", path + "/laya"), api("GET", path + "/laya/logs", layaLogsParams(s))]);
     if (!current(ticket, s)) return;
     if (config.status === "fulfilled") { s.laya.data = config.value; s.laya.draft = layaDraftFrom(config.value); }
-    if (history.status === "fulfilled") { s.laya.logs = history.value.events || []; s.laya.logsUnavailable = history.value.available === false; s.laya.logsError = false; }
+    if (history.status === "fulfilled") {
+      s.laya.logs = history.value.events || [];
+      s.laya.logsUnavailable = history.value.available === false;
+      s.laya.logsScopeKind = history.value.scope_kind || "";
+      if (!isGroupLaya(s) && ["all", "current"].includes(history.value.scope)) s.laya.logsScope = history.value.scope;
+      s.laya.logsError = false;
+    }
     else s.laya.logsError = true; }
   /* ---------- DeepSeek search binding ---------- */
   const searchDirty = x => !!x.data && !!x.draft
@@ -1339,6 +1524,16 @@ window.CompanionModelsPage = (() => {
   function searchClick(s, event) { const target = event.target;
     if (target.closest("[data-search-refresh]")) { searchRefresh(s); return; }
     if (target.closest("[data-search-save]")) searchSave(s); }
+  /* ---------- Pricing v2 workbench delegation ---------- */
+  const pricingWorkbench = () => window.CompanionPricingWorkbench || null;
+  function pricingCtx(s) {
+    const wb = pricingWorkbench();
+    s.pricing ||= wb?.createState?.() || {loaded: false, loading: false, busy: false, data: null, draft: null};
+    return {
+      state: s, p: s.pricing, path, api, render,
+      isCurrent: ticket => current(ticket, s), ticket: () => version, root: () => root, fail,
+    };
+  }
   async function layaDecide(s) { const l = s.laya; if (l.busy || l.loading || !l.data) return;
     if (layaDirty(l)) { l.bad = true; l.notice = "请先保存当前 Laya 配置，再执行决策预览。"; render(); return; }
     if ((l.draft?.mode || l.data.mode) === "local" && l.data.local_runtime_state === "gpu_unavailable") {
@@ -1349,6 +1544,10 @@ window.CompanionModelsPage = (() => {
     const text = String(l.previewText || "").trim(); if (!text) { l.bad = true; l.notice = "先输入一段测试消息。"; render(); return; }
     const ticket = version; l.busy = true; l.preview = {status: "testing"}; l.notice = "正在请求 Laya 进行语义分类…"; render();
     try { const result = await api("POST", path + "/laya/decide", {facts: {message_kind: "text", user_text: text}}, 125000); if (!current(ticket, s)) return;
+      if (result?.status === "failed") {
+        l.preview = result; l.bad = true; l.notice = layaErrorText(result, "Laya 决策调用未完成。");
+        render(); await layaRefreshQuiet(s, ticket); return;
+      }
       l.preview = result; l.notice = result.status === "skipped" ? "这条测试消息被规则跳过。" : "已收到 Laya 决策。"; l.bad = false; await layaRefreshQuiet(s, ticket); }
     catch (err) { if (!current(ticket, s)) return; l.preview = {status: "unknown", code: err.code || err.message, reason: err.reason || ""}; l.bad = true; l.notice = layaErrorText(err, "Laya 决策调用未完成。");
       /* 先让失败原因可见，再补拉运行记录，避免日志读取拖住错误提示。 */
@@ -1379,6 +1578,20 @@ window.CompanionModelsPage = (() => {
     else if (result.confidence_gate?.status === "confidence_unavailable")
       meta.push("当前服务未返回行动概率，阈值未强制执行");
     return `<div class="model-laya-result"><b>决策结果${meta.length ? ` · ${esc(meta.join(" · "))}` : ""}</b><code>${esc(JSON.stringify(decision, null, 2))}</code></div>`; }
+  function layaMaskScopeId(id) {
+    const text = String(id || "").trim();
+    if (text.length <= 6) return text;
+    return text.slice(0, 3) + "…" + text.slice(-3);
+  }
+  function layaScopeLabel(event) {
+    const scopeKind = event.scope_info?.kind || (event.source === "probe" ? "test" : "");
+    const nativeId = String(event.scope_info?.native_scope_id || "").trim();
+    const shortId = nativeId ? layaMaskScopeId(nativeId) : "";
+    if (scopeKind === "group") return shortId ? `群聊 ${shortId}` : "群聊";
+    if (scopeKind === "private") return shortId ? `私聊 ${shortId}` : "私聊";
+    if (scopeKind === "test") return "连接测试";
+    return scopeKind || "";
+  }
   function layaHistoryMarkup(l) { const events = Array.isArray(l.logs) ? l.logs : [];
     if (l.logsError) return '<p class="model-laya-history-empty">近期记录暂不可用；Laya 配置仍可查看和保存。</p>';
     if (l.logsUnavailable) return '<p class="model-laya-history-empty">当前群聊的近期决策记录暂不能按会话汇总；全局 Laya 配置仍可在此管理。</p>';
@@ -1395,7 +1608,14 @@ window.CompanionModelsPage = (() => {
       const diagnostics = hasDiagnostics
         ? `<div class="model-laya-diagnostics">${diagnostic("模型输入 · state 与分类问题", event.request, "未记录请求")}${diagnostic("模型原始响应", event.response, "未收到模型响应")}${diagnostic("处理结果 · 合同解析、范围修正与实际应用", event.processing, "未记录处理过程")}</div>`
         : '<small>该记录生成于详细诊断字段启用前。</small>';
-      return `<li data-state="${esc(event.status)}"><details><summary><span><strong>${esc(labels[event.status] || event.status)}</strong><small>${esc(time)} · ${esc(sources[event.source] || event.source || "未知来源")} · ${esc(event.mode)}</small></span><b>${event.elapsed_ms == null ? "—" : esc(event.elapsed_ms) + " ms"}</b></summary><div><small>${esc(event.reason_code || "分类结果")}</small>${enabledMarkup}<code>${esc(detail)}</code>${diagnostics}</div></details></li>`;
+      const sourceLabel = sources[event.source] || event.source || "未知来源";
+      const scopeLabel = layaScopeLabel(event);
+      const metaParts = [scopeLabel, scopeLabel === sourceLabel ? "" : sourceLabel, event.mode].filter(Boolean);
+      const action = event.decision && typeof event.decision === "object" && event.decision.action ? String(event.decision.action) : "";
+      const conf = event.processing?.action_confidence;
+      const confText = typeof conf === "number" && Number.isFinite(conf) ? ` (${(conf * 100).toFixed(1)}%)` : "";
+      const actionTag = action ? ` <span class="model-tag ${action === "silent" ? "n" : action === "wait" ? "a" : "g"}">action=${esc(action)}${esc(confText)}</span>` : "";
+      return `<li data-state="${esc(event.status)}"><details><summary><span><strong>${esc(labels[event.status] || event.status)}${actionTag}</strong><small>${esc(time)} · ${esc(metaParts.join(" · "))}</small></span><b>${event.elapsed_ms == null ? "—" : esc(event.elapsed_ms) + " ms"}</b></summary><div><small>${esc(event.reason_code || "分类结果")}</small>${enabledMarkup}<code>${esc(detail)}</code>${diagnostics}</div></details></li>`;
     }).join("")}</ol>`; }
   function layaContextMarkup() { const product = window.CompanionProduct, currentTarget = product?.target?.();
     if (!currentTarget) return "";
@@ -1447,7 +1667,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
         <div class="model-state">上游源码与版本：<a href="https://github.com/NandhaKishorM/laya" target="_blank" rel="noreferrer">NandhaKishorM/laya</a> · <a href="https://huggingface.co/convaiinnovations/laya-multilingual" target="_blank" rel="noreferrer">Multilingual 权重</a></div>
       </div>`}
       <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">调用预览</span><h3>测试一次语义决策</h3></div></div><label class="model-fd"><span class="model-cap">测试消息<em>只提交这段文字与固定的文本类型事实</em></span><textarea data-laya-preview rows="4" ${l.busy || l.loading ? "disabled" : ""}>${esc(l.previewText || "")}</textarea></label><div class="model-editor-actions"><button type="button" class="button primary" data-laya-decide ${l.busy || l.loading || !l.data.enabled ? "disabled" : ""}>调用 Laya</button></div>${l.preview ? layaResult(l.preview) : ""}</div>
-      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">${l.logsUnavailable ? "当前会话" : "运行记录 · 最近 50 条"}</span><h3>Laya 调用日志</h3></div></div>${layaHistoryMarkup(l)}</div>
+      <div class="model-card"><div class="model-phead"><div class="model-grow"><span class="model-eb">${l.logsUnavailable ? "当前会话" : isGroupLaya(s) ? "本群运行记录 · 最近 50 条" : l.logsScope === "current" ? "当前会话 · 最近 50 条" : "全部来源 · 最近 50 条"}</span><h3>Laya 调用日志</h3></div>${isGroupLaya(s) ? "" : `<div class="model-st2"><div class="model-seg" role="group" aria-label="日志来源筛选"><button type="button" class="${(l.logsScope || "all") === "all" ? "on" : ""}" data-laya-logs-scope="all" aria-pressed="${(l.logsScope || "all") === "all"}" ${l.loading || l.logsLoading ? "disabled" : ""}>全部来源</button><button type="button" class="${l.logsScope === "current" ? "on" : ""}" data-laya-logs-scope="current" aria-pressed="${l.logsScope === "current"}" ${l.loading || l.logsLoading ? "disabled" : ""}>仅当前会话</button></div></div>`}</div>${layaHistoryMarkup(l)}</div>
     </div>`; }
   function layaInput(s, event) { const l = s.laya, t = event.target;
     if (event.type === "change" && t.matches("[data-laya-target]")) {
@@ -1467,6 +1687,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     if (event.type === "change") { l.bad = false; render(); } }
   function layaClick(s, event) { const t = event.target;
     if (t.closest("[data-laya-refresh]")) { layaRefresh(s); return; }
+    const logsScope = t.closest("[data-laya-logs-scope]"); if (logsScope) { layaSwitchLogsScope(s, logsScope.dataset.layaLogsScope); return; }
     if (t.closest("[data-laya-save]")) { layaSave(s); return; }
     const preset = t.closest("[data-laya-preset]"); if (preset) { layaApplyPreset(s, preset.dataset.layaPreset); return; }
     const copy = t.closest("[data-laya-copy]"); if (copy) { layaCopyInstall(s, copy.dataset.layaCopy); return; }
@@ -2128,7 +2349,8 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       ["voice", "语音模型", ICONS.voice, s.voice.data ? s.voice.data.providers.length : ""],
       ["image", "生图模型", ICONS.image, s.image.data ? s.image.data.actions.length : ""],
       ["search", "搜索服务", ICONS.search, s.search?.data?.deepseek_provider_id ? "已绑定" : ""],
-      ["laya", "Laya 决策", ICONS.decision, s.laya.data ? (s.laya.data.enabled ? "启用" : "") : ""]];
+      ["laya", "Laya 决策", ICONS.decision, s.laya.data ? (s.laya.data.enabled ? "启用" : "") : ""],
+      ["pricing", "计价与汇率", ICONS.pricing, pricingWorkbench()?.tabBadge?.(s.pricing) || ""]];
     return `<div class="model-tabs" role="tablist" aria-label="模型配置分类">${tabs.map(([id, label, ic, count]) =>
       `<button type="button" role="tab" data-model-tab="${id}" aria-selected="${s.tab === id}" class="${s.tab === id ? "on" : ""}">${icon(ic)}${label}${count !== "" ? `<span class="c">${count}</span>` : ""}</button>`).join("")}</div>`; }
   /* ---------- functional subtabs (design migration) ---------- */
@@ -2140,7 +2362,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     return `<div class="model-subtabs" role="tablist" aria-label="功能模型视图">${tabs.map(([id, label, ic, desc]) => `<button type="button" role="tab" data-model-sub="${id}" aria-selected="${s.sub === id}" class="${s.sub === id ? "on" : ""}"><span class="model-subtab-icon">${icon(ICONS[ic])}</span><span class="model-subtab-copy"><b>${label}</b><small>${desc}</small></span></button>`).join("")}</div>`; }
   function kpi(n, label, tone = "") { return `<div class="model-kpi ${tone}"><b>${n}</b><span>${esc(label)}</span></div>`; }
   function fnKpis(s) { const tasks = snapshot(s); const total = tasks.length; const providers = s.status?.providers.length || 0;
-    const withFb = tasks.filter(fallbackFor).length; const own = tasks.filter(t => taskFields(t).some(nm => t.fields[nm]?.explicit)).length;
+    const withFb = tasks.filter(fallbackFor).length; const own = tasks.filter(t => taskFields(t).some(nm => ownsField(t, nm))).length;
     return kpi(total, "需要模型的功能") + kpi(providers, "可用模型") + kpi(withFb, "已设回退", "g")
       + kpi(total - withFb, "暂无回退", "a") + kpi(own, "单独设置"); }
   function sitFilters(s) { const avSeg = [["slot", "按能力槽"], ["lane", "按前台 / 后台"]]; const afSeg = [["all", "全部"], ["nofb", "仅无备用"], ["own", "仅单独设置"]];
@@ -2150,7 +2372,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     ? `<button type="button" class="model-pill m${hovered === id ? " is-hovered" : ""}" data-provider-pill="${esc(id)}" style="--mc:${pillColor(id)}" title="查看 ${esc(id)} 的路由分工">${esc(id)}</button>`
     : `<span class="model-pill m none">${missing || "无回退"}</span>`;
   function situationMap(s) { const tasks = snapshot(s); const q = s.query.toLocaleLowerCase();
-    const match = t => { if (s.af === "nofb" && (coreReply(t) || fallbackFor(t))) return false; if (s.af === "own" && !taskFields(t).some(nm => t.fields[nm]?.explicit)) return false;
+    const match = t => { if (s.af === "nofb" && (coreReply(t) || fallbackFor(t))) return false; if (s.af === "own" && !taskFields(t).some(nm => ownsField(t, nm))) return false;
       if (!q) return true; const info = taskName(t.kind); return (info.label + info.group + info.description + t.kind).toLocaleLowerCase().includes(q); };
     let groups2;
     if (s.av === "lane") groups2 = [["前台 · 用户可见", tasks.filter(t => t.lane === "foreground")], ["后台 · 静默运行", tasks.filter(t => t.lane === "background")]];
@@ -2172,7 +2394,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       return `<section class="model-grp"><header><input type="checkbox" class="model-gck" data-model-gpick="${esc(gkey)}" ${all ? "checked" : ""} aria-label="全选 ${esc(g)}">${icon(groupIcon(g))}<b>${esc(g)}</b><span class="cnt">${ts.length} 项${sel ? " · 已选 " + sel : ""}</span></header>
         ${items || '<p class="model-empty">没有匹配的任务。</p>'}</section>`; }).join("");
     const legend = (s.status?.providers || []).map(p => `<span><i style="background:${pillColor(p.id)}"></i><em>${esc(p.id)}</em></span>`).join("");
-    return `<div class="model-subpane"><div class="model-kpis">${fnKpis(s)}</div>${bulkBar(s)}${sitFilters(s)}
+    return `<div class="model-subpane"><div class="model-kpis">${fnKpis(s)}</div>${sitFilters(s)}
       <details class="model-mlgd-box"><summary><span>模型提供方图例</span><small>${(s.status?.providers || []).length} 个 · 点击展开</small></summary><div class="model-mlgd legend">${legend}</div></details>
       <div class="model-rgrid">${list}</div>${testBar(s)}</div>`; }
   const probeLabel = result => result.status === "ok" ? `连接成功 · ${result.latency_ms} ms`
@@ -2263,7 +2485,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
   async function applySlot(s, slotId) { const gp = taskGroups(s).find(([g]) => g === slotId); if (!gp) return; const providerId = s.slotDraft[slotId]; if (!providerId) return;
     const kinds = [];
     for (const [kind] of gp[1]) { const task = taskOf(s, kind), draft = s.drafts.get(kind); if (!task || coreReply(task) || !draft || draft.pending || draft.stale) continue;
-      if (!task.capabilities.every(cap => s.status.providers.find(p => p.id === providerId)?.capabilities.includes(cap))) continue;
+      if (!providerSupportsTask(task, s.status.providers.find(p => p.id === providerId))) continue;
       draft.inherited.provider = false; draft.values.provider = providerId; draft.touched = true; fitLimit(s, task, draft); kinds.push(kind); }
     if (!kinds.length) { s.bad = true; s.notice = "这些任务没有可改动的草稿或能力不符。"; render(); return; }
     s.notice = `正在把「${slotId}」组中 ${kinds.length} 项任务指派给 ${providerId}…`; render();
@@ -2454,12 +2676,12 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       <div class="model-policy-editor">${task ? panel : '<div class="model-empty">当前没有可用的模型任务。</div>'}</div>
     </div>`; }
   function cfgPane(s) { const tasks = snapshot(s);
-    const own = tasks.filter(t => taskFields(t).some(nm => t.fields[nm]?.explicit)).length;
+    const own = tasks.filter(t => taskFields(t).some(nm => ownsField(t, nm))).length;
     const note = s.status ? `生效中 · ${own} / ${tasks.length} 项任务单独设置了模型` : "";
     const cmSeg = [["quick", "快速配置"], ["precise", "精确配置"]];
     const seg = `<div class="model-seg" role="group" aria-label="配置模式">${cmSeg.map(([id, label]) => `<button type="button" data-model-cm="${id}" aria-pressed="${s.cm === id}" class="${s.cm === id ? "on" : ""}">${label}</button>`).join("")}</div>`;
     const body2 = s.cm === "quick" ? quickConfig(s) : `${toolbar(s)}<div class="model-queue-slot">${queue(s)}</div>${body(s)}`;
-    return `<div class="model-subpane"><div class="model-note cfg">${seg}</div>${bulkBar(s)}${notice(s)}${s.cm === "quick" ? "" : overview(s)}${body2}</div>`; }
+    return `<div class="model-subpane"><div class="model-note cfg">${seg}</div>${notice(s)}${s.cm === "quick" ? "" : overview(s)}${body2}</div>`; }
   /* ---------- replacement policy: mutations ---------- */
   const ruleTarget = ref => { const [kind, index] = String(ref || "").split(":"); return { kind, index: Number(index) }; };
   /* Every rule edit funnels through here so the JSON the gateway reads stays canonical. */
@@ -2571,7 +2793,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     ruleInput(s, event); }
   function fnPane(s) { const sub = s.sub === "map" ? situationMap(s) : s.sub === "pol" ? replacementPolicy(s) : cfgPane(s);
     return `${topbar(s)}${subtabBar(s)}${sub}`; }
-  function pane(s) { if (s.tab !== "fn" && !path) return `<p class="model-empty">当前角色只有群聊模型入口，此处的模型连接服务暂不可用。功能模型仍可设置角色默认与本群覆盖。</p>`; if (s.tab === "voice") return voicePane(s); if (s.tab === "image") return imagePane(s); if (s.tab === "search") return searchPane(s); if (s.tab === "laya") return layaPane(s); return fnPane(s); }
+  function pane(s) { if (s.tab !== "fn" && !path) return `<p class="model-empty">当前角色只有群聊模型入口，此处的模型连接服务暂不可用。功能模型仍可设置角色默认与本群覆盖。</p>`; if (s.tab === "voice") return voicePane(s); if (s.tab === "image") return imagePane(s); if (s.tab === "search") return searchPane(s); if (s.tab === "laya") return layaPane(s); if (s.tab === "pricing") return pricingWorkbench()?.renderPane?.(pricingCtx(s)) || '<p class="model-empty">计价模块未加载。</p>'; return fnPane(s); }
   function drawer(s) { const id = s.drawer; if (!id) return "";
     const provider = s.status?.providers.find(p => p.id === id); if (!provider) return "";
     const tasks = snapshot(s), asMain = tasks.filter(t => providerFor(t, s.drafts.get(t.kind)) === id);
@@ -2592,17 +2814,19 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     if (s.tab === "image") { imageInput(s, event); return; }
     if (s.tab === "search") { searchInput(s, event); return; }
     if (s.tab === "laya") { layaInput(s, event); return; }
+    if (s.tab === "pricing") { pricingWorkbench()?.handleInput?.(pricingCtx(s), event); return; }
     fnInput(event); }
   function click(event) { if (window.CompanionWorkbench.scopeHintClick(event)) return; const s = state; if (!s || !root?.isConnected) return;
     const tab = event.target.closest("[data-model-tab]");
     if (tab) { const id = tab.dataset.modelTab; if (s.tab !== id) { s.tab = id;
         if (id !== "fn" && !path) { render(); return; }
-        if (id === "voice" && !state.voice.loaded) voiceRefresh(s); else if (id === "image" && !state.image.loaded) imageRefresh(s); else if (id === "search" && !state.search.loaded) searchRefresh(s); else if (id === "laya" && !state.laya.loaded) layaRefresh(s);
+        if (id === "voice" && !state.voice.loaded) voiceRefresh(s); else if (id === "image" && !state.image.loaded) imageRefresh(s); else if (id === "search" && !state.search.loaded) searchRefresh(s); else if (id === "laya" && !state.laya.loaded) layaRefresh(s); else if (id === "pricing" && !state.pricing?.loaded) pricingWorkbench()?.refresh?.(pricingCtx(s));
         render(); } return; }
     if (s.tab === "voice") { voiceClick(s, event); return; }
     if (s.tab === "image") { imageClick(s, event); return; }
     if (s.tab === "search") { searchClick(s, event); return; }
     if (s.tab === "laya") { layaClick(s, event); return; }
+    if (s.tab === "pricing") { pricingWorkbench()?.handleClick?.(pricingCtx(s), event); return; }
     fnClick(event); }
   function providerHover(event) {
     window.CompanionWorkbench.scopeHintReset(event);
@@ -2654,17 +2878,19 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
         view: "generate", config: null, configBase: null, configDraft: null, configText: null, configTextBase: null,
         configLoading: false, configSaving: false, configBad: false, configNotice: "",
       },
-      laya: { data: null, draft: null, logs: [], loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" },
+      laya: { data: null, draft: null, logs: [], logsScope: "all", logsScopeKind: "", logsLoading: false, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" },
       search: { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" },
+      pricing: pricingWorkbench()?.createState?.() || { loaded: false, loading: false, busy: false, data: null, draft: null },
       loading: false, busy: false, bad: false, denied: false, notice: "" };
     state.layer ||= "role"; if(!windowAvailable)state.layer="role"; state.providerTests ||= {}; state.testing ||= new Set();
     /* 展开状态按对象保存：刷新、切任务、切页回来都保持上次展开的分组，
        不再每次回到“全收起”或“全展开”。 */
-    state.expOpen = { ...restoreExpanded(key), ...(state.expOpen || {}) }; state.voice.lastTest ||= null; state.voice.editorValues ||= {}; state.voice.ttsTestResults ||= {}; state.voice.ttsTesting ||= false; state.voice.createDraft ||= { type: "", id: "" }; state.image.endpointTests ||= {}; state.image.endpointTestKeys ||= {}; state.image.endpointTesting ||= null; state.configDraft ||= null; state.peak ||= { on: true, provider: "", start: "09:00", end: "12:00" }; state.testing ||= new Set(); state.peak.windows ||= "09:00-12:00\n14:00-18:00"; state.laya ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" }; state.search ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" }; state.hoverProvider = "";
+    state.expOpen = { ...restoreExpanded(key), ...(state.expOpen || {}) }; state.voice.lastTest ||= null; state.voice.editorValues ||= {}; state.voice.ttsTestResults ||= {}; state.voice.ttsTesting ||= false; state.voice.createDraft ||= { type: "", id: "" }; state.image.endpointTests ||= {}; state.image.endpointTestKeys ||= {}; state.image.endpointTesting ||= null; state.configDraft ||= null; state.peak ||= { on: true, provider: "", start: "09:00", end: "12:00" }; state.testing ||= new Set(); state.peak.windows ||= "09:00-12:00\n14:00-18:00"; state.laya ||= { data: null, draft: null, logs: [], logsScope: "all", logsScopeKind: "", logsLoading: false, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "", test: null, preview: null, previewText: "" }; state.laya.logsScope ||= "all"; state.laya.logsScopeKind ||= ""; state.search ||= { data: null, draft: null, loaded: false, loading: false, busy: false, stale: false, bad: false, notice: "" }; state.pricing ||= pricingWorkbench()?.createState?.() || { loaded: false, loading: false, busy: false, data: null, draft: null }; state.hoverProvider = "";
+    if (pricingWorkbench()?.consumePendingTab?.()) state.tab = "pricing";
     states.set(key, state);
     state.sub = ["map", "cfg", "pol"].includes(options.sub) ? options.sub : "map";
     root.addEventListener("input", input); root.addEventListener("change", input); root.addEventListener("click", click); root.addEventListener("pointerover", providerHover); root.addEventListener("pointerout", providerHover); root.addEventListener("keydown", window.CompanionWorkbench.scopeHintKeydown); root.addEventListener("focusin", window.CompanionWorkbench.scopeHintReset); root.addEventListener("focusout", window.CompanionWorkbench.scopeHintReset); render();
-    if (state.tab && state.tab !== "fn") { if (!path) { render(); return; } if (state.tab === "voice" && !state.voice.loaded) voiceRefresh(state); else if (state.tab === "image" && !state.image.loaded) imageRefresh(state); else if (state.tab === "search" && !state.search.loaded) searchRefresh(state); else if (state.tab === "laya" && !state.laya.loaded) layaRefresh(state); }
+    if (state.tab && state.tab !== "fn") { if (!path) { render(); return; } if (state.tab === "voice" && !state.voice.loaded) voiceRefresh(state); else if (state.tab === "image" && !state.image.loaded) imageRefresh(state); else if (state.tab === "search" && !state.search.loaded) searchRefresh(state); else if (state.tab === "laya" && !state.laya.loaded) layaRefresh(state); else if (state.tab === "pricing" && !state.pricing?.loaded) pricingWorkbench()?.refresh?.(pricingCtx(state)); }
     else { refresh().catch(() => {}); } }
   /* Only the mounted scope can block navigation. Retained drafts belonging to
      another role or a closed page must not trigger a warning on every route. */
@@ -2739,6 +2965,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       }
     }
     if (s.search && searchDirty(s.search)) changed.push('联网搜索凭据来源');
+    if (s.pricing && pricingWorkbench()?.changedFields) changed.push(...pricingWorkbench().changedFields(s.pricing));
     return changed;
   }
   function isDirty() {
@@ -2747,7 +2974,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
   async function saveBeforeLeave() {
     const s = state;
     if (!s || !root) return true;
-    if (s.busy || s.loading || s.voice?.busy || s.image?.busy || s.image?.configSaving || s.laya?.busy || s.search?.busy)
+    if (s.busy || s.loading || s.voice?.busy || s.image?.busy || s.image?.configSaving || s.laya?.busy || s.search?.busy || pricingWorkbench()?.isBusy?.(s.pricing))
       return {error:'模型配置正在处理，请稍后保存。'};
     if ([...s.drafts.values()].some(draft => draft.pending) || s.voice?.pending)
       return {error:'上次保存结果待核对，请回到模型配置中核对原请求。'};
@@ -2762,6 +2989,7 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
       [s.image && imageConfigDirty(s.image), imageConfigSave, () => imageConfigDirty(s.image), () => s.image.configNotice],
       [s.laya && layaDirty(s.laya), layaSave, () => layaDirty(s.laya), () => s.laya.notice],
       [s.search && searchDirty(s.search), searchSave, () => searchDirty(s.search), () => s.search.notice],
+      [s.pricing && pricingWorkbench()?.isDirty?.(s.pricing), () => pricingWorkbench().save(pricingCtx(s)), () => pricingWorkbench().isDirty(s.pricing), () => s.pricing.notice],
     ]) {
       if (!needed) continue;
       await action(s);
@@ -2771,13 +2999,13 @@ ${mode === "remote" && (l.draft.request_format || l.data.request_format) === "cl
     return !isDirty() ? true : {error:'还有配置未保存，改动仍保留。'};
   }
   function discardChanges() {
-    if (state?.busy || state?.voice?.busy || state?.image?.busy || state?.image?.configSaving || state?.laya?.busy || state?.search?.busy)
+    if (state?.busy || state?.voice?.busy || state?.image?.busy || state?.image?.configSaving || state?.laya?.busy || state?.search?.busy || pricingWorkbench()?.isBusy?.(state?.pricing))
       return {error:'正在保存，请等待结果后再切换。'};
     if (key) states.delete(key);
     unmount();
     return true;
   }
   const isBusy = () => Boolean(state && (state.busy || state.voice?.busy || state.voice?.ttsBusy
-    || state.voice?.ttsTesting || state.image?.busy || state.image?.configSaving || state.laya?.busy || state.search?.busy));
+    || state.voice?.ttsTesting || state.image?.busy || state.image?.configSaving || state.laya?.busy || state.search?.busy || pricingWorkbench()?.isBusy?.(state.pricing)));
   return { mount, unmount, isDirty, isBusy, changedFields, saveBeforeLeave, discardChanges };
 })();

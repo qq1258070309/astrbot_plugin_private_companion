@@ -125,6 +125,48 @@ window.CompanionHomeSidebar = (() => {
   }
   const activities = life => Array.isArray(life?.activities) ? life.activities : [];
   const sleepOf = ({state, life}) => state?.body_sleep || life?.body_sleep || state?.state?.sleep_execution;
+  const CLAUSE_SPLIT = /[，。；,;!！?？\n]+|(?=(?:但是|但|不过|可是|只是|就是|却|然而|反而|倒是))/;
+  const NEGATOR = "(?:完全没有|一点也没|一点都没|丝毫没有|半点没有|没有出现|没有觉得|没有感到|并没有|并未曾|未曾|完全不|一点也不|一点都不|丝毫不|半点不|谈不上|挑不出|找不到|觉察不到|感受不到|感觉不到|不至于|算不上|没觉得|没感到|没有|暂无|并无|未见|尚未|不再|并不|并未|不算|没到|没啥|无|没|(?<!不得|不能)不)";
+  const NEG_BRIDGE = "(?:觉得|感到|觉察到|感觉到|察觉到|出现|产生|带有|带着|存在|什么|啥|任何|其他|其它|别的|明显|特别|格外|半点|丝毫|一丝|半分|一点|有多|多少|多么|多|真|真的|怎么|太|很|有点|有些|过于|过分|正在|正|在|有|哪里|哪儿|哪处|身上|身体|胸口|肠胃|胃里|头部|肩背|腰背|四肢|扰人的|多余的|酸沉|酸软|酸胀|酸痛|闷胀|沉闷|乏力|紧绷|僵硬|发沉|或者|以及|或|和|与|及|、|的|之类|方面)";
+  const NEG_JOIN = "(?:或者|以及|或|和|与|及|、|也(?:没有|并无|暂无|未见|没|无|不))";
+  const STATUS_PATTERNS = {
+    healthRecovering: "恢复中|康复中|正在恢复|逐渐恢复|正在好转|有所好转",
+    healthStrained: "不太舒服|不舒服|不适|生病|发烧|发热|疼痛|头痛|头疼|感冒|虚弱|不稳定|欠佳",
+    healthWell: "稳定|正常|健康|良好",
+    hungerFull: "吃撑|太饱|过饱|饱胀|有点撑",
+    hungerPos: "没有吃饱|没吃饱|未吃饱|有点饿|有些饿|很饿|好饿|挺饿|太饿|发饿|肚子饿|饿得|饿了|饥饿感|饥饿|饥肠辘辘|^饿$",
+    hungerNeg: "没有吃饱|没吃饱|未吃饱|饥饿感|饥饿|饿意|饿得|饿了|饿",
+    hungerSated: "已吃饱|吃饱了|饱腹|饱足|已饱",
+    sleepRestless: "难以入睡|无法入睡|失眠|睡不着|辗转|睡眠不足|没有睡好|没睡好|睡不好",
+    sleepyPos: "困倦感|困倦|困意|犯困|想睡|好困|有些困|有点困|很困|太困|挺困|疲惫|^困$",
+    sleepyNeg: "困倦感|困倦|困意|犯困|想睡|困乏|疲惫|困(?![难惑扰境局顿])",
+    sleepRest: "休息|入睡|睡着|睡眠中",
+    sleepAwake: "清醒|精神饱满|已醒|醒着",
+    busyPos: "忙碌|忙着|忙于|在忙|正忙|很忙|有点忙|有些忙|挺忙|太忙|忙不过来|忙得|^忙$",
+    busyNeg: "忙碌|忙着|忙于|在忙|正忙|忙不过来|忙得|忙",
+  };
+  function analyzeNegation(raw, posSource, negSource = posSource) {
+    const value = text(raw);
+    if (!value) return {hasPositive:false, hasNegated:false};
+    const negPattern = new RegExp(
+      `${NEGATOR}${NEG_BRIDGE}{0,8}(?:${negSource})(?:感|意|症状|之感)?(?:${NEG_JOIN}${NEG_BRIDGE}{0,4}(?:${negSource})(?:感|意|症状|之感)?)*`,
+      "g"
+    );
+    const postNegPattern = new RegExp(
+      `(?:一点|半点|丝毫|一丝|半分|完全|根本|几乎)?${NEG_BRIDGE}{0,3}(?:${negSource})(?:感|意|症状|之感)?(?:也|都)?(?:没有|并无|全无|皆无|无)(?=$|[了啦呢嘛啊呀的])`,
+      "g"
+    );
+    const posPattern = new RegExp(posSource);
+    let hasPositive = false, hasNegated = false;
+    for (const part of value.split(CLAUSE_SPLIT)) {
+      const clause = part.trim();
+      if (!clause) continue;
+      let cleaned = clause.replace(negPattern, () => { hasNegated = true; return ""; });
+      cleaned = cleaned.replace(postNegPattern, () => { hasNegated = true; return ""; });
+      if (posPattern.test(cleaned)) hasPositive = true;
+    }
+    return {hasPositive, hasNegated};
+  }
   function vital(kind, raw, {sleeping=false, disabled=false, loading=false, unreadable=false}={}) {
     const icons = {energy:"battery",health:"heart-pulse",hunger:"utensils",sleep:"moon",mood:"heart",
       cycle:"calendar-heart",busy:"briefcase-business",location:"map-pin"};
@@ -140,36 +182,35 @@ window.CompanionHomeSidebar = (() => {
     if (!raw) return item("unknown",icons[kind],loading ? "读取中" : unreadable ? "待读取" : "未记录");
     if (/^(未知|不清楚|未记录|暂无|尚未记录|未设置|待确认)$/.test(raw)) return item("unknown",icons[kind],"未知");
     if (kind === "health") {
-      if (/^(稳定|正常|健康|良好|状态良好|无不适|没有不适|身体无不适|身体还好|还好|没什么不舒服|没有不舒服)$/.test(raw)) return item("well","heart-pulse","良好","ok");
-      if (/恢复中|康复中|正在恢复|逐渐恢复|正在好转|有所好转/.test(raw)) return item("recovering","heart-handshake","恢复中","ok");
-      // 「没有不舒服」「没什么不适」是否定句：先剔除被否定的症状，避免只看关键词就把常态判成不适。
-      const signs = /不太舒服|不大舒服|不舒服|不适|疼痛|头痛|头疼|发烧|发热|感冒|虚弱|生病|恶心|呕吐|腹泻|异常|头(?:有点|有些|很|特别)?(?:疼|痛|晕)/;
-      const denied = raw.replace(/(?:没有|没什么|暂无|并无|未见|没有出现|未出现|不再|并不|并未|无|没|不)(?:(?:觉得|感到|出现|明显|任何|什么|的)\s*)*(?:不太舒服|不大舒服|不舒服|不适|疼痛|头痛|头疼|发烧|发热|感冒|虚弱|生病|恶心|呕吐|腹泻|异常|头(?:有点|有些|很|特别)?(?:疼|痛|晕))/g, "");
-      if (signs.test(denied)) return item("strained","heart-crack","不适","warn");
-      if (/稳定|正常|健康|良好|还好|(?:没有|暂无|无|没什么)(?:明显|任何)?(?:不适|不舒服)/.test(raw)) return item("well","heart-pulse","良好","ok");
-      if (denied !== raw) return item("well","heart-pulse","良好","ok");
+      if (/^(稳定|正常|健康|良好|状态良好|无不适|没有不适|身体无不适)$/.test(raw)) return item("well","heart-pulse","良好","ok");
+      if (analyzeNegation(raw, STATUS_PATTERNS.healthRecovering).hasPositive) return item("recovering","heart-handshake","恢复中","ok");
+      const strained = analyzeNegation(raw, STATUS_PATTERNS.healthStrained);
+      if (strained.hasPositive) return item("strained","heart-crack","不适","warn");
+      if (strained.hasNegated || analyzeNegation(raw, STATUS_PATTERNS.healthWell).hasPositive) return item("well","heart-pulse","良好","ok");
     } else if (kind === "hunger") {
-      if (/吃撑|太饱|过饱|饱胀|有点撑/.test(raw)) return item("full","utensils-crossed","偏饱","warn");
+      if (analyzeNegation(raw, STATUS_PATTERNS.hungerFull).hasPositive) return item("full","utensils-crossed","偏饱","warn");
       if (/^(不饿|没有饥饿感|已吃饱|吃饱了|饱腹|饱足|已饱|适中)$/.test(raw)) return item("sated","utensils","不饿","ok");
-      if (/没吃饱|未吃饱|有点饿|饥饿|很饿|饿了|^饿$|饥肠辘辘/.test(raw)) return item("hungry","soup","饿了","warn");
+      const hungry = analyzeNegation(raw, STATUS_PATTERNS.hungerPos, STATUS_PATTERNS.hungerNeg);
+      if (hungry.hasPositive) return item("hungry","soup","饿了","warn");
+      if (hungry.hasNegated || analyzeNegation(raw, STATUS_PATTERNS.hungerSated).hasPositive) return item("sated","utensils","不饿","ok");
     } else if (kind === "sleep") {
       if (/^(清醒|精神|精神饱满|不困|没有困意|已醒|醒着)$/.test(raw)) return item("awake","sun","清醒","ok");
-      if (/难以入睡|无法入睡|失眠|睡不着|辗转|睡眠不足/.test(raw)) return item("restless","cloud-moon","睡不好","warn");
-      if (/困倦|犯困|想睡|有些困|很困|疲惫|^困$/.test(raw)) return item("sleepy","moon","困倦","warn");
-      if (/休息|入睡|睡着|睡眠中/.test(raw)) return item("rest","moon","休息感受","rest");
+      if (analyzeNegation(raw, STATUS_PATTERNS.sleepRestless).hasPositive) return item("restless","cloud-moon","睡不好","warn");
+      const sleepy = analyzeNegation(raw, STATUS_PATTERNS.sleepyPos, STATUS_PATTERNS.sleepyNeg);
+      if (sleepy.hasPositive) return item("sleepy","moon","困倦","warn");
+      if (analyzeNegation(raw, STATUS_PATTERNS.sleepRest).hasPositive) return item("rest","moon","休息感受","rest");
+      if (sleepy.hasNegated || analyzeNegation(raw, STATUS_PATTERNS.sleepAwake).hasPositive) return item("awake","sun","清醒","ok");
     }
     // 自由文字不能可靠归类时保留原文，不推断成正常或异常。
     return item("recorded",icons[kind],raw);
   }
   function specialState(kind, raw, {timeline, sleeping=false}={}) {
-    if(kind==="cycle")return timeline?.applicability==="applicable"&&timeline.phase==="menstrual";
-    if(kind==="sleep"&&sleeping)return false;
-    if(!raw||/(?:可能|或许|也许|不确定|担心|会不会)/.test(raw))return false;
-    const negative={health:"不适|疼痛|头痛|发热|发烧|感冒|虚弱|生病",hunger:"饥饿感|饥饿|饿",sleep:"失眠|睡不着|睡眠不足|难以入睡",busy:"忙碌|忙"}[kind];
-    const affirmative=negative?raw.replace(new RegExp(`(?:没有|暂无|并无|未见|不再|并不|并未|未|无|没|不)(?:觉得|感到|明显|任何|出现|什么)?(?:${negative})`,"g"),""):raw;
-    if(kind==="busy")return /忙碌|忙着|忙于|在忙|正忙|很忙|有点忙|忙不过来|^忙$/.test(affirmative);
-    const visual=vital(kind,affirmative).visual;
-    return kind==="health"?visual==="strained":kind==="hunger"?visual==="hungry":kind==="sleep"?visual==="restless":false;
+    if (kind === "cycle") return timeline?.applicability === "applicable" && timeline.phase === "menstrual";
+    if (kind === "sleep" && sleeping) return false;
+    if (!raw || /(?:可能|或许|也许|不确定|担心|会不会)/.test(raw)) return false;
+    if (kind === "busy") return analyzeNegation(raw, STATUS_PATTERNS.busyPos, STATUS_PATTERNS.busyNeg).hasPositive;
+    const visual = vital(kind, raw).visual;
+    return kind === "health" ? visual === "strained" : kind === "hunger" ? visual === "hungry" : kind === "sleep" ? visual === "restless" : false;
   }
   function renderVital(kind, label, raw, options) {
     const item = vital(kind, raw, options), detail = item.visual === "disabled" ? "该项维护未启用"
@@ -188,6 +229,19 @@ window.CompanionHomeSidebar = (() => {
       <span class="home-state-row-icon" aria-hidden="true"><i data-lucide="${item.icon}"></i></span>
       <span class="home-state-row-copy"><span class="home-state-row-label">${label}</span><strong>${e(item.label)}</strong></span>
     </span>`;
+  }
+  /* 状态时间移到标题旁后，用相对时间读起来比“18:42”更直接；
+     15 秒一次的首页时钟会顺手刷新它，不必整块重绘。 */
+  function stateAge(input) {
+    const updated = stamp(input?.state?.state?.updated_at);
+    if (updated == null) return "";
+    const now = input.now ?? Date.now();
+    const minutes = Math.max(0, Math.floor((now - updated) / 60000));
+    if (minutes < 1) return "刚刚";
+    if (minutes < 60) return `${minutes} 分钟前`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    return `${Math.floor(hours / 24)} 天前`;
   }
   function renderState(input) {
     const {state, life, loading=false, unavailable=()=>"尚未读取"} = input;
@@ -213,18 +267,16 @@ window.CompanionHomeSidebar = (() => {
       ["location","位置",text(values.location),settings.location_enabled===false]];
     const visible = candidates.filter(([kind,,raw,disabled]) => settings["home_show_"+kind] !== false && settings.enabled !== false && !disabled
       && (!settings["home_only_special_"+kind] || !unreadable && specialState(kind,raw,{timeline,sleeping})));
-    const updated = stamp(state?.state?.updated_at);
-    const caption = [settings.enabled === false || state?.state?.state === "disabled" ? "自动维护未启用" : "",
-      updated != null ? `更新于 ${moment(updated, now, zone)}` : ""].filter(Boolean).join(" · ");
     const sleepEntry = visible.find(([kind]) => kind === "sleep");
     const rows = visible.filter(([kind]) => kind !== "sleep").map(row => {
-      const value = typeof row[2] === "string" ? row[2] : "";
-      return {row, wide: ["mood","busy","location"].includes(row[0]) || value.length > 5};
+      const options = {sleeping, disabled:row[3], loading, unreadable};
+      const item = vital(row[0], row[2], options);
+      return {row, options, wide: ["mood","busy","location"].includes(row[0]) || item.label.length > 5};
     });
     const shortRows = rows.filter(item => !item.wide);
     if (shortRows.length % 2) shortRows[shortRows.length - 1].wide = true;
     const laidOut = [...rows.filter(item => !item.wide), ...rows.filter(item => item.wide)];
-    const states = laidOut.map(({row,wide}) => renderStateRow(row[0],row[1],row[2],{sleeping,disabled:row[3],loading,unreadable},wide)).join("");
+    const states = laidOut.map(({row, options, wide}) => renderStateRow(row[0],row[1],row[2],options,wide)).join("");
     const sleepRaw = sleepEntry?.[2] || "";
     const sleepStart = stamp(sleepOf(input)?.started_at);
     const sleepMinutes = sleeping && sleepStart != null ? Math.max(0, (now - sleepStart) / 60000) : null;
@@ -237,8 +289,7 @@ window.CompanionHomeSidebar = (() => {
       <span class="home-state-hero-copy"><small>当前</small><strong>${e(heroTitle)}</strong></span></span>` : "";
     return `<button type="button" class="home-state-board is-b2" data-go="life" data-life-target="state" aria-label="查看并更新角色状态。${e(accessible || fallback)}" title="查看并更新角色状态">
       ${hero}<span class="home-state-grid">${states}</span>${!hero && !states ? `<span class="home-state-empty">${e(fallback)}</span>` : ""}<span class="home-state-open" aria-hidden="true"><i data-lucide="arrow-up-right"></i></span></button>
-      ${unreadable && !loading ? `<p class="home-side-warning" role="status">${e(runtimeMissing ? "角色数据尚未就绪，请核对账号与人格的角色映射；首次设置记录仍会保留。" : state ? "暂时无法读取角色状态，请在详情中核对。" : unavailable("state"))}</p>${runtimeMissing ? `<button class="text-button home-side-action" data-go="manage" data-manage="host">前往账号与会话</button>` : ""}` : ""}
-      ${caption ? `<p class="home-side-caption">${e(caption)}</p>` : ""}`;
+      ${unreadable && !loading ? `<p class="home-side-warning" role="status">${e(runtimeMissing ? "角色数据尚未就绪，请核对账号与人格的角色映射；首次设置记录仍会保留。" : state ? "暂时无法读取角色状态，请在详情中核对。" : unavailable("state"))}</p>${runtimeMissing ? `<button class="text-button home-side-action" data-go="manage" data-manage="host">前往账号与会话</button>` : ""}` : ""}`;
   }
   function agenda(input) {
     const {state, life} = input, now = input.now ?? Date.now(), zone = zoneOf(input), items = [], seen = new Set();
@@ -301,28 +352,15 @@ window.CompanionHomeSidebar = (() => {
     const planningIncomplete = planning?.enabled && planning.calendar_enabled
       && (planning.running || ["failed","expired","dead_letter","cancelled","uncertain","blocked","deferred"].includes(dailyResult?.state));
     const planningFailure = planningIncomplete && !planning.running;
-    // daily_result 只记录那次任务本身的结果。任务之后的自动重试如果停在准备阶段
-    // （宿主账号断连、平台未加载、预算延期）根本不会产生新任务，页面就会一直复述
-    // 几小时前的旧失败。这里用更新的 blocked 结果替换展示原因，状态仍是「今天没规划完」。
-    const latestResult = planning?.last_result;
-    const blocker = planningFailure && latestResult?.state === "blocked"
-      && stamp(latestResult.observed_at) > (stamp(dailyResult?.observed_at) ?? -Infinity) ? latestResult : null;
-    const failureCode = blocker?.code || dailyResult?.code;
-    const planningFailureLabel = ({provider_wait_timed_out:"模型等待超时",model_timeout:"模型请求超时（结果未知）",
-      provider_wait_interrupted:"模型请求被中断",timeout:"执行超时",
+    const planningFailureLabel = ({provider_wait_timed_out:"模型等待超时",timeout:"执行超时",
       model_usage_unknown:"模型输出不完整（可能达到长度上限）",response_contract_rejected:"模型返回格式不符合日程要求",
-      native_response_parse_failed:"模型返回无法解析",planning_output_invalid:"模型返回的日程无效",worker_error:"生成失败",
-      host_account_changed:"宿主账号未连接（QQ 端已断开）",host_platform_unavailable:"宿主平台尚未加载",
-      host_platform_changed:"宿主平台已变化",host_not_running:"角色尚未运行",
-      authorization_denied:"当前身份未通过会话授权",calendar_disabled:"角色日程总开关已关闭",
-      model_task_unregistered:"规划模型尚未配置",planning_role_changed:"角色绑定已变化",
-      planning_closed:"规划任务已停止",planning_job_unavailable:"规划输入已失效"})[failureCode]
-      || (failureCode ? `生成未完成（${failureCode}）` : "生成未完成");
+      native_response_parse_failed:"模型返回无法解析",planning_output_invalid:"模型返回的日程无效",worker_error:"生成失败"})[dailyResult?.code]
+      || (dailyResult?.code ? `生成未完成（${dailyResult.code}）` : "生成未完成");
     const nextReview = stamp(planning?.next_review_at);
     const planningNote = planning?.enabled
       ? !planning.calendar_enabled ? "日历写入尚未开启，自动规划暂停"
         : planning.running ? "自动规划正在检查日程"
-          : planningFailure ? `当日规划未完成：${planningFailureLabel} · 发送「重新生成日程」可立即重试${nextReview != null ? (nextReview > now ? ` · ${moment(nextReview, now, zone)} 重新评估剩余时段` : " · 下次巡检时重新评估剩余时段") : ""}`
+          : planningFailure ? `当日规划未完成：${planningFailureLabel} · 发送「重新生成日程」可立即重试${nextReview != null ? ` · ${moment(nextReview, now, zone)} 重新评估剩余时段` : ""}`
           : nextCheck != null ? `自动规划已开启 · 调度巡检 ${moment(nextCheck, now, zone)}`
             : "自动规划已开启 · 暂无近期计划"
       : "";
@@ -416,5 +454,5 @@ window.CompanionHomeSidebar = (() => {
       ${runtimeMissing ? `<button class="text-button home-side-action" data-go="manage" data-manage="host">前往账号与会话</button>` : ""}
       <p class="home-side-caption">${planningNote ? `${e(planningNote)} · ` : ""}时间按 ${e(zone)} 显示</p>`;
   }
-  return {renderState, renderSchedule};
+  return {renderState, renderSchedule, stateAge, vital, specialState};
 })();

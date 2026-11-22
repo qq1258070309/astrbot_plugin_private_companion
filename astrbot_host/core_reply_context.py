@@ -26,8 +26,9 @@ from companion_v2.delivery.history import CONTEXT_INSTRUCTION as SENT_MESSAGE_IN
 from companion_v2.foundation.refs import ScopeKind
 from companion_v2.knowledge.members import MEMBER_CLUE_INSTRUCTION
 from companion_v2.role_work.state.service import INSTRUCTION as STATE_INSTRUCTION
+from companion_v2.sources.dependencies import validation_batch
 from companion_v2.system_prompts.catalog import (
-    BACKGROUND_INSTRUCTION, KNOWLEDGE_INSTRUCTION, MEMORY_INSTRUCTION,
+    BACKGROUND_INSTRUCTION, CORE_REPLY_TIME_STYLE, KNOWLEDGE_INSTRUCTION, MEMORY_INSTRUCTION,
 )
 from companion_v2.system_prompts.context import SystemPromptContext
 from .core_reply_health import health_perception_snapshot
@@ -51,10 +52,10 @@ GROUP_INSTRUCTION = (
     "known_names 和旧记忆里的昵称都不是“在叫我”的证据：即使与别人提到或 @ 的名字相同，也不要接成"
     "“在叫我/你刚才叫我/是在叫我吗”；第三人称谈论同名角色不等于直接呼唤。"
 )
-CURRENT_TIME_INSTRUCTION = """current_local_time 是系统时钟按当前窗口配置时区投影出的本轮时间，用于理解现在、今天和问候时段。历史消息与摘要保留各自日期，不能充当当前时间。
-感知本轮 current_local_time 与最近历史消息时间戳的跨度：同一对话流内直接自然接话；隔了半天、隔夜或隔了几天再聊时，自然体现重逢或时隔感，不把几天前的话头当成上一秒刚说完直接硬接。
-时间只在相关时使用，不主动报时。用户说“还早”等话时结合玩笑、夸张或时区差异理解；只有对方问几点，或会影响实际安排时，才简短说明或确认，不据此推断对方已经睡着、刚起床或正在等待。
-用户问日期、星期、几点或“今天是什么日子”这类直接问题时，给出答案就够：不为了接话把别的话题、旧话头或对方没说过的半句话缀在后面。"""
+CURRENT_TIME_MEANING = (
+    "current_local_time 是系统时钟按当前窗口配置时区投影出的本轮时间，用于理解现在、今天和问候时段。"
+    "历史消息与摘要保留各自日期，不能充当当前时间。"
+)
 SENT_CONTINUATION_INSTRUCTION = (
     SENT_MESSAGE_INSTRUCTION +
     "这些是你自己在当前窗口已经发出的消息，可能尚未出现在 AstrBot 的普通会话历史中。"
@@ -85,6 +86,7 @@ class CoreReplyPrompt:
     stable_instruction: str = ""
     context_instruction: str = ""
     context_blocks: tuple[dict, ...] = ()
+    perception_style: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,11 +98,15 @@ class _MaterialSection:
     def render(self):
         payload = json.dumps(self.materials, ensure_ascii=False, sort_keys=True,
                              separators=(",", ":"), allow_nan=False)
-        return "\n\n【" + self.title + "】\n" + self.instruction + "\n" + payload
+        if self.instruction:
+            return "\n\n【" + self.title + "】\n" + self.instruction + "\n" + payload
+        return "\n\n【" + self.title + "】\n" + payload
 
     def structured(self):
-        return {"title": self.title, "instruction": self.instruction,
-                "materials": self.materials}
+        if self.instruction:
+            return {"title": self.title, "instruction": self.instruction,
+                    "materials": self.materials}
+        return {"title": self.title, "materials": self.materials}
 
 
 def _ready(materials):
@@ -150,14 +156,15 @@ def _linked_inspiration_material(material, sent_rounds):
     return replace(material, payload=encode({**payload, "items": visible}))
 
 
-def _capture_materials(owner, context, at):
+def _capture_materials(owner, context, at, *, runtime=None):
     if owner is None:
         return ()
     snapshot = owner.capture(context, at)
     if isinstance(snapshot, dict) and snapshot.get("state") == "unavailable":
         raise TaskError(snapshot.get("reason") or "core_reply_context_unavailable",
                         "optional background is unavailable")
-    return owner.contributions(snapshot, context, at)
+    with validation_batch(runtime, at):
+        return owner.contributions(snapshot, context, at)
 
 
 def _knowledge_materials(messages, context, native_input, at, *, members=False):
@@ -173,7 +180,7 @@ def _knowledge_materials(messages, context, native_input, at, *, members=False):
     if members:
         clue = owner.member_contribution(context, **arguments)
         return (clue,) if clue is not None else ()
-    return owner.background_contributions(context, include_official=False, **arguments)
+    return owner.core_background_contributions(context, **arguments)
 
 
 def _memory_materials(owner, context, native_input, at, timezone_name):
@@ -286,6 +293,7 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
     sent_rounds, sent_round_refs = {}, {}
     measured, started = [], time.monotonic()
     messages = application.messages
+    runtime = getattr(application, "runtime", None)
     perception_snapshot = {}
     try:
         prompt_overrides = SystemPromptContext(application.runtime).overrides(context)
@@ -334,11 +342,12 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
                  if owner is not None else "", stable=stable)
 
     def captured(name, title, instruction, owner):
-        optional(name, lambda: _material_section(title, instruction, _capture_materials(owner, context, at)))
+        optional(name, lambda: _material_section(title, instruction,
+                                                 _capture_materials(owner, context, at, runtime=runtime)))
 
     def role_state():
         owner = getattr(messages, "role_state_context", None)
-        materials = _ready(_capture_materials(owner, context, at))
+        materials = _ready(_capture_materials(owner, context, at, runtime=runtime))
         return (_material_section("角色当前状态", STATE_INSTRUCTION + owner.instruction(materials),
                                   materials) if materials else "")
 
@@ -370,10 +379,22 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
             logger.warning("[CompanionV2] 核心回复附加提示读取降级 error_type=%s", type(error).__name__)
         return "\n\n【对话附加提示】\n" + prompt.strip() if isinstance(prompt, str) and prompt.strip() else ""
 
+    group_instruction_emitted = False
+
+    def _group_material_section(title, materials):
+        nonlocal group_instruction_emitted
+        instruction = "" if group_instruction_emitted else GROUP_INSTRUCTION
+        section = _material_section(title, instruction, materials)
+        if section:
+            group_instruction_emitted = True
+        return section
+
     optional("task_prompt", task_prompt, stable=True)
-    optional("person_card", lambda: _material_section("当前相识资料", GROUP_INSTRUCTION
-        if context.scope.kind is ScopeKind.GROUP else system_text("memory", MEMORY_INSTRUCTION),
-        (messages.acquaintance.card_contribution(context, at),)))
+    optional("person_card", lambda: (
+        _group_material_section("当前相识资料", (messages.acquaintance.card_contribution(context, at),))
+        if context.scope.kind is ScopeKind.GROUP
+        else _material_section("当前相识资料", system_text("memory", MEMORY_INSTRUCTION),
+                               (messages.acquaintance.card_contribution(context, at),))))
     if context.scope.kind is ScopeKind.GROUP and isinstance(private_group_context, str) and private_group_context.strip():
         optional("private_group_context", lambda: "\n\n【当前发言者的私聊上下文摘要】\n"
                  "这段摘要只用于理解当前发言者，不要向群内其他人复述私聊原文、称呼、关系细节或时间；"
@@ -417,7 +438,8 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
                         perception_data["interaction_gap"] = gap
             except Exception:
                 pass
-        instructions = [CURRENT_TIME_INSTRUCTION]
+        time_style = prompt_overrides.get("reply_time_style", CORE_REPLY_TIME_STYLE)
+        instructions = ["\n".join(filter(None, (CURRENT_TIME_MEANING, time_style)))]
         if settings["calendar_enabled"]:
             annual_calendars = None
             owner = getattr(messages, "role_state_context", None)
@@ -485,7 +507,6 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
         personal_dates = project_personal_dates(
             at, settings["calendar_timezone"], role_birthday=role_birthday,
             user_birthday=user_birthday)
-        runtime = getattr(application, "runtime", None)
         if context.scope.kind is ScopeKind.PRIVATE and runtime is not None:
             try:
                 from companion_v2.relationships import anniversaries
@@ -513,7 +534,8 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
             received_at = _input_received_at(native_input, at)
             snapshot = owner.capture(context, min(received_at, at), action="conversation.reply",
                                      limit=8, max_chars=3200)
-            items = owner.read(snapshot, context, at, action="conversation.reply", round_metadata=True)
+            with validation_batch(runtime, at):
+                items = owner.read(snapshot, context, at, action="conversation.reply", round_metadata=True)
             materials = []
             for item in items:
                 visible = {key: value for key, value in item.items() if not key.startswith("_")}
@@ -581,22 +603,28 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
         optional("group_participation", group_participation)
 
         def group_speaker():
+            nonlocal group_instruction_emitted
             messages.group_context.authorize(context, at)
-            return "\n\n【当前群聊发言者】\n" + GROUP_INSTRUCTION + "\n" + encode({
+            header = "\n\n【当前群聊发言者】\n"
+            if not group_instruction_emitted:
+                group_instruction_emitted = True
+                header += GROUP_INSTRUCTION + "\n"
+            return header + encode({
                 "speaker_id": context.actor.principal.native_account_id,
                 "group_id": context.scope.native_scope_id,
             })
 
         optional("group_speaker", group_speaker)
-        optional("group_network", lambda: _material_section("群成员与近期互动", GROUP_INSTRUCTION,
+        optional("group_network", lambda: _group_material_section("群成员与近期互动",
             (messages.group_network.contribution(context, (native_input,), at=at),)))
 
         def group_memory():
             owner = messages.group_memory.context
             key = "core-reply-" + digest([context.key, native_input.event_id])
             snapshot = owner.capture(context, key)
-            return _material_section("群公共记忆", GROUP_INSTRUCTION,
-                                     owner.contributions(snapshot, context, key))
+            with validation_batch(runtime, key):
+                return _group_material_section("群公共记忆",
+                                               owner.contributions(snapshot, context, key))
 
         optional("group_memory", group_memory)
         optional("role_state", role_state)
@@ -613,9 +641,10 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
         # ``rules_per_turn`` rules and records exactly those identifiers as the
         # injection. Selecting a rule that sits behind unrelated ones by intent
         # belongs to the V2 reply generator, which has the decision in hand.
-        return _material_section("表达习惯参考", EXPRESSION_STYLE_INSTRUCTION,
-            owner.contributions(snapshot, context, at, policy=policy,
-                                on_injection=expression_signal_ids.extend))
+        with validation_batch(runtime, at):
+            return _material_section("表达习惯参考", EXPRESSION_STYLE_INSTRUCTION,
+                owner.contributions(snapshot, context, at, policy=policy,
+                                    on_injection=expression_signal_ids.extend))
 
     optional("expression_style", expression_style)
     # 关键词材料：用户这轮问到余额这类需要现查的信息时，由调用方在异步阶段取好再传进来。
@@ -650,4 +679,5 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
         stable_instruction=stable_instruction,
         context_instruction=context_instruction,
         context_blocks=tuple(context_blocks),
+        perception_style=prompt_overrides.get("reply_style"),
     )

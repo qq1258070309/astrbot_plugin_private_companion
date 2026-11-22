@@ -123,6 +123,12 @@ class _CeilingCut(Exception):
         self.retry = retry
 
 
+class _PhoneFormatRejected(Exception):
+    def __init__(self, provider_position: int, timeout_seconds: float):
+        self.provider_position = provider_position
+        self.timeout_seconds = timeout_seconds
+
+
 def _redact_prompt_media(value):
     if isinstance(value, list):
         return [_redact_prompt_media(item) for item in value]
@@ -317,18 +323,27 @@ class LocalModelGateway:
         structurally bounded attempt with a higher ceiling on the same provider and
         the same request. Anything else keeps today's outcome and error code.
 
-        One gateway round therefore dispatches at most three calls: the chain's
-        own call, its one contract fallback, and this one retry (two calls when no
-        contract fallback happened). The retry owns the next round number, so it
-        is never allowed to be a tool round: it either ends as a final answer or
-        as the original failure, and the session never asks for a round whose
-        number is already taken.
+        A rejected phone decision can instead retry with a format correction
+        before falling back. Neither retry can dispatch tools, and each uses
+        its own round so the original provider calls stay accounted for.
         """
         try:
             return await self._generate_chain(
                 run, plan, envelope, round_no, tuple(enumerate(plan.providers)),
                 allow_fallback=True, allow_ceiling_retry=allow_ceiling_retry,
                 on_reply_prefix=on_reply_prefix, reply_prefix_ready=reply_prefix_ready)
+        except _PhoneFormatRejected as error:
+            retry_round = round_no + 1
+            request = envelope.original
+            repair = ("上一次回复无法解析，手机尚未执行指令。依据同一画面重新给出一个完整 JSON 动作。"
+                      "只输出以花括号包住的对象，使用双引号，保留动作协议要求的字段。"
+                      '当前确实无法继续时输出 {"action":"fail","reason":"具体原因"}。')
+            retry = replace(envelope, original=replace(request, instruction=request.instruction + "\n\n" + repair))
+            logger.warning("Retrying an invalid phone decision with a format correction task=%s", run.task.task_id)
+            return await self._generate_chain(
+                run, plan, retry, retry_round, tuple(enumerate(plan.providers))[error.provider_position:],
+                allow_fallback=True, retry_round=True, record_deferral=False, timeout_seconds=error.timeout_seconds,
+                begin_round=lambda: self._begin_round(run, plan, retry, retry_round))
         except _CeilingCut as cut:
             retry = cut.retry
             kind = plan.audit["profile"]["kind"]
@@ -439,6 +454,7 @@ class LocalModelGateway:
                 if record_deferral:
                     self.ledger.record_deferral(run, error)
                 raise
+            begin_round = None
 
             def record_cache_signature(signature):
                 self.ledger.record_cache_signature(run, call_id, provider.binding, signature)
@@ -588,6 +604,17 @@ class LocalModelGateway:
                 diagnostics = response.diagnostics
                 failure = response.failure or (diagnostics.failure if diagnostics is not None else None)
                 phase = failure.document()["phase"] if failure is not None else "unclassified"
+                if (envelope.original.output_format == "phone_action" and not envelope.tools
+                        and not prefix_committed and failure is ModelFailure.TRANSPORT
+                        and diagnostics is not None and diagnostics.status_code == 429
+                        and not diagnostics.completion_present):
+                    # The phone has not acted on a model result. Keep the original
+                    # call's accounting and let a configured vision fallback decide.
+                    if allow_fallback and provider_position + 1 < len(plan.providers):
+                        logger.warning("Phone decision rate limited; trying the configured fallback task=%s provider=%s",
+                                       run.task.task_id, provider.binding.provider)
+                        continue
+                    raise TaskError("phone_model_rate_limited", "the phone decision provider returned HTTP 429")
                 logger.warning(
                     "[CompanionV2] 模型结果无法确认 task=%s kind=%s round=%d provider=%s "
                     "phase=%s failure=%s parse_state=%s finish_reason=%s completion_present=%s "
@@ -602,16 +629,19 @@ class LocalModelGateway:
                     diagnostics.parsed.chars if diagnostics is not None and diagnostics.parsed is not None else "unavailable",
                     diagnostics.visible.chars if diagnostics is not None and diagnostics.visible is not None else "unavailable",
                     prefix_committed)
-                # 上游 7.1.0 的三个门禁必须保留：用量未知的调用不能重试，
-                # 同一轮也只能降级一次（我方旧分支没有这两道，勿回退）。
+                if (round_no == 0 and envelope.original.output_format == "phone_action"
+                        and failure is ModelFailure.WIRE_DECODE and usage_known and not prefix_committed
+                        and not envelope.tools and not response.tool_calls):
+                    remaining = (run.task.spec.deadline_at - self.tasks.now()).total_seconds()
+                    seconds = min(plan.audit["timeout_seconds"], remaining - 5)
+                    if seconds >= 5:
+                        raise _PhoneFormatRejected(provider_position, seconds)
                 if (allow_fallback and not prefix_committed and not contract_fallback_used
                         and failure is ModelFailure.WIRE_DECODE and usage_known
                         and provider_position + 1 < len(plan.providers)):
                     # 结构化任务拿不到合法 JSON，但这次调用的用量已由 Provider 确认：
                     # 没有已发出的正文前缀，也没有执行过工具，换备用模型重试一次不会
                     # 造成重复投递；这一次的用量照常入账，不计入"未知不可重试"。
-                    # 上游 7.1.0 的 allow_fallback / contract_fallback_used / usage_known
-                    # 三个门禁必须保留：用量未知的调用不能重试，同一轮也只能降级一次。
                     contract_fallback_used = True
                     logger.warning(
                         "[CompanionV2] 结构化输出不符合契约，用量已确认，切换备用模型重试 "
@@ -741,7 +771,8 @@ class LocalModelGateway:
                                "cache_creation_tokens": row["cache_creation_tokens"], "output_tokens": row["output_tokens"],
                                "usage_state": "unknown" if row["actual_tokens"] is None else "settled",
                                "over_reservation": None if row["actual_tokens"] is None else (
-                                   row["actual_tokens"] > row["reserved_tokens"] or row["actual_cost"] > row["reserved_cost"]),
+                                   row["actual_tokens"] > row["reserved_tokens"]
+                                   or (row["actual_cost"] is not None and row["actual_cost"] > row["reserved_cost"])),
                                "provider_latency_ms": row["latency_ms"],
                                "response_diagnostics": checked_response_diagnostics(row["response_summary_json"]),
                                "failure": None if row["failure_code"] is None else {
@@ -773,17 +804,14 @@ class ModelSession:
     async def generate(self, request, *, history=(), owner_refresh=None, media_refresh=None, on_reply_prefix=None,
                        allow_ceiling_retry=None, tools=None,
                        reply_prefix_ready=None):
-        # ``tools`` 是本轮可以递给模型的目录；``None`` 表示「沿用会话默认」，
-        # 与「显式空目录」区分开。结构化输出（主动联系的开口轮、判定、日记等）
-        # 由调用方显式传 ``()``：build_wire 会拒绝这类请求携带目录。
+        # Fork: allow a caller to narrow this round's catalog. ``None`` keeps the
+        # upstream default (the whole session catalog); structured rounds pass an
+        # explicit empty tuple so build_wire never offers tools to them.
         if tools is not None and (len(tools) > MAX_TOOL_CATALOG
                 or len({tool.action for tool in tools}) != len(tools)
                 or any(tool not in self.tools for tool in tools)):
             raise ValueError("this round may only offer a bounded subset of the session catalog")
         round_tools = self.tools if tools is None else tuple(tools)
-        if request.output_format != "conversation" and (round_tools or history):
-            raise TaskError("model_tools_not_offered",
-                            "structured output is written without a tool catalog")
         if self.closed or self.busy or self.round_no > 8:
             raise TaskError("model_session_closed", "original model session cannot generate again")
         original = self.plan.envelope.original

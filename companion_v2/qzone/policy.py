@@ -22,15 +22,9 @@ from .topics import allowed_scenes, normalize_scene, normalize_topic, topic_spec
 KIND = "qzone.runtime.v1"
 COOLDOWN_STEPS = (12.0, 24.0, 24.0 * 7)
 FAILURE_MEMORY_SECONDS = 7 * 24 * 3600
-SIMILARITY_THRESHOLD = 2
-# A two-trigram overlap proves nothing on a short status: "测试一条，发说说吧" and
-# "再测试一条发说说看看" are different posts. Similarity only counts once both
-# bodies are long enough for two shared trigrams to mean something.
-SIMILARITY_MIN_CHARS = 12
-# A fixed count alone still blocks long posts that share a couple of ordinary
-# phrases ("不解决", "只是让") out of dozens of trigrams. Require the shared
-# trigrams to cover half of the shorter body before calling two posts alike.
-SIMILARITY_COVERAGE = 0.5
+SIMILARITY_THRESHOLD = 8
+SIMILARITY_RATIO = 0.30
+SHORT_TEXT_SIMILARITY_CHARS = 16
 RECENT_PUBLISH_TEXTS = 8
 PUBLISH_KINDS = ("publish",)
 
@@ -161,6 +155,34 @@ def _ngrams(text, size):
     return {compact[index:index + size] for index in range(len(compact) - size + 1)}
 
 
+def _too_similar(previous, current):
+    """Return True for genuine near-duplicates without rejecting unrelated posts sharing a phrase."""
+    left = "".join(str(previous or "").split())
+    right = "".join(str(current or "").split())
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    first = _ngrams(left, 3)
+    second = _ngrams(right, 3)
+    shared = len(first & second)
+    union = len(first | second)
+    if not union:
+        return False
+    jaccard = shared / union
+    if shared >= SIMILARITY_THRESHOLD and jaccard >= SIMILARITY_RATIO:
+        return True
+    # Very short posts cannot accumulate 8 shared 3-grams; catch exact containment
+    # or heavy overlap only when the shorter post covers most of the longer one.
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    if len(shorter) <= SHORT_TEXT_SIMILARITY_CHARS:
+        if shorter in longer and len(shorter) / len(longer) >= 0.5:
+            return True
+        if shared >= 3 and jaccard >= 0.5:
+            return True
+    return False
+
+
 def topic_reason(state, settings, *, topic, scene, confidence, topic_confirmed, at, day):
     """Return the classified-post gate as ``(code, message)``.
 
@@ -250,11 +272,7 @@ def publish_reason(state, settings, *, text, at, day, topic=None, scene=None,
     for previous in state.recent_publish_texts:
         if "".join(previous.split()) == compact:
             return "这条说说和刚发过的重复"
-        shared = ngram_shared(previous, compact)
-        shortest = min(len(_ngrams(previous, 3)), len(_ngrams(compact, 3)))
-        if (min(len(compact), len("".join(previous.split()))) >= SIMILARITY_MIN_CHARS
-                and shared >= SIMILARITY_THRESHOLD
-                and shortest and shared / shortest >= SIMILARITY_COVERAGE):
+        if _too_similar(previous, compact):
             return "这条说说和刚发过的太像"
     return ""
 
@@ -313,7 +331,7 @@ class QzoneRuntimeStore:
         return state
 
 
-__all__ = ["COOLDOWN_STEPS", "KIND", "QzoneRuntimeState", "QzoneRuntimeStore", "SIMILARITY_COVERAGE",
-           "SIMILARITY_MIN_CHARS", "SIMILARITY_THRESHOLD",
+__all__ = ["COOLDOWN_STEPS", "KIND", "QzoneRuntimeState", "QzoneRuntimeStore",
+           "SHORT_TEXT_SIMILARITY_CHARS", "SIMILARITY_RATIO", "SIMILARITY_THRESHOLD",
            "action_reason", "block_reason", "clear_failure", "ngram_shared", "note_action", "note_failure",
            "note_publish", "publish_reason", "topic_reason"]

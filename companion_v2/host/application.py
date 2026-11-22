@@ -105,6 +105,7 @@ from companion_v2.screen.configuration import (ScreenConfigurationOwner, ScreenS
     configuration_fields as screen_configuration_fields)
 from companion_v2.screen.interpretation import ScreenInterpretationService
 from companion_v2.screen.peek import ScreenPeekService
+from companion_v2.device.action_service import KIND as PHONE_KIND, NOTICE_OWNER as PHONE_NOTICE_OWNER, PhoneActionService
 from companion_v2.conversation.relay_settings import (RelayConfigurationOwner, RelaySettings,
     configuration_fields as relay_configuration_fields)
 from companion_v2.conversation.recall_settings import (RecallConfigurationOwner, RecallSettings,
@@ -118,11 +119,14 @@ from companion_v2.library.provider import (CATALOG_CAPABILITY as LIBRARY_CATALOG
     make_read_provider as make_library_read_provider)
 from companion_v2.references.configuration import (ReferenceConfigurationOwner, ReferenceSettings,
     configuration_fields as reference_configuration_fields)
+from companion_v2.references.daily_outfit import DailyOutfitPhotos
 from companion_v2.references.service import ReferenceAssetService
 from companion_v2.references.wardrobe import (WardrobeConfigurationOwner, WardrobeSettings,
     configuration_fields as wardrobe_configuration_fields)
 from companion_v2.qzone.configuration import (QzoneConfigurationOwner, QzoneSettings,
     configuration_fields as qzone_configuration_fields)
+from companion_v2.device.configuration import (PhoneConfigurationOwner,
+    configuration_fields as phone_configuration_fields)
 from companion_v2.qzone.service import QzoneService
 from companion_v2.system_prompts.configuration import (
     RoleSystemPromptConfigurationOwner, configuration_fields as system_prompt_configuration_fields)
@@ -272,6 +276,7 @@ class CompanionApplication:
             *reference_configuration_fields(),
             *wardrobe_configuration_fields(),
             *qzone_configuration_fields(),
+            *phone_configuration_fields(),
             *private_access_configuration_fields(),
             *relay_configuration_fields(),
             *system_prompt_configuration_fields(),
@@ -299,6 +304,7 @@ class CompanionApplication:
                     reference_configuration_owner,
                     WardrobeConfigurationOwner(runtime),
                     QzoneConfigurationOwner(runtime),
+                    PhoneConfigurationOwner(runtime),
                     RoleSystemPromptConfigurationOwner(runtime),
                     *capability_owners))
         try:
@@ -330,16 +336,19 @@ class CompanionApplication:
         self.role_reader = RoleReader(self.role_life)
         self.state_maintenance = StateMaintenance(runtime)
         self.calendar_planning = CalendarPlanning(runtime, weather_port=weather_port)
+        self.daily_outfit = DailyOutfitPhotos(runtime, weather_port)
         self.growth_progress = GrowthProgressService(runtime)
         self.self_review = SelfReviewService(runtime)
         self.expression_style = ExpressionStyleService(runtime)
         self.expression_draft_review = ExpressionDraftReview(runtime)
         self.agenda = AgendaService(runtime)
+        self.phone_actions = PhoneActionService(runtime, notify=self.notify)
         self.outbound = OutboundDelivery(runtime, sender, (
             DeliveryOwner(AGENDA_OWNER, "reminder.deliver", lambda request, at: self.agenda_background.delivery_text(request, at),
                 lambda request, at: self.agenda_background.history_text(request, at)),
             DeliveryOwner(CONTACT_GROUP, CONTACT_GROUP, self.proactive.delivery_text, self.proactive.history_text),
             DeliveryOwner(FALLBACK_OWNER, "conversation.reply", lambda request, at: self.image_fallback.read(request, at)),
+            DeliveryOwner(PHONE_NOTICE_OWNER, PHONE_KIND, self.phone_actions.delivery_content),
         ), concurrency=limits.background_slots)
         self.outbound.on_delivered = self._mark_contact_sent
         self.outbound.on_receipt = self._record_contact_delivery_receipt
@@ -362,8 +371,8 @@ class CompanionApplication:
             TaskRegistration(TaskDefinition(DELIVERY_KIND, "conversation.delivery", REPLY_ACTION, Lane.FOREGROUND,
                 side_effect=SideEffect.MESSAGE_DELIVERY, binding=sender.binding, timeout_seconds=30,
                 max_attempts=1, concurrency=self.worker_limit), lambda spec, at: self.delivery.validate(spec, at)),
-        ) + self.poke_reply_model.registrations + self.journal_writer.registrations + self.memory_reflection.registrations + self.role_reader.registrations + self.state_maintenance.registrations + self.calendar_planning.registrations + self.growth_progress.registrations + self.self_review.registrations + self.expression_style.registrations + self.proactive.registrations + self.outbound.registrations + self.image_review_service.registrations + self.context_image_caption.registrations + self.image_narration.registrations + self.video_narration.registrations + self.screen_interpretation.registrations + self.screen_peek.registrations + self.authoring.registrations + (external.registrations if external is not None else ())
-        registrations += self.expression_draft_review.registrations
+        ) + self.poke_reply_model.registrations + self.journal_writer.registrations + self.memory_reflection.registrations + self.role_reader.registrations + self.state_maintenance.registrations + self.calendar_planning.registrations + self.growth_progress.registrations + self.self_review.registrations + self.expression_style.registrations + self.proactive.registrations + self.outbound.registrations + self.image_review_service.registrations + self.context_image_caption.registrations + self.image_narration.registrations + self.video_narration.registrations + self.screen_interpretation.registrations + self.screen_peek.registrations + self.phone_actions.registrations + self.authoring.registrations + (external.registrations if external is not None else ())
+        registrations += self.expression_draft_review.registrations + self.daily_outfit.registrations
         self.tasks = TaskSupervisor(runtime, registrations, limits=limits, now=self.now)
         # Reference material shares this runtime and the supervisor that owns it, so
         # it is constructed here rather than with the other settings readers above.
@@ -481,11 +490,13 @@ class CompanionApplication:
         self.video_narration.attach(self)
         self.screen_interpretation.attach(self)
         self.screen_peek.attach(self)
+        self.phone_actions.attach(self)
         self.background = BackgroundCoordinator(self.tasks, self.outbound,
                                                 (self.agenda_background, self.image_review_service,
                                                  self.screen_interpretation, self.screen_peek), notify=self.notify)
         self.state_maintenance.attach(self)
         self.calendar_planning.attach(self)
+        self.daily_outfit.attach(self)
         self.growth_progress.attach(self)
         self.self_review.attach(self)
         self.expression_style.attach(self)
@@ -984,10 +995,12 @@ class CompanionApplication:
                      lambda: self.background.advance(planners=False)),
             TickUnit("memory-schedule", self.memory_schedule.advance),
             TickUnit("life-runtime", self.life_runtime.advance),
+            TickUnit("phone-actions", self.phone_actions.advance),
             TickUnit("state-maintenance", self.state_maintenance.advance),
             TickUnit("memory-activity", bound_activity),
             TickUnit("memory-game", bound_game),
             TickUnit("calendar-planning", self.calendar_planning.advance),
+            TickUnit("daily-outfit", self.daily_outfit.advance),
             TickUnit("growth-progress", self.growth_progress.advance),
             TickUnit("self-review", self.self_review.advance),
             TickUnit("group-participation", advance_reflection),
@@ -1128,12 +1141,14 @@ class CompanionApplication:
             self.life_runtime.cancel_running()
             self.state_maintenance.cancel_running()
             self.calendar_planning.cancel_running()
+            self.daily_outfit.cancel_running()
             self.growth_progress.cancel_running()
             self.self_review.cancel_running()
             self.expression_style.cancel_running()
             self.image_review_service.cancel_running()
             self.screen_interpretation.cancel_running()
             self.screen_peek.cancel_running()
+            self.phone_actions.cancel_running()
             self.memory.activity.close()
             if self.memory.game is not None:
                 self.memory.game.close()
@@ -1148,7 +1163,7 @@ class CompanionApplication:
     def active_handles(self):
         return ((self.semantics.active_handles if self.semantics else ()) + self.runner.active_handles + self.journal_writer.active_handles + self.memory_reflection.active_handles
                 + self.role_reader.active_handles + self.life_runtime.active_handles
-                + self.state_maintenance.active_handles + self.calendar_planning.active_handles
+                + self.state_maintenance.active_handles + self.calendar_planning.active_handles + self.daily_outfit.active_handles
                 + self.growth_progress.active_handles
                 + self.self_review.active_handles
                 + self.expression_style.active_handles
@@ -1163,6 +1178,7 @@ class CompanionApplication:
                 + self.poke_reply_model.active_handles + tuple(self.poke_context_tasks)
                 + self.screen_interpretation.active_handles
                 + self.screen_peek.active_handles
+                + self.phone_actions.active_handles
                 + (self.authoring.runner.active_handles if self.authoring.runner else ())
                 + (self.external.runner.active_handles if self.external else ()))
 
@@ -1198,6 +1214,7 @@ class CompanionApplication:
             await self.life_runtime.close()
             await self.state_maintenance.close()
             await self.calendar_planning.close()
+            await self.daily_outfit.close()
             await self.growth_progress.close()
             await self.self_review.close()
             await self.expression_style.close()
@@ -1208,6 +1225,7 @@ class CompanionApplication:
             await self.video_narration.close()
             await self.screen_interpretation.close()
             await self.screen_peek.close()
+            await self.phone_actions.close()
             self.memory.activity.close()
             if self.memory.game is not None:
                 self.memory.game.close()

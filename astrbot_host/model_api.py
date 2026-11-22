@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
 from copy import deepcopy
 from pathlib import Path
 from time import monotonic
@@ -17,14 +18,31 @@ from companion_v2.conversation.media.models import MAX_REFERENCE_IMAGES
 from companion_v2.conversation.reply_management import ReplyManagement
 from companion_v2.decision import LayaDecisionService, LayaSettingsStore
 from companion_v2.decision.client import LayaClientError
+from companion_v2.decision.service import safe_laya_client_error_reason
 from companion_v2.decision.store import LayaSettingsError
 from companion_v2.execution.models import TaskError, digest, require
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.model_gateway.management import ModelManagement
+from companion_v2.model_gateway.pricing import (
+    PricingSettingsError,
+    PricingSettingsStore,
+    effective_usd_cny_rate,
+)
+from companion_v2.model_gateway.pricing_catalog import PriceCatalogStore
+from companion_v2.model_gateway.pricing_expr import validate_tiered_expr_rule
 from companion_v2.proactive.search_settings import SearchSettingsError, SearchSettingsStore
+from companion_v2.storage.runtime import StorageOpenError
 
 from .management_identity import dashboard_operator
 from .core_reply_configuration import CORE_MANAGED_FIELDS, project_core_reply_configuration
+from .exchange_rate import ExchangeRateService, read_astrbot_http_proxy
+from .pricing_inventory import (
+    build_pricing_payload,
+    build_provider_metadata_map,
+    collect_provider_inventory,
+    read_provider_stat_runtime_models,
+)
+from .pricing_sources import PricingCatalogService
 from .memory_diagnostics import process_memory_snapshot
 from .memory_linkage import read_external_memory_summary
 from .maintenance_checks import read_host_checks
@@ -416,6 +434,17 @@ class ModelWebAPI:
             (PREFIX + "/laya/save", self.laya_save, ["POST"], "Save optional Laya decision model configuration"),
             (PREFIX + "/search", self.search_status, ["GET"], "Read the DeepSeek search Provider binding"),
             (PREFIX + "/search/save", self.search_save, ["POST"], "Save the DeepSeek search Provider binding"),
+            (PREFIX + "/pricing", self.pricing_status, ["GET"], "Read Pricing v2 rules, catalog sources, clusters, and FX"),
+            (PREFIX + "/pricing", self.pricing_save, ["POST"], "Save Pricing v2 rules, schedules, multipliers, and FX"),
+            (PREFIX + "/pricing/sync-rates", self.pricing_sync_rates, ["POST"], "Refresh live USD to CNY exchange rate"),
+            (PREFIX + "/pricing/sync", self.pricing_sync_catalog, ["POST"], "Sync enabled online and New API price catalog sources"),
+            (PREFIX + "/pricing/sources/toggle", self.pricing_source_toggle, ["POST"], "Toggle a price catalog source"),
+            (PREFIX + "/pricing/sources/detect", self.pricing_source_detect, ["POST"], "Probe a provider for New API /api/pricing"),
+            (PREFIX + "/pricing/select", self.pricing_select, ["POST"], "Persist a catalog candidate selection for a provider model"),
+            (PREFIX + "/pricing/select/reset", self.pricing_select_reset, ["POST"], "Clear persisted catalog candidate selection"),
+            (PREFIX + "/pricing/expr/validate", self.pricing_expr_validate, ["POST"], "Validate a tiered_expr formula with USD/CNY preview"),
+            (PREFIX + "/pricing/reset", self.pricing_reset, ["POST"], "Reset custom pricing rules, schedules, multipliers, or selections"),
+            (PREFIX + "/pricing/residue/clear", self.pricing_residue_clear, ["POST"], "Clear orphaned pricing overrides for deleted providers"),
             (PREFIX + "/laya/logs", self.laya_logs, ["GET"], "Read recent Laya decision events"),
             (PREFIX + "/laya/test", self.laya_test, ["POST"], "Test the Laya decision model connection"),
             (PREFIX + "/laya/decide", self.laya_decide, ["POST"], "Call Laya for one semantic decision"),
@@ -455,16 +484,23 @@ class ModelWebAPI:
             return outcome_response(Outcome.failed("model_catalog_unavailable", "AstrBot provider list is unavailable"))
 
     def _authorized(self, *, layer="role", include_status=False, authorize=True,
-                    session=None, runtime=None):
+                    session=None, runtime=None, allow_query_keys=()):
         controller = self.controller
         username = request.username
         if type(username) is not str or not username.strip() or username.startswith("api_key:"):
             raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard")
         if layer not in ("role", "window"):
             raise TaskError("model_request_invalid", "select role defaults or this conversation window")
-        if request.query and (set(request.query.keys()) != {"layer"} or request.query.get("layer") != layer
-                or callable(getattr(request.query, "getlist", None)) and len(request.query.getlist("layer")) != 1):
-            raise TaskError("model_request_invalid", "model routes do not accept target overrides")
+        if request.query:
+            if allow_query_keys:
+                allowed = set(allow_query_keys)
+                if (set(request.query.keys()) - allowed
+                        or (callable(getattr(request.query, "getlist", None))
+                            and any(len(request.query.getlist(key)) != 1 for key in request.query.keys()))):
+                    raise TaskError("model_request_invalid", "model routes do not accept target overrides")
+            elif (set(request.query.keys()) != {"layer"} or request.query.get("layer") != layer
+                  or callable(getattr(request.query, "getlist", None)) and len(request.query.getlist("layer")) != 1):
+                raise TaskError("model_request_invalid", "model routes do not accept target overrides")
         if controller._terminated:
             raise TaskError("staging_host_terminated", "plugin is stopped")
         session = session if session is not None else (controller.session or controller.last_session)
@@ -537,13 +573,24 @@ class ModelWebAPI:
                     raise TaskError("staging_host_terminated", "plugin is stopped")
                 if session is None or runtime is None:
                     raise TaskError("staging_not_initialized", "load the V2 profile first")
-            _session, operator, manager, _status = await asyncio.to_thread(
-                self._authorized, layer=layer, authorize=False, session=session, runtime=runtime)
             if action == "status":
+                _session, operator, manager, _status = await asyncio.to_thread(
+                    self._authorized, layer=layer, authorize=False, session=session, runtime=runtime)
                 result = await asyncio.to_thread(manager.status, operator, layer=layer)
             elif action == "maintenance":
-                result = await asyncio.to_thread(manager.maintenance, operator)
+                def _run_maintenance_core():
+                    sess, op, mgr, st = self._authorized(
+                        layer=layer, authorize=False, session=session, runtime=runtime
+                    )
+                    settings = self._pricing_store(runtime).read_safe()
+                    provider_metadata = build_provider_metadata_map(controller, sess, settings)
+                    res = mgr.maintenance(op, provider_metadata=provider_metadata)
+                    return sess, op, mgr, st, res
+
+                _session, operator, manager, _status, result = await asyncio.to_thread(_run_maintenance_core)
             else:
+                _session, operator, manager, _status = await asyncio.to_thread(
+                    self._authorized, layer=layer, authorize=False, session=session, runtime=runtime)
                 result = await asyncio.to_thread(manager.configure, operator, {**data, "layer": layer})
             if action in {"status", "configure"} and result.is_success:
                 if action == "status":
@@ -553,8 +600,29 @@ class ModelWebAPI:
                 result = Outcome.success(project_core_reply_configuration(result.unwrap()))
             if action == "maintenance" and result.is_success:
                 payload = dict(result.unwrap())
-                payload["external_token_sources"] = read_token_sources(self.controller)
-                payload["external_token_sources"]["main"] = await read_astrbot_token_usage(self.controller)
+                try:
+                    self._exchange_rate_service(runtime.data_root).maybe_schedule_background_refresh()
+                except Exception:
+                    logger.debug("[CompanionV2] 后台汇率刷新调度跳过", exc_info=True)
+                try:
+                    self._pricing_catalog_service(runtime.data_root, _session).maybe_schedule_daily_sync()
+                except Exception:
+                    logger.debug("[CompanionV2] 后台价格源自动同步调度跳过", exc_info=True)
+
+                async def _safe_read_host_checks():
+                    try:
+                        return await asyncio.to_thread(read_host_checks, self.controller)
+                    except Exception:
+                        logger.exception("[CompanionV2] 排障主机检查读取失败")
+                        return None
+
+                ext_sources, main_usage, host_checks = await asyncio.gather(
+                    asyncio.to_thread(read_token_sources, self.controller),
+                    read_astrbot_token_usage(self.controller),
+                    _safe_read_host_checks(),
+                )
+                payload["external_token_sources"] = ext_sources
+                payload["external_token_sources"]["main"] = main_usage
                 memory_source = payload["external_token_sources"].get("memory")
                 if isinstance(memory_source, dict):
                     memory_source["linkage"] = await read_external_memory_summary(
@@ -563,11 +631,8 @@ class ModelWebAPI:
                 # maintenance read (the page already refreshes it) so no new
                 # polling path is introduced; a failure here must not hide the
                 # role-level accounting that already succeeded.
-                try:
-                    payload["host_checks"] = await asyncio.to_thread(
-                        read_host_checks, self.controller)
-                except Exception:
-                    logger.exception("[CompanionV2] 排障主机检查读取失败")
+                if host_checks is not None:
+                    payload["host_checks"] = host_checks
                 # External reads can take time; revalidate before returning the
                 # diagnostics rather than trusting the earlier authorization.
                 await asyncio.to_thread(manager.authorize, operator)
@@ -575,6 +640,11 @@ class ModelWebAPI:
             return self._response(result)
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
+        except (StorageOpenError, sqlite3.Error) as error:
+            logger.warning("[CompanionV2] 模型存储暂不可用 action=%s error_type=%s",
+                           action, type(error).__name__)
+            return self._response(Outcome.failed(
+                "model_storage_unavailable", "model storage is temporarily unavailable"))
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
             return self._response(Outcome.failed("model_request_invalid", "invalid UTF-8 model request"))
 
@@ -647,6 +717,10 @@ class ModelWebAPI:
                 return self._response(result)
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
+        except (StorageOpenError, sqlite3.Error) as error:
+            logger.warning("[CompanionV2] 模型存储检查暂不可用 error_type=%s", type(error).__name__)
+            return self._response(Outcome.failed(
+                "model_storage_unavailable", "model storage is temporarily unavailable"))
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
             return self._response(Outcome.failed("model_request_invalid", "invalid storage check request"))
 
@@ -699,8 +773,10 @@ class ModelWebAPI:
         target = getattr(getattr(session, "profile", None), "target", None)
         runtime = getattr(application, "runtime", None) or getattr(self.controller, "runtime", None)
         origin_key = getattr(target, "key", None)
+        scope = getattr(getattr(target, "audience", None), "scope", None) or getattr(target, "scope", None)
         return LayaDecisionService(LayaSettingsStore(root),
-                                   runtime=runtime, origin_key=origin_key, client_factory=LayaDecisionClient)
+                                   runtime=runtime, origin_key=origin_key, scope=scope,
+                                   client_factory=LayaDecisionClient)
 
     def _search_settings_store(self):
         return SearchSettingsStore(Path(getattr(self.controller, "data_root", Path.cwd())))
@@ -744,9 +820,468 @@ class ModelWebAPI:
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
             return self._response(Outcome.failed("search_config_invalid", "搜索服务配置字段无效"))
 
+    def _pricing_store(self, runtime) -> PricingSettingsStore:
+        return PricingSettingsStore(Path(runtime.data_root))
+
+    def _pricing_catalog_store(self, runtime) -> PriceCatalogStore:
+        return PriceCatalogStore(Path(runtime.data_root))
+
+    def _exchange_rate_service(self, runtime_root) -> ExchangeRateService:
+        base = getattr(self.controller, "controller", self.controller)
+        services = getattr(base, "_exchange_rate_services", None)
+        if not isinstance(services, dict):
+            services = {}
+            try:
+                setattr(base, "_exchange_rate_services", services)
+            except Exception:
+                pass
+        key = str(Path(runtime_root).resolve())
+        service = services.get(key)
+        if service is None:
+            service = ExchangeRateService(
+                PricingSettingsStore(Path(runtime_root)),
+                now=getattr(base, "now", None),
+                proxy_resolver=lambda: read_astrbot_http_proxy(self.controller),
+            )
+            services[key] = service
+        return service
+
+    def _pricing_catalog_service(self, runtime_root, session=None) -> PricingCatalogService:
+        base = getattr(self.controller, "controller", self.controller)
+        services = getattr(base, "_pricing_catalog_services", None)
+        if not isinstance(services, dict):
+            services = {}
+            try:
+                setattr(base, "_pricing_catalog_services", services)
+            except Exception:
+                pass
+        key = str(Path(runtime_root).resolve())
+        service = services.get(key)
+        if service is None:
+            def _connections():
+                _p, _s, conns = collect_provider_inventory(self.controller, session)
+                return conns
+
+            service = PricingCatalogService(
+                PricingSettingsStore(Path(runtime_root)),
+                PriceCatalogStore(Path(runtime_root)),
+                now=getattr(base, "now", None),
+                proxy_resolver=lambda: read_astrbot_http_proxy(self.controller),
+                connections_resolver=_connections,
+            )
+            services[key] = service
+        return service
+
+    async def _authorize_pricing(self):
+        async with self.controller._control_lock:
+            session = self.controller.session or self.controller.last_session
+            runtime = self.controller.runtime
+            if self.controller._terminated:
+                raise TaskError("staging_host_terminated", "plugin is stopped")
+            if session is None or runtime is None:
+                raise TaskError("staging_not_initialized", "load the V2 profile first")
+        return await asyncio.to_thread(self._authorized, session=session, runtime=runtime)
+
+    async def _build_pricing_response(self, session, operator, manager, runtime, settings) -> dict:
+        catalog = await asyncio.to_thread(self._pricing_catalog_store(runtime).read_safe)
+        host_route = self._host_route(session)
+        try:
+            status_outcome = await asyncio.to_thread(manager.status, operator)
+            model_status = status_outcome.unwrap() if status_outcome.is_success else None
+        except Exception:
+            model_status = None
+        runtime_models = await read_provider_stat_runtime_models(self.controller)
+        return await asyncio.to_thread(
+            build_pricing_payload,
+            controller=self.controller,
+            session=session,
+            runtime=runtime,
+            settings=settings,
+            catalog=catalog,
+            host_route=host_route,
+            model_status=model_status,
+            runtime_models=runtime_models,
+        )
+
+    async def pricing_status(self):
+        try:
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            settings = await asyncio.to_thread(self._pricing_store(runtime).read)
+            try:
+                self._exchange_rate_service(runtime.data_root).maybe_schedule_background_refresh()
+            except Exception:
+                logger.debug("[CompanionV2] 汇率后台刷新调度跳过", exc_info=True)
+            try:
+                self._pricing_catalog_service(runtime.data_root, session).maybe_schedule_daily_sync()
+            except Exception:
+                logger.debug("[CompanionV2] 价格源后台同步调度跳过", exc_info=True)
+            payload = await self._build_pricing_response(session, operator, manager, runtime, settings)
+            return self._response(Outcome.success(payload))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (OSError, ValueError):
+            return self._response(Outcome.failed("pricing_config_unavailable", "无法读取模型计价配置"))
+
+    async def pricing_save(self):
+        try:
+            data = _document(await request.body(), {"revision", "changes"}, limit=524_288)
+            if type(data["changes"]) is not dict:
+                raise ValueError("invalid pricing changes")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            updated = await asyncio.to_thread(
+                self._pricing_store(runtime).update, data["revision"], data["changes"]
+            )
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success(payload))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_config_invalid", "模型计价配置字段无效"))
+
+    async def pricing_sync_rates(self):
+        try:
+            raw = await request.body()
+            if raw and raw.strip():
+                _document_optional(raw, set(), optional=(), limit=1024)
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            fx_service = self._exchange_rate_service(runtime.data_root)
+            sync_result = await fx_service.sync_now()
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            settings = await asyncio.to_thread(self._pricing_store(runtime).read)
+            payload = await self._build_pricing_response(session, operator, manager, runtime, settings)
+            return self._response(Outcome.success({**payload, "sync": sync_result}))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_sync_invalid", "汇率刷新请求无效"))
+
+    async def pricing_sync_catalog(self):
+        try:
+            raw = await request.body()
+            source_ids = None
+            if raw and raw.strip():
+                data = _document_optional(raw, set(), optional=("source_ids",), limit=4096)
+                if "source_ids" in data and data["source_ids"] is not None:
+                    if (
+                        type(data["source_ids"]) is not list
+                        or len(data["source_ids"]) > 64
+                        or any(type(s) is not str or not s.strip() for s in data["source_ids"])
+                    ):
+                        raise ValueError("invalid source_ids")
+                    source_ids = [s.strip() for s in data["source_ids"]]
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            _p, _s, connections = await asyncio.to_thread(collect_provider_inventory, self.controller, session)
+            catalog_service = self._pricing_catalog_service(runtime.data_root, session)
+            sync_result = await catalog_service.sync_sources(
+                source_ids=source_ids, connections=connections, record_daily_timestamp=True
+            )
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            settings = await asyncio.to_thread(self._pricing_store(runtime).read)
+            payload = await self._build_pricing_response(session, operator, manager, runtime, settings)
+            return self._response(Outcome.success({**payload, "sync": sync_result}))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_sync_invalid", "价格源同步请求无效"))
+
+    async def pricing_source_toggle(self):
+        try:
+            data = _document_optional(
+                await request.body(),
+                {"source_id", "enabled"},
+                optional=("sync", "revision"),
+                limit=4096,
+            )
+            source_id = data["source_id"]
+            enabled = data["enabled"]
+            do_sync = data.get("sync", False)
+            revision = data.get("revision")
+            if type(source_id) is not str or not source_id.strip() or type(enabled) is not bool or type(do_sync) is not bool:
+                raise ValueError("invalid source toggle")
+            if revision is not None and type(revision) is not str:
+                raise ValueError("invalid revision")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            updated = await asyncio.to_thread(
+                self._pricing_store(runtime).set_source_enabled,
+                source_id.strip(),
+                enabled,
+                revision=revision,
+            )
+            sync_result = None
+            if enabled and do_sync:
+                _p, _s, connections = await asyncio.to_thread(collect_provider_inventory, self.controller, session)
+                catalog_service = self._pricing_catalog_service(runtime.data_root, session)
+                sync_result = await catalog_service.sync_sources(
+                    source_ids=[source_id.strip()], connections=connections
+                )
+                updated = await asyncio.to_thread(self._pricing_store(runtime).read)
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success({
+                **payload,
+                "source_id": source_id.strip(),
+                "enabled": enabled,
+                "sync": sync_result,
+            }))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_source_invalid", "价格源切换请求无效"))
+
+    async def pricing_source_detect(self):
+        try:
+            data = _document_optional(
+                await request.body(),
+                {"provider_id"},
+                optional=("enable",),
+                limit=4096,
+            )
+            provider_id = data["provider_id"]
+            enable = data.get("enable", True)
+            if type(provider_id) is not str or not provider_id.strip() or len(provider_id) > 128 or type(enable) is not bool:
+                raise ValueError("invalid detect request")
+            pid = provider_id.strip()
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            providers_by_id, _suppliers, connections = await asyncio.to_thread(
+                collect_provider_inventory, self.controller, session
+            )
+            conn = connections.get(pid)
+            if not conn or not conn.get("api_base"):
+                return self._response(Outcome.failed("pricing_detect_unavailable", "该供应商未配置可探测的接口地址"))
+            catalog_service = self._pricing_catalog_service(runtime.data_root, session)
+            detection = await catalog_service.detect_newapi_source(
+                provider_id=pid,
+                api_base=conn["api_base"],
+                api_key=conn.get("api_key", ""),
+                proxy=conn.get("proxy", ""),
+                supplier_label=conn.get("supplier_name") or (providers_by_id.get(pid) or {}).get("supplier_name") or pid,
+                enable=enable,
+            )
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            settings = await asyncio.to_thread(self._pricing_store(runtime).read)
+            payload = await self._build_pricing_response(session, operator, manager, runtime, settings)
+            return self._response(Outcome.success({**payload, "detection": detection}))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_detect_invalid", "New API 探测请求无效"))
+
+    async def pricing_select(self):
+        try:
+            data = _document_optional(
+                await request.body(),
+                {"provider_id", "model", "price_key"},
+                optional=("revision",),
+                limit=4096,
+            )
+            pid = data["provider_id"]
+            model = data["model"]
+            price_key = data["price_key"]
+            revision = data.get("revision")
+            if (
+                type(pid) is not str or not pid.strip()
+                or type(model) is not str or not model.strip()
+                or type(price_key) is not str or not price_key.strip()
+            ):
+                raise ValueError("invalid price selection")
+            if revision is not None and type(revision) is not str:
+                raise ValueError("invalid revision")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            existing = await asyncio.to_thread(self._pricing_catalog_store(runtime).get_price, price_key.strip())
+            if existing is None:
+                return self._response(Outcome.failed("pricing_candidate_not_found", "未在当前价格目录中找到该候选价格"))
+            updated = await asyncio.to_thread(
+                self._pricing_store(runtime).set_price_selection,
+                pid.strip(),
+                model.strip(),
+                price_key.strip(),
+                revision=revision,
+            )
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success(payload))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_select_invalid", "价格源选择请求无效"))
+
+    async def pricing_select_reset(self):
+        try:
+            data = _document_optional(
+                await request.body(),
+                {"provider_id"},
+                optional=("model", "revision"),
+                limit=4096,
+            )
+            pid = data["provider_id"]
+            model = data.get("model")
+            revision = data.get("revision")
+            if type(pid) is not str or not pid.strip():
+                raise ValueError("invalid provider_id")
+            if model is not None and type(model) is not str:
+                raise ValueError("invalid model")
+            if revision is not None and type(revision) is not str:
+                raise ValueError("invalid revision")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            updated = await asyncio.to_thread(
+                self._pricing_store(runtime).clear_price_selection,
+                pid.strip(),
+                model=model,
+                revision=revision,
+            )
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success(payload))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_select_invalid", "清除价格源选择请求无效"))
+
+    async def pricing_expr_validate(self):
+        try:
+            data = _document_optional(
+                await request.body(),
+                set(),
+                optional=("expr", "tiers", "default_expr", "cluster_multiplier", "sample"),
+                limit=32_768,
+            )
+            session, _operator, _manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            settings = await asyncio.to_thread(self._pricing_store(runtime).read_safe)
+            usd_cny_rate = effective_usd_cny_rate(settings)
+            sample = data.get("sample")
+            if sample is not None and type(sample) is not dict:
+                raise ValueError("invalid sample")
+            rule_payload = {k: v for k, v in data.items() if k != "sample"}
+            result = await asyncio.to_thread(
+                validate_tiered_expr_rule, rule_payload, usd_cny_rate=usd_cny_rate, sample=sample
+            )
+            return self._response(Outcome.success(result))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_expr_invalid", "表达式验证请求无效"))
+
+    async def pricing_reset(self):
+        try:
+            raw = await request.body()
+            data = (
+                _document_optional(raw, set(), optional=("scope", "provider_id", "revision"), limit=4096)
+                if raw and raw.strip()
+                else {}
+            )
+            scope = data.get("scope", "all")
+            provider_id = data.get("provider_id")
+            revision = data.get("revision")
+            if type(scope) is not str:
+                raise ValueError("invalid scope")
+            if provider_id is not None and type(provider_id) is not str:
+                raise ValueError("invalid provider_id")
+            if revision is not None and type(revision) is not str:
+                raise ValueError("invalid revision")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            updated = await asyncio.to_thread(
+                self._pricing_store(runtime).reset_pricing,
+                scope=scope,
+                provider_id=provider_id,
+                revision=revision,
+            )
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success(payload))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_reset_invalid", "重置计价配置请求无效"))
+
+    async def pricing_residue_clear(self):
+        try:
+            raw = await request.body()
+            data = (
+                _document_optional(raw, set(), optional=("provider_ids", "revision"), limit=8192)
+                if raw and raw.strip()
+                else {}
+            )
+            raw_ids = data.get("provider_ids")
+            revision = data.get("revision")
+            target_ids = None
+            if raw_ids is not None:
+                if (
+                    type(raw_ids) is not list
+                    or len(raw_ids) > 256
+                    or any(type(p) is not str or not p.strip() for p in raw_ids)
+                ):
+                    raise ValueError("invalid provider_ids")
+                target_ids = {p.strip() for p in raw_ids}
+            if revision is not None and type(revision) is not str:
+                raise ValueError("invalid revision")
+            session, operator, manager, _status = await self._authorize_pricing()
+            runtime = getattr(getattr(session, "application", None), "runtime", None) or self.controller.runtime
+            providers_by_id, _suppliers, _conns = await asyncio.to_thread(
+                collect_provider_inventory, self.controller, session
+            )
+            configured_pids = set(providers_by_id)
+            configured_cids = {info["cluster_id"] for info in providers_by_id.values()}
+            updated, cleared = await asyncio.to_thread(
+                self._pricing_store(runtime).clear_residue,
+                configured_provider_ids=configured_pids,
+                configured_cluster_ids=configured_cids,
+                target_provider_ids=target_ids,
+                revision=revision,
+            )
+            payload = await self._build_pricing_response(session, operator, manager, runtime, updated)
+            return self._response(Outcome.success({**payload, "cleared_provider_ids": cleared}))
+        except TaskError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except PricingSettingsError as error:
+            return self._response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return self._response(Outcome.failed("pricing_residue_invalid", "清理已删除供应商残留请求无效"))
+
     @staticmethod
     def _laya_error(error):
         return getattr(error, "code", "laya_unavailable"), str(getattr(error, "reason", error))
+
+    @staticmethod
+    def _laya_client_failure(error, service=None):
+        """Build an ok-enveloped failure payload so the host bridge keeps safe reasons."""
+        api_key = ""
+        if service is not None:
+            try:
+                api_key = str(service.store.raw().get("api_key") or "")
+            except Exception:
+                api_key = ""
+        return {
+            "status": "failed",
+            "code": getattr(error, "code", "laya_unavailable"),
+            "reason": safe_laya_client_error_reason(error, api_key=api_key),
+        }
 
     async def laya_status(self):
         try:
@@ -779,8 +1314,15 @@ class ModelWebAPI:
     async def laya_logs(self):
         try:
             async with self.controller._control_lock:
-                self._authorized()
-                return self._response(Outcome.success(self._laya_service().recent()))
+                self._authorized(allow_query_keys={"scope"})
+                query = request.query or {}
+                scope = query.get("scope", "all")
+                if scope not in ("all", "current"):
+                    raise TaskError("model_request_invalid", "invalid Laya log scope")
+                service = self._laya_service()
+                data = service.recent() if scope == "current" else service.recent(all_origins=True)
+                data["scope"] = scope
+                return self._response(Outcome.success(data))
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
         except (LayaSettingsError, OSError, ValueError) as error:
@@ -788,6 +1330,7 @@ class ModelWebAPI:
             return self._response(Outcome.failed(code, reason))
 
     async def laya_test(self):
+        service = None
         try:
             _document(await request.body(), set(), limit=1024)
             async with self.controller._control_lock:
@@ -797,14 +1340,17 @@ class ModelWebAPI:
             async with self._laya_lock:
                 result = await service.test()
             return self._response(Outcome.success(result))
+        except LayaClientError as error:
+            return self._response(Outcome.success(self._laya_client_failure(error, service)))
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
-        except (LayaSettingsError, LayaClientError, OSError, ValueError, TypeError,
+        except (LayaSettingsError, OSError, ValueError, TypeError,
                 KeyError, UnicodeError, RecursionError, OverflowError) as error:
             code, reason = self._laya_error(error)
             return self._response(Outcome.failed(code, reason))
 
     async def laya_decide(self):
+        service = None
         try:
             data = _document(await request.body(), {"facts"}, limit=32000)
             if type(data["facts"]) is not dict:
@@ -816,9 +1362,11 @@ class ModelWebAPI:
             async with self._laya_lock:
                 result = await service.decide(data["facts"])
             return self._response(Outcome.success(result))
+        except LayaClientError as error:
+            return self._response(Outcome.success(self._laya_client_failure(error, service)))
         except TaskError as error:
             return self._response(Outcome.failed(error.code, str(error)))
-        except (LayaSettingsError, LayaClientError, OSError, ValueError, TypeError,
+        except (LayaSettingsError, OSError, ValueError, TypeError,
                 KeyError, UnicodeError, RecursionError, OverflowError) as error:
             code, reason = self._laya_error(error)
             return self._response(Outcome.failed(code, reason))

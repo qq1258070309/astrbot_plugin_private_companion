@@ -61,8 +61,23 @@ window.CompanionExpressionSamplesPage = (() => {
   };
   function project(){
     const rows=Object.values(rowsBySource);
-    items=rows.flatMap(row=>row.items).sort(compareItems);
-    counts=rows.reduce((total,row)=>{for(const [key,value] of Object.entries(row.counts||{}))total[key]=(total[key]||0)+Number(value||0);return total;},{});
+    /* Role-level and window-level targets can expose the same material.  The
+       handle is the server's identity for a sample; source-local keys made the
+       same row appear twice and doubled the header counters. */
+    const unique=new Map();
+    for(const item of rows.flatMap(row=>row.items)){
+      const key=item.handle || item._key;
+      const previous=unique.get(key);
+      if(!previous)unique.set(key,item);
+      else {
+        const preferred=item.state!=="pending"&&previous.state==="pending"?item:previous;
+        const fallback=preferred===item?previous:item;
+        unique.set(key,{...fallback,...preferred,actions:preferred.actions||fallback.actions,
+          view_token:preferred.view_token||fallback.view_token});
+      }
+    }
+    items=Array.from(unique.values()).sort(compareItems);
+    counts=rows.reduce((total,row)=>{for(const [key,value] of Object.entries(row.counts||{}))total[key]=Math.max(total[key]||0,Number(value||0));return total;},{});
     const runtimes=rows.map(row=>row.runtime||{});
     runtime={running:runtimes.some(value=>value.running),learning_enabled:runtimes.some(value=>value.learning_enabled),
       application_enabled:runtimes.some(value=>value.application_enabled),eligible_samples:runtimes.reduce((sum,value)=>sum+Number(value.eligible_samples||0),0),
@@ -159,7 +174,7 @@ window.CompanionExpressionSamplesPage = (() => {
           <button type="button" class="lh-command is-primary" data-sample-learn${canLearn() ? "" : " disabled"}>${runtime.running ? "学习中…" : "立即学习"}</button></div></header>
       <div class="lh-samples-progress" role="status"><span>${e(statusText())}</span><span>可用 ${Number(runtime.eligible_samples || 0)} / ${Number(runtime.minimum_samples || 0)}</span>
         ${runtime.new_messages == null ? "" : `<span>新增 ${Number(runtime.new_messages)} / ${Number(runtime.required_new_messages)}</span><span>今日 ${Number(runtime.group_batches_today)} / ${Number(runtime.group_daily_batch_limit)} 批</span>`}</div>
-      <nav class="lh-review-filters" aria-label="素材审核状态">${FILTERS.map(([key, label]) => `<button type="button" data-sample-filter="${key}" aria-pressed="${filter === key}"${disabled}>${label}<span>${key === "all" ? Object.values(counts).reduce((a,b) => a + Number(b), 0) : Number(counts[key] || 0)}</span></button>`).join("")}</nav>
+      <nav class="lh-samples-filters" aria-label="素材审核状态">${FILTERS.map(([key, label]) => `<button type="button" data-sample-filter="${key}" aria-pressed="${filter === key}"${disabled}>${label}<span>${key === "all" ? Object.values(counts).reduce((a,b) => a + Number(b), 0) : Number(counts[key] || 0)}</span></button>`).join("")}</nav>
       ${notice ? `<div class="lh-inline-status${error ? " is-error" : ""}" role="status"><span>${e(notice)}</span>${issueList}</div>` : ""}
       <div class="lh-samples-list" aria-busy="${busy || writing}">${items.length ? items.map(item => `<article class="lh-sample" data-row-key="${e(item._key)}" data-state="${e(item.state)}">
         <details><summary><span class="lh-sample-sender">${e(item.sender_id || "消息来源")}</span><time>${e(time(item.received_at))}</time><span class="lh-sample-state">${STATES[item.state] || "不可用"}${item.eligible ? " · 可学习" : ""}</span><span class="lh-sample-preview">${e(item.text)}</span></summary><p>${e(item.text)}</p><small class="lh-sample-scope">记录来源 · ${e(sourceLabel(item._source))}</small></details>

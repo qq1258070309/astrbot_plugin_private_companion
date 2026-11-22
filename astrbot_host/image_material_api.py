@@ -34,7 +34,7 @@ class ImageMaterialsWebAPI:
             (PREFIX + "/album", self.album, ["GET"], "Read the role-scoped generated image album"),
             (PREFIX + "/album/export", self.export_album, ["POST"], "Export selected generated images as a ZIP archive"),
             (PREFIX + "/album/hide", self.hide_album, ["POST"], "Remove selected generated images from the album"),
-            (PREFIX + "/album/open-folder", self.open_album_folder, ["POST"], "Open the V2 data folder"),
+            (PREFIX + "/album/open-folder", self.open_album_folder, ["POST"], "Open the role-scoped generated album folder"),
             (PREFIX + "/references/upload", self.upload_reference, ["POST"], "Upload one role-owned reference image"),
             (PREFIX + "/references", self.register_reference, ["POST"], "Register one explicit album image reference"),
             (PREFIX + "/references/update", self.update_reference, ["POST"], "Update one role image reference"),
@@ -43,6 +43,8 @@ class ImageMaterialsWebAPI:
             (PREFIX + "/wardrobe", self.register_wardrobe, ["POST"], "Add one role wardrobe item"),
             (PREFIX + "/wardrobe/withdraw", self.withdraw_wardrobe, ["POST"], "Withdraw one role wardrobe item"),
             (PREFIX + "/daily-outfit", self.select_daily_outfit, ["POST"], "Choose today's role outfit"),
+            (PREFIX + "/daily-outfit/photo", self.daily_outfit_photo, ["GET"], "Read today's generated outfit photo"),
+            (PREFIX + "/daily-outfit/generate", self.generate_daily_outfit_photo, ["POST"], "Generate today's role outfit photo"),
         ]
 
     async def _operator_context(self, *, allow_cursor=False):
@@ -108,7 +110,7 @@ class ImageMaterialsWebAPI:
                 elif action == "hide_album":
                     value = manager.hide_album_images(operator, context, at=at, image_ids=body["image_ids"])
                 elif action == "open_album_folder":
-                    value = manager.open_album_folder(operator, context, at=at)
+                    value = manager.open_album_folder(operator, context, at=at, role_id=body.get("role_id"))
                 elif action == "register_reference":
                     value = manager.register_from_album(operator, context, at=at, **body)
                 elif action == "upload_reference":
@@ -131,6 +133,10 @@ class ImageMaterialsWebAPI:
                     value = manager.register_wardrobe_item(operator, context, at=at, **body)
                 elif action == "withdraw_wardrobe":
                     value = manager.withdraw_wardrobe_item(operator, context, body["item_id"], at=at)
+                elif action == "daily_outfit_photo":
+                    value = manager.daily_outfit_photo(operator, context, at=at)
+                elif action == "generate_daily_outfit_photo":
+                    value = manager.generate_daily_outfit_photo(operator, context, at=at, **body)
                 else:
                     value = manager.select_daily_outfit(operator, context, body["item_id"], at=at)
                 return outcome_response(Outcome.success(value))
@@ -205,7 +211,7 @@ class ImageMaterialsWebAPI:
         return await self._post("hide_album", {"image_ids"})
 
     async def open_album_folder(self):
-        return await self._post("open_album_folder", set())
+        return await self._post("open_album_folder", set(), optional={"role_id"})
 
     async def register_reference(self):
         return await self._post("register_reference", {"image_id", "label", "roles", "operation_key"})
@@ -231,3 +237,9 @@ class ImageMaterialsWebAPI:
 
     async def select_daily_outfit(self):
         return await self._post("select_daily_outfit", {"item_id"})
+
+    async def daily_outfit_photo(self):
+        return await self._run("daily_outfit_photo")
+
+    async def generate_daily_outfit_photo(self):
+        return await self._post("generate_daily_outfit_photo", {"operation_key"})

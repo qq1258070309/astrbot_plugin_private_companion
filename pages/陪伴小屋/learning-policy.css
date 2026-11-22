@@ -1,0 +1,65 @@
+/* 角色策略页（学习与反思 → 角色策略）。
+ *
+ * 两个配置编辑器（技能领域、表达学习策略）各自成卡，以容器宽度决定两列或单列排布：
+ * 在 AstrBot 双侧栏（~904–912px）及更宽桌面下，短字段两两成对，长控件自动整行通栏；
+ * 字段内排版直接复用 workbench.css 的容器两行结构（开关左右对齐、说明通栏、
+ * 窄列数字/下拉自然折行），不再写死 320px 列宽导致中屏溢出或 <=1280px 右侧空洞。 */
+
+.learning-hub:has(.learning-policy-workspaces){max-width:1480px;margin-inline:auto;width:100%}
+.learning-policy-workspaces{min-width:0;container:learning-policy / inline-size}
+
+/* 两张设置卡：标题、字段、保存条收进同一块卡，保存范围的边界一眼可见。 */
+.learning-policy-workspaces .config-editors{
+  padding:var(--sp-4) var(--sp-5);
+  border:1px solid var(--t-line);
+  border-radius:var(--r-md);
+  background:var(--t-surface);
+  box-shadow:var(--t-shadow);
+}
+.learning-policy-workspaces .wb-card-copy h3{font-size:var(--fs-lead)}
+
+/* 默认单列，容器宽 >=720px 时排成对称两列（覆盖 1280px 与 1440px 桌面）。 */
+.learning-policy-workspaces .wb-fields{
+  max-width:none;
+  grid-template-columns:minmax(0,1fr);
+  align-items:stretch;
+  gap:0;
+}
+@container learning-policy (min-width:720px){
+  .learning-policy-workspaces .wb-fields{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:0 var(--sp-6);
+  }
+}
+
+/* journal 无层轨：主体铺满单列，空槽自动折叠，控件与分隔线对齐同一条右边缘。 */
+.learning-policy-workspaces .wb-field{
+  align-items:start;
+  grid-template-columns:minmax(0,1fr);
+  padding-right:0;
+}
+.learning-policy-workspaces .wb-field>.wb-field-main{grid-column:1}
+.learning-policy-workspaces .wb-field-side{grid-column:1;padding-left:0}
+.learning-policy-workspaces .wb-field-side:empty{display:none}
+
+/* 分区标题与字段左边缘对齐（工作台默认缩进 8px）。 */
+.learning-policy-workspaces .wb-group-head{margin-left:0}
+
+/* 保存条贴到卡片下缘：负边距与上面的卡片内边距成对出现。 */
+.learning-policy-workspaces .wb-actions{
+  margin-inline:calc(var(--sp-5) * -1);
+  margin-bottom:calc(var(--sp-4) * -1);
+  padding-inline:var(--sp-5);
+  padding-bottom:var(--sp-4);
+  border-radius:0 0 var(--r-md) var(--r-md);
+}
+
+@media(max-width:860px){
+  .learning-policy-workspaces .config-editors{padding:var(--sp-3)}
+  .learning-policy-workspaces .wb-actions{
+    margin-inline:calc(var(--sp-3) * -1);
+    margin-bottom:calc(var(--sp-3) * -1);
+    padding-inline:var(--sp-3);
+    padding-bottom:var(--sp-3);
+  }
+}

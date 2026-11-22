@@ -16,7 +16,6 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 
 from companion_v2.agenda.models import AgendaTarget, MemoCursor
-from companion_v2.capabilities.privacy import is_core
 from companion_v2.conversation.agenda_tools import AgendaRoleSession
 from companion_v2.conversation.interaction_tools import POKE_ACTION, POKE_SPEC
 from companion_v2.conversation.tool_loop import READ_ACTIONS
@@ -59,9 +58,9 @@ def group_tool_manifest(offered, profile, *, allow_camera=False):
 
     ``full`` keeps the ordinary catalogue.  ``lean`` and ``standard`` filter to
     the same ordered allowlist on every turn, so the provider's cached tool
-    prefix does not change when a message happens to carry an image or mention.
-    ``allow_camera`` is the explicit core-admin exception; it is computed from
-    the authenticated actor, never from message text.
+    prefix does not change when a message happens to carry an image, mention,
+    or a different group speaker.  ``allow_camera`` reflects window/role
+    camera availability; execution-time admission enforces core-admin access.
     """
     if profile not in ("lean", "standard"):
         return tuple(offered)
@@ -89,6 +88,40 @@ access_scope=same_device 的链接仅供运行 AstrBot 的电脑使用；public_
 对方明确点名要你戳一戳/拍一拍某个人时，调用 interaction.poke，target 用对方给出的昵称、群名片或 QQ；只戳被点名的人，不猜同名，同一轮对同一人只戳一次。不要用文字假装已经戳过；结果未知时如实说明，不重复调用。"""
 EVIDENCE_SPEC = ToolSpec("turn.evidence", "读取本轮已认证发言的证据句柄，供记忆、日历、成长和关系提案使用。",
                         encode({"type": "object", "properties": {}, "additionalProperties": False}))
+
+PHONE_TASK_INSTRUCTION = (
+    "调用 phone.task.start 时，目标要保留用户交办的全部细节，包括数量、规格、配送方式、红包和优惠条件、明确要求填写的备注和停止条件。"
+    "用户交办手机操作或调整当前订单时，先调用此工具，再根据回执回复。"
+    "结账暂停后的「继续」「改一对一配送」「记得用红包」都是当前订单的接续请求，设置 resume_checkout=true，"
+    "保留原订单和最新要求。结账设置改动后需要新的订单截图，付款应按新回执单独回复「确认支付」。"
+    "单独要求唤醒手机、解锁或查看当前页面时，登记普通手机任务，shopping 和 resume_checkout 都设为 false。"
+    "若工具返回 phone_checkout_unavailable，说明当前私聊没有可接续订单，按回执准确回应。"
+    "收到「点击极速支付」等说法时，按现有结账和确认状态处理；需要新回执时先接续订单，只有后台回执能确认是否实际支付。"
+    "state=queued 表示任务已登记，可以回复已接到任务，等后台回执。"
+    "工具未调用、失败或仍排队时，如实说明当前状态。商品、规格、红包、配送和付款状态以手机任务回执为准。"
+)
+PHONE_TASK_SPEC = ToolSpec(
+    "phone.task.start",
+    "登记当前私聊交办的手机任务，由后台逐步执行。登记回执为 queued。"
+    "点餐、购买等任务须设置 shopping=true，付款前会在原私聊发送订单明细和截图。"
+    "继续已停在结账环节的订单或调整配送、红包时，设置 resume_checkout=true。",
+    encode({"type": "object", "properties": {
+        "goal": {"type": "string", "minLength": 1, "maxLength": 500,
+                 "description": "写成可验证的目标，保留用户指定的应用、商家、商品、数量、规格、配送方式、红包和优惠条件、备注和停止条件。重复交办同一件事时，将本轮新增要求合并到之前的目标。"},
+        "delay_minutes": {"type": "integer", "minimum": 0, "maximum": 1440,
+                          "description": "多少分钟后开始第一步；0 表示下一个空闲回合。"},
+        "max_steps": {"type": "integer", "minimum": 1, "maximum": 20,
+                      "description": "最多允许几步操作，默认按手机配置（最多 20 步）。"},
+        "shopping": {"type": "boolean", "description": "用户交办点餐、购物或其他涉及付款的任务时设为 true。"},
+        "resume_checkout": {"type": "boolean", "description": "调整或接续已登记的当前订单时设为 true，goal 写明原订单和本次调整。单独唤醒手机时设为 false。"},
+    }, "required": ["goal"], "additionalProperties": False}))
+
+
+_GROUP_ADMIN_DENIAL_REASONS = {
+    "screen_scope_denied": "桌面截屏在群聊中只允许核心管理员使用，本次操作已拒绝。",
+    "reality_camera_private_required": "摄像头观察在群聊中只允许核心管理员使用，本次操作已拒绝。",
+    "reality_admin_only": "该现实能力在群聊中只允许核心管理员使用，本次操作已拒绝。",
+}
 
 
 def native_tool_name(action: str) -> str:
@@ -250,6 +283,9 @@ class CoreReplyToolSession:
                     if (spec.action.startswith(("memo.", "reminder.")) or spec.action == "operation.lookup") and policy.feature_access(context.actor, scope=context.scope,
                             action=spec.action, observed_at=app.tasks.now()).is_success:
                         offered.append(_OfferedTool(spec, "agenda"))
+            phone = getattr(app, "phone_actions", None)
+            if phone is not None and phone.available(context):
+                offered.append(_OfferedTool(PHONE_TASK_SPEC, "phone"))
             memory = getattr(tools, "memory", None)
             if memory is not None and not tools._memory_is_external():
                 offered.extend(_OfferedTool(spec, "memory") for spec in memory.catalog_for(context))
@@ -308,7 +344,11 @@ class CoreReplyToolSession:
                 and getattr(getattr(getattr(self, "event", None), "platform_meta", None), "name", "") != "wechat_native"):
             offered.append(_OfferedTool(POKE_SPEC, "interaction"))
         if self.context.scope.kind is ScopeKind.GROUP and self.group_tool_profile in ("lean", "standard"):
-            allow_camera = is_core(self.application.runtime, self.context.actor.subject)
+            # Expose camera strictly by window/role configuration (already
+            # filtered by external.catalog_for), never by current speaker, so
+            # alternating admin/member turns keep an invariant tools_hash.
+            # Execution-time admission strictly enforces core-admin permission.
+            allow_camera = any(item.spec.action == "reality.camera.observe" for item in offered)
             return group_tool_manifest(offered, self.group_tool_profile, allow_camera=allow_camera)
         return tuple(offered)
 
@@ -546,9 +586,15 @@ class CoreReplyToolSession:
                 result = execute_core_behavior(self, action, arguments, native_call_id(wrapper, action, arguments))
             elif offered.owner == "evidence":
                 result = await self.evidence()
+            elif offered.owner == "phone":
+                result = self._phone_task(arguments)
             elif offered.owner == "interaction":
                 result = await self.poke(arguments)
             elif offered.owner == "external":
+                external = getattr(self.application.tools, "external", None)
+                provider = external.providers.get(action) if external is not None else None
+                if provider is not None:
+                    external.admit(provider.descriptor, self.context, self.application.tasks.now())
                 if action in ("image.edit", "image.mask_edit"):
                     # An explicit empty inbound selection means this edit only
                     # uses saved reference_ids. Capturing every current/quoted
@@ -634,11 +680,35 @@ class CoreReplyToolSession:
                 return encode({key: value for key, value in {**result, "material_state": "unavailable", "code": error.code}.items()
                                if key in {"state", "effect", "invocation_id", "operation_id", "receipt_ref", "material_state",
                                           "code", "retry_disposition", "reason", "next_step"}})
-            return encode({"state": "failed", "effect": "none", "code": error.code,
-                           "retry_disposition": "input_invalid" if error.code == "invalid_tool_arguments" else "stop"})
+            payload = {
+                "state": "failed", "effect": "none", "code": error.code,
+                "retry_disposition": "input_invalid" if error.code == "invalid_tool_arguments" else "stop",
+            }
+            denial_reason = _GROUP_ADMIN_DENIAL_REASONS.get(error.code)
+            if denial_reason:
+                payload["reason"] = denial_reason
+            return encode(payload)
         except (ValueError, ValidationError):
             return encode({"state": "failed", "effect": "none", "code": "invalid_tool_arguments",
                            "retry_disposition": "input_invalid"})
+
+    def _phone_task(self, arguments):
+        """Register one due phone task; execution happens in the background loop."""
+        app, context = self.application, self.context
+        service = getattr(app, "phone_actions", None)
+        if service is None or not service.available(context):
+            raise TaskError("phone_disabled", "the phone channel is not enabled for this window")
+        goal = arguments.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise TaskError("invalid_tool_arguments", "a phone task needs a goal")
+        resumed = arguments.get("resume_checkout") is True
+        document = service.create(context, goal,
+                                  delay_minutes=int(arguments.get("delay_minutes") or 0),
+                                  max_steps=arguments.get("max_steps"),
+                                  shopping=arguments.get("shopping") is True or resumed,
+                                  resume_checkout=resumed)
+        return {"state": "queued", "effect": "committed", "payload": document,
+                "reason": "手机任务已登记，等待后台执行。"}
 
     def _read(self, owner, action, arguments):
         app, context = self.application, self.context
@@ -754,6 +824,8 @@ def inject_core_reply_tools(event, req, *, application):
         if (session.group_tool_profile == "lean" and session.context.scope.kind is ScopeKind.GROUP
                 and LEAN_GROUP_INSTRUCTION not in req.system_prompt):
             req.system_prompt = (req.system_prompt.rstrip() + "\n\n" + LEAN_GROUP_INSTRUCTION).lstrip()
+        if any(item.owner == "phone" for item in offered) and PHONE_TASK_INSTRUCTION not in req.system_prompt:
+            req.system_prompt += "\n\n" + PHONE_TASK_INSTRUCTION
         if any(item.owner == "authoring" for item in offered):
             from companion_v2.conversation.content.authoring_workflow import INSTRUCTION as AUTHORING_INSTRUCTION
             if AUTHORING_INSTRUCTION not in req.system_prompt:

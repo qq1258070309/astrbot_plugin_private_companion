@@ -95,7 +95,13 @@ window.CompanionProduct = (() => {
     legacy_nothing_to_migrate:"这份旧版数据里没有可以自动迁移的来源。",
     legacy_scope_unavailable:"这份角色设置里没有要写入的配置分组，这一组会跳过，其余照常。",
     legacy_apply_failed:"迁移没有写入任何设置，请重新试算后再试一次。",
-    legacy_request_invalid:"这次操作缺少必要的信息，请重新走一遍迁移的三步。"};
+    legacy_request_invalid:"这次操作缺少必要的信息，请重新走一遍迁移的三步。",
+    /* 配置保存的回绝也要有中文落点：这些码会经 product.request 出现在
+       角色档案草稿、模型页等工作区里，不能只剩一句英文机器码。 */
+    role_profile_configuration_invalid:"角色档案没有通过校验：头像需为 24 KB 以内的 JPEG，单个字段与整份档案都有字数上限。草稿已保留，请调整后再保存。",
+    configuration_request_invalid:"请求格式有误或内容过大（角色头像上限 24 KB）。草稿已保留，请调整后再试。",
+    configuration_revision_conflict:"配置已经更新。草稿已保留，读取新版本后再核对。",
+    configuration_storage_unavailable:"配置存储暂时不可用，这次没有写入；请稍后重新保存。"};
   /* 主题六套，按明暗分两组，每套对应小屋的一个时段或陈设风格。
      色值不在这里写——tokens.css 是唯一色源，这里只有名字与分组。
      色卡预览靠给元素套上 data-theme 真实渲染，而不是各写一份色值副本
@@ -266,6 +272,15 @@ window.CompanionProduct = (() => {
   }
   const fail = (code, confirmed = false) => Object.assign(new Error(errors[code] || "暂不可读取，请刷新核对。"),
     {code, ...(confirmed ? {confirmed:true} : {})});
+  /* 结果未知的码：请求可能已经送到服务端并落库，也可能根本没发出去。
+     这些不能按「明确回绝」清掉待核对请求，只能继续沿用原操作核对。
+     其余机器码是插件自己写的域内错误，代表一次确定的服务端答复。 */
+  const UNCERTAIN_CODES = new Set(["bridge_timeout", "bridge_unavailable",
+    "invalid_response", "plugin_web_internal_error", "dashboard_bridge_not_ready",
+    "timeout", "request_timeout", "network_error", "canceled", "cancelled", "aborted"]);
+  const isUncertainCode = code => typeof code !== "string" || !code
+    || UNCERTAIN_CODES.has(code) || code.startsWith("bridge_")
+    || code.startsWith("dashboard_bridge_");
   let bridge, catalog, manifest, data = {}, failures = {}, failureCodes = {}, selected = {target_id:null,role_id:null,bot_id:null};
   let selectionGuard = () => true, selectionIntent = 0, selectionNotice = "";
   let browserPreferenceIdentity = null, browserPreferenceNotice = "";
@@ -590,17 +605,9 @@ window.CompanionProduct = (() => {
   const diagnosticEndpoint = value => String(value || "").split("?", 1)[0]
     .replace(/(^|\/)targets\/[^/]+/g, "$1targets/:target")
     .replace(/(^|\/)roles\/[^/]+/g, "$1roles/:role");
-  /* 超时标出「谁先放弃」：页面外层（stage=parent）还是桥/宿主那层（stage=bridge，
-     由桥自己抛的 bridge_timeout 带过来）。写入是否生效由 operation_key 幂等保证，
-     但提示语要说得清是哪一段没等到回执，用户才知道该重发还是该核对。 */
   async function bounded(promise, timeoutMs = DEFAULT_API_TIMEOUT_MS) {
     let timer;
-    try { return await Promise.race([promise, new Promise((_,reject) => {timer = setTimeout(() => {
-      const late = fail("bridge_timeout");
-      late.timeoutMs = timeoutMs;
-      late.timeoutStage = "parent";
-      reject(late);
-    },timeoutMs);})]); }
+    try { return await Promise.race([promise, new Promise((_,reject) => {timer = setTimeout(() => reject(fail("bridge_timeout")),timeoutMs);})]); }
     finally { clearTimeout(timer); }
   }
   async function api(method, path, body, options) {
@@ -613,20 +620,24 @@ window.CompanionProduct = (() => {
         });
       }
       /* 老版页面桥会把机器码放在 Error.message 或 Error.code 上，未必经过
-         unwrap()。先把已知码送回同一张表，避免 setup-guide 直接显示英文串。 */
-      if (error.code && errors[error.code]) {
-        const same = fail(error.code, error.confirmed === true);
-        /* 超时的等待时长与阶段要跟着码一起穿过去：工作台靠它写「等了多少秒、
-           是谁先放弃」，只丢码的话用户看到的还是笼统的「没有返回保存确认」。 */
-        if (error.timeoutMs) same.timeoutMs = error.timeoutMs;
-        if (error.timeoutStage) same.timeoutStage = error.timeoutStage;
-        throw same;
+         unwrap()。先把已知码送回同一张表，避免 setup-guide 直接显示英文串。
+         机器码本身是一份服务端回执：除连接层/宿主内部错误外，都按 confirmed
+         交给调用方；否则一次明确回绝会被当成「结果未知」反复核对。 */
+      const code = (typeof error?.code === "string" && error.code)
+        ? error.code : (CODE.test(error?.message || "") ? error.message : "");
+      if (code) {
+        const confirmed = error.confirmed === true || !isUncertainCode(code);
+        if (errors[code]) throw fail(code, confirmed);
+        if (confirmed) throw Object.assign(
+          new Error(method === "POST"
+            ? `保存没有通过（错误码：${code}），草稿已保留，请按提示调整后再试。`
+            : `读取没有完成（错误码：${code}），请刷新后重试。`),
+          {code, confirmed: true});
+        throw fail(code, false);
       }
-      if (CODE.test(error.message || "") && errors[error.message]) throw fail(error.message, error.confirmed === true);
-      if (error.code) throw fail(error.code, error.confirmed === true);
-      if (/initialized|explicit V2 profile/i.test(error.message)) throw fail("staging_not_initialized");
-      if (/Dashboard|sign in/i.test(error.message)) throw fail("dashboard_identity_required");
-      throw fail(CODE.test(error.message || "") ? error.message : "invalid_response");
+      if (/initialized|explicit V2 profile/i.test(error.message)) throw fail("staging_not_initialized", true);
+      if (/Dashboard|sign in/i.test(error.message)) throw fail("dashboard_identity_required", true);
+      throw fail("invalid_response");
     }
   }
   /* 桥的 endpoint 是**插件相对**路径：不带前导斜杠，也**不带插件目录名**。
@@ -1061,6 +1072,9 @@ window.CompanionProduct = (() => {
   function stateCard() {
     return window.CompanionHomeSidebar.renderState({state:data.state,life:data.life,loading,unavailable,
       unavailableCode:name=>failureCodes[name]||""});
+  }
+  function stateAge() {
+    return window.CompanionHomeSidebar.stateAge?.({state:data.state,now:Date.now()}) || "";
   }
   function scheduleCard() {
     return window.CompanionHomeSidebar.renderSchedule({state:data.state,life:data.life,loading,unavailable,
@@ -1518,6 +1532,7 @@ window.CompanionProduct = (() => {
         const allowed=(method==="GET"&&["acquaintance","acquaintance/authorization","acquaintance/settings","acquaintance/strangers",
           "acquaintance/account-links","acquaintance/account-links/history"].includes(path))
            ||(method==="POST"&&["acquaintance/authorization","acquaintance/settings","acquaintance/identity","acquaintance/admin-name","acquaintance/stranger-target",
+             "acquaintance/stranger-remove","acquaintance/stranger-block","acquaintance/stranger-unblock",
              "acquaintance/account-links","acquaintance/account-links/unlink"].includes(path));
         if(!allowed)throw fail("invalid_response");
         mapped=relative(roleApi)+path.slice("acquaintance".length);
@@ -1537,17 +1552,13 @@ window.CompanionProduct = (() => {
       }
       // Preserve original response envelopes and error reasons for each workspace.
       timeoutMs=requestTimeout({timeoutMs:message.timeoutMs});
-      /* The budget the member page asked for has to reach the bridge too: the
-         bridge defaults to 18 s and would otherwise give up before a slow write
-         (configuration saves serialize on the host control lock) can answer. */
-      const budget = {timeoutMs};
-      const execute=()=>bounded(method==="GET"?bridge.apiGet(mapped,message.body,budget):bridge.apiPost(mapped,message.body,budget),timeoutMs);
+      const execute=()=>bounded(method==="GET"?bridge.apiGet(mapped,message.body):bridge.apiPost(mapped,message.body),timeoutMs);
       const retained=context.kind==="designer"&&method==="POST"&&["designer/turn","designer/drafts"].includes(path);
       const id=path==="designer/turn"?message.body?.request_id:message.body?.id;
       if(retained&&(typeof id!=="string"||!/^[a-f0-9]{32}$/.test(id)))throw fail("invalid_response");
       const result=await (retained?window.CompanionPersonaDesignerMemory.run(
         (path==="designer/turn"?"turn:":"save:")+id,execute,
-        path==="designer/turn"?()=>bridge.apiPost("persona-designer/cancel",{request_id:id},budget):undefined):execute());valid();
+        path==="designer/turn"?()=>bridge.apiPost("persona-designer/cancel",{request_id:id}):undefined):execute());valid();
       send({kind:"response",requestId:message.requestId,ok:true,data:result});
     } catch(error){
       /* 宿主页面桥对 status=error 只抛出 `new Error(message)`，不带 `code`；
@@ -1562,8 +1573,6 @@ window.CompanionProduct = (() => {
         method,endpoint:diagnosticEndpoint(path),elapsed_ms:Date.now()-startedAt,
         timeout_ms:timeoutMs,code:code||"unknown",confirmed:false,
       });
-      /* 超时的等待时长与阶段随响应一起回给成员页：成员页的「结果未确认」提示
-         要写清等了几秒、是页面外层先放弃还是桥没等到宿主回执。 */
       /* 一次失败只属于实际请求的那条来源路由，不能拿主页面当前选中的
          目标冒充；先从 endpoint 里的 target/role 反查标签，再退回当前选择。 */
       const routeTarget=/(?:^|\/)targets\/([^/]+)\/roles\/([^/]+)(?:\/|$)/.exec(path||"");
@@ -1574,9 +1583,7 @@ window.CompanionProduct = (() => {
       send({kind:"response",requestId:message.requestId,ok:false,
         error:errors[code]||reason||"请求未完成，请刷新核对当前状态后重试。",
         code:code||undefined,reason:reason||undefined,sourceLabel:sourceLabel||undefined,
-        confirmed:error?.confirmed===true,
-        timeoutMs:Number.isInteger(error?.timeoutMs)?error.timeoutMs:undefined,
-        timeoutStage:typeof error?.timeoutStage==="string"?error.timeoutStage.slice(0,16):undefined});
+        confirmed:error?.confirmed===true});
     }
   });
   function extensionsMarkup(ids) {
@@ -1696,7 +1703,7 @@ window.CompanionProduct = (() => {
        展示多 Bot / 多角色拓扑，再用 targets 给可接收迁移的角色补上真实路由。 */
     accounts:()=>catalog?.accounts||[], personas:()=>catalog?.personas||[],
     targetLabel,subjectLabel,platformLabel,accountLabel,roleLabel,scopeLabel,actorLabel,executorLabel,
-    get manifest(){return manifest;},get data(){return data;},stateCard,scheduleCard,capabilityCard,growthCard,memoryCard,
+    get manifest(){return manifest;},get data(){return data;},stateCard,stateAge,scheduleCard,capabilityCard,growthCard,memoryCard,
     workspace,workspaceDirtyDrafts,unmountWorkspace,mountWorkspace,workspaceAddress,providerAddress,extensionsMarkup,providersMarkup,capabilitiesMarkup,providerDetail,growthMarkup,
     extension:id=>manifest?.extensions?.find(p=>p.capability_id===id),
     provider:id=>manifest?.providers?.find(p=>p.capability_id===id),

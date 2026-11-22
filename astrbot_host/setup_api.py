@@ -90,7 +90,7 @@ PROACTIVE_TEST_SUGGESTIONS = {
     "contact_quiet_hours": "当前处于静默时段；结束后再运行测试。",
     "delivery_result_unknown": "投递结果未知；先核对核心管理员私聊，不要重放这次尝试。",
     "delivery_failed": "检查 OneBot 私聊连接、机器人在线状态和平台返回错误。",
-    "contact_diagnostic_source_required": "展开技术详情查看本次没有测试机会的原因。关系表达类使用已完成的私聊窗口和用途设置；事件类需要当前有效事件来源。没有候选时不会调用模型。",
+    "contact_diagnostic_source_required": "展开技术详情查看本次没有测试机会的原因。关系表达类使用已完成的私聊窗口和用途设置；事件类需要当前有效事件来源。没有候选时不会调用模型。若是首次使用：请用核心管理员账号私聊 bot，完成一次问答后回到这里重试。",
     "contact_weather_unavailable": "检查角色地点与天气观测设置，并确认 Open-Meteo 或已配置的和风凭据可访问；刷新后先在状态页确认出现当前观测。",
     "contact_news_unavailable": "检查当前资讯源的网络抓取结果与条目发布时间；真实测试不会用合成新闻替代。",
     "screen_peek_unavailable": "检查当前私聊已配置的截图设备、识屏开关与窥屏授权。",
@@ -972,9 +972,24 @@ class SetupWebAPI:
 
     async def _recipient_document(self):
         resolver = getattr(self.controller, "proactive_diagnostic_targets", None)
-        if not callable(resolver):
-            raise TaskError("proactive_recipients_unavailable", "the shared host does not support recipient selection")
-        targets = await resolver()
+        if callable(resolver):
+            targets = list(await resolver())
+        else:
+            # Single-window hosts have no picker: the confirmed core binding is the
+            # only candidate.  Keep the page working there instead of reporting
+            # "unsupported" for a host that can answer.
+            single = getattr(self.controller, "proactive_diagnostic_target", None)
+            if not callable(single):
+                raise TaskError("proactive_recipients_unavailable",
+                                "the shared host does not support recipient selection")
+            try:
+                target = await single()
+            except TaskError as error:
+                if error.code != "setup_binding_confirmation_required":
+                    raise
+                targets = []
+            else:
+                targets = [target] if target is not None else []
         stored = self.diagnostic_recipient.read()
         selected = next((t for t in targets if self.diagnostic_recipient.identity(t) == stored), None)
         # A unique live CORE recipient needs no manual configuration, even after

@@ -1,4 +1,4 @@
-﻿const assert = require('node:assert/strict');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -2257,4 +2257,1007 @@ test('仅有群入口的角色不请求不存在的模型连接服务', async ()
   assert.equal(h.requests.length, 1);
   assert.match(node.innerHTML, /只有群聊模型入口/);
   h.page.unmount();
+});
+
+test('the primary provider select offers an explicit follow-parent option', async () => {
+  const h = harness(), node = h.root(), data = status();
+  /* A dead id saved on an editable layer: the backend keeps its failure
+     visible instead of recovering it, which is the state the parent label
+     has to describe. */
+  const stale = task('content.authoring.draft', 'gone', ['text'], 'background');
+  stale.fields.provider = {value: 'gone', inherited_value: 'gone', source: 'role',
+    inherited_source: 'role', explicit: false};
+  data.tasks = [stale];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /<option value="__inherit__" selected>跟随上级（角色默认：gone · 当前不可用）<\/option>/);
+  /* Inherited: the select stays on the parent option and does not present the
+     stale id as selected; the caption still names the inherited route. */
+  assert.doesNotMatch(card, /<option value="gone" selected>/);
+  assert.match(card, /跟随上级时为 角色默认：gone/);
+  h.page.unmount();
+});
+
+test('choosing the parent option submits a reset instead of an explicit provider', async () => {
+  const h = harness(), node = h.root(), data = status();
+  data.tasks = [editable('content.authoring.draft', 'primary')];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'content.authoring.draft', value: '__inherit__'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'choosing the parent option should produce a save');
+  assert.equal(JSON.stringify(saved.values.reset), JSON.stringify(['provider']));
+  assert.equal(Object.hasOwn(saved.values.changes, 'provider'), false);
+  h.page.unmount();
+});
+
+test('choosing the parent option re-fits an explicit output limit to the parent ceiling', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'small');
+  item.fields.provider = {value: 'small', inherited_value: 'big', source: 'role',
+    inherited_source: 'installation', explicit: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'role',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'small', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider', modelKind: 'content.authoring.draft', value: '__inherit__'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'the parent option should still be saveable after the limit is re-fitted');
+  assert.equal(saved.values.changes.max_output_tokens, 1024);
+  h.page.unmount();
+});
+
+test('the inherit checkbox re-fits an explicit output limit like the parent option', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'small');
+  item.fields.provider = {value: 'small', inherited_value: 'big', source: 'role',
+    inherited_source: 'installation', explicit: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'role',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'small', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'provider',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'the checkbox path should re-fit the limit before save');
+  assert.equal(saved.values.changes.max_output_tokens, 1024);
+  h.page.unmount();
+});
+
+test('following a parent whose explicit provider is blank is refused with an explanation', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.provider = {value: 'primary', inherited_value: '', source: 'window',
+    inherited_source: 'role', explicit: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  assert.match(node.innerHTML, /上级（角色默认）保存的主模型是空值/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 0,
+    'the refused switch must not turn into a save');
+  h.page.unmount();
+});
+
+test('the inherit checkbox also refuses a blank parent provider', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.provider = {value: 'primary', inherited_value: '', source: 'window',
+    inherited_source: 'role', explicit: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'provider',
+    modelKind: 'content.authoring.draft', checked: true});
+  assert.match(node.innerHTML, /上级（角色默认）保存的主模型是空值/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 0,
+    'the refused checkbox must not turn into a save');
+  h.page.unmount();
+});
+
+test('bulk restore skips a task whose parent provider is blank', async () => {
+  const {page, requests, root} = harness();
+  const node = root();
+  page.mount(node);
+  const data = status();
+  data.tasks[0].fields.provider = {value: 'primary', inherited_value: '', source: 'window',
+    inherited_source: 'role', explicit: true};
+  requests[0].resolve(data);
+  await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.click('[data-model-pick]', {modelPick: 'conversation.reply'});
+  node.click('[data-model-action]', {modelAction: 'inherit'});
+  assert.match(node.innerHTML, /1 项已跳过：对话回复（上级主模型为空）/);
+  page.unmount();
+});
+
+test('a fallback cleared by recovery is shown as disabled instead of inherited', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /已停用（本层保存的备用与主模型重复）/);
+  assert.doesNotMatch(card, /<option value="" selected>不使用备用模型<\/option>/);
+  h.page.unmount();
+});
+
+test('following an unavailable parent provider is refused with an explanation', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.provider = {value: 'primary', inherited_value: 'removed-id', source: 'window',
+    inherited_source: 'role', explicit: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  assert.match(node.innerHTML, /主模型 removed-id 当前不可用/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 0);
+  h.page.unmount();
+});
+
+test('a cleared field renders exactly one disabled option', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.equal((card.match(/value="__cleared__"/g) || []).length, 1);
+  h.page.unmount();
+});
+
+test('following the parent for a cleared fallback resets its stored row', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(Object.hasOwn(saved.values.changes, 'provider'), false);
+  h.page.unmount();
+});
+
+test('following a parent provider that lacks the task capability is refused', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary', ['text', 'image']);
+  item.fields.provider = {value: 'primary', inherited_value: 'text-only', source: 'window',
+    inherited_source: 'role', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'text-only', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  assert.match(node.innerHTML, /主模型 text-only 当前不可用/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 0);
+  h.page.unmount();
+});
+
+test('picking a provider for a cleared fallback shows that choice', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'fallback',
+    modelKind: 'content.authoring.draft', value: 'secondary'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.doesNotMatch(card, /已停用（本层保存的备用/);
+  assert.match(card, /<option value="secondary" selected>/);
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.equal(saved.values.changes.fallback, 'secondary');
+  h.page.unmount();
+});
+
+test('the cleared marker cannot be chosen as a value', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /<option value="__cleared__" selected disabled>/);
+  h.page.unmount();
+});
+
+test('a cleared fallback can be explicitly cleared to no fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'role', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'fallback',
+    modelKind: 'content.authoring.draft', value: ''});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'explicitly choosing no fallback must be saveable');
+  assert.equal(saved.values.changes.fallback, '');
+  h.page.unmount();
+});
+
+test('a cleared fallback does not count as a configured fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  for (const task of data.tasks) {
+    task.fields.provider = {value: 'primary', inherited_value: 'primary', source: 'installation',
+      inherited_source: 'installation', explicit: false};
+    task.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+      inherited_source: 'role', explicit: false, cleared: true};
+  }
+  h.page.mount(node);
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-sub]', {modelSub: 'map'});
+  assert.match(node.innerHTML, /<b>0<\/b><span>已设回退<\/span>/);
+  h.page.unmount();
+});
+
+test('bulk restore names an unavailable parent as unavailable, not blank', async () => {
+  const h = harness(), node = h.root(), data = status();
+  data.tasks[0].fields.provider = {value: 'primary', inherited_value: 'removed-id',
+    source: 'window', inherited_source: 'role', explicit: true};
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.click('[data-model-pick]', {modelPick: 'conversation.reply'});
+  node.click('[data-model-action]', {modelAction: 'inherit'});
+  assert.match(node.innerHTML, /对话回复（上级模型不可用）/);
+  h.page.unmount();
+});
+
+test('a chosen no-fallback survives a configuration refresh', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'role', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'fallback',
+    modelKind: 'content.authoring.draft', value: ''});
+  node.click('[data-model-action]', {modelAction: 'refresh'});
+  h.requests.at(-1).resolve(data); await flush();
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved, 'the explicit no-fallback choice must survive the refresh');
+  assert.equal(saved.values.changes.fallback, '');
+  h.page.unmount();
+});
+
+test('a cleared field counts as configured in the map stats', async () => {
+  const h = harness(), node = h.root(), data = status();
+  /* One task inherits everything except a cleared fallback row; the other is
+     fully explicit. Both must count as "configured on this layer". */
+  const clearedTask = task('content.authoring.draft', 'primary', ['text'], 'background');
+  clearedTask.fields.fallback = {value: '', inherited_value: 'secondary', source: 'installation',
+    inherited_source: 'installation', explicit: false, cleared: true};
+  data.tasks = [clearedTask, editable('memory.reflect', 'primary')];
+  h.page.mount(node);
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-sub]', {modelSub: 'map'});
+  assert.match(node.innerHTML, /<b>2<\/b><span>单独设置<\/span>/);
+  h.page.unmount();
+});
+
+test('changing the primary clears a stored fallback that was disabled', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'role', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.equal(saved.values.changes.provider, 'secondary');
+  assert.equal(saved.values.changes.fallback, '');
+  h.page.unmount();
+});
+
+test('an emptied inherited fallback does not count as a fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  for (const task of data.tasks) {
+    task.fields.fallback = {value: '', inherited_value: '', source: 'default',
+      inherited_source: 'default', explicit: false, emptied: true};
+  }
+  h.page.mount(node);
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-sub]', {modelSub: 'map'});
+  assert.match(node.innerHTML, /<b>0<\/b><span>已设回退<\/span>/);
+  h.page.unmount();
+});
+
+test('an inherited fallback shows the route that is actually used', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  item.fields.fallback = {value: 'secondary', inherited_value: '', source: 'host_conversation',
+    inherited_source: 'default', explicit: false};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /<option value="secondary" selected>/);
+  assert.doesNotMatch(card, /<option value="" selected>不使用备用模型<\/option>/);
+  /* The output limit is checked against the fallback dispatch actually uses. */
+  assert.match(card, /1024/);
+  h.page.unmount();
+});
+
+test('an emptied fallback is not shown as an inherited fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'host_conversation', explicit: false, emptied: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /<option value="">不使用备用模型<\/option>/);
+  assert.doesNotMatch(card, /<option value="secondary" selected>/);
+  /* The emptied fallback must not cap the output limit either. */
+  assert.doesNotMatch(card, /1024/);
+  h.page.unmount();
+});
+
+test('switching an explicit fallback to follow the parent uses the parent ceiling', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'local-fb', inherited_value: 'parent-fb', source: 'window',
+    inherited_source: 'role', explicit: true,
+    parent_stored: 'parent-fb', parent_stored_usable: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'local-fb', model: '', capabilities: ['text'], max_output_tokens: 1024},
+    {id: 'parent-fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(Object.hasOwn(saved.values.changes, 'max_output_tokens'), false);
+  h.page.unmount();
+});
+
+test('a cleared field alone does not make the draft dirty', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'role', explicit: false, cleared: true};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /data-model-action="save-one"[^>]*disabled/);
+  h.page.unmount();
+});
+
+test('a substituted fallback names the stored row it replaced', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, replaced: true, stored_value: 'primary'};
+  item.fields.fallback.value = 'secondary';
+  item.fields.fallback.inherited_value = 'secondary';
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /本层保存的 primary 已被恢复替换/);
+  h.page.unmount();
+});
+
+test('following the parent for a cleared fallback uses the parent ceiling', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'role', explicit: false, cleared: true, emptied: true,
+    parent_stored: 'secondary', parent_stored_usable: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(saved.values.changes.max_output_tokens, 1024);
+  h.page.unmount();
+});
+
+test('a replaced field counts as configured and can be reset', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const clearedTask = task('content.authoring.draft', 'primary', ['text'], 'background');
+  clearedTask.fields.fallback = {value: 'secondary', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'default', explicit: false, replaced: true, stored_value: 'primary'};
+  data.tasks = [clearedTask, editable('memory.reflect', 'primary')];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-sub]', {modelSub: 'map'});
+  assert.match(node.innerHTML, /<b>2<\/b><span>单独设置<\/span>/);
+  node.click('[data-model-sub]', {modelSub: 'cfg'});
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  h.page.unmount();
+});
+
+test('following the parent for a replaced fallback uses the parent ceiling', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'replaced-fb', inherited_value: 'parent-fb', source: 'default',
+    inherited_source: 'role', explicit: false, replaced: true, stored_value: 'primary'};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'replaced-fb', model: '', capabilities: ['text'], max_output_tokens: 1024},
+    {id: 'parent-fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(Object.hasOwn(saved.values.changes, 'max_output_tokens'), false);
+  h.page.unmount();
+});
+
+test('changing the primary clears a replaced fallback row', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'replaced-fb', inherited_value: 'replaced-fb', source: 'default',
+    inherited_source: 'default', explicit: false, replaced: true, stored_value: 'primary'};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'replaced-fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.equal(saved.values.changes.fallback, 'replaced-fb',
+    'the fallback the card shows must survive the primary change');
+  h.page.unmount();
+});
+
+test('an emptied fallback returns to the ceiling when the primary moves', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, emptied: true, stored_value: 'secondary'};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'big'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(saved.values.changes.max_output_tokens, 1024);
+  h.page.unmount();
+});
+
+test('an emptied fallback uses the recovered route when the primary moves', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, emptied: true,
+    stored_value: 'secondary', recovered_value: 'big'};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big2', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'secondary', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'big2'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(Object.hasOwn(saved.values.changes, 'max_output_tokens'), false);
+  h.page.unmount();
+});
+
+test('an emptied fallback matching the new primary is not shown as a fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, emptied: true,
+    stored_value: 'secondary', recovered_value: 'big'};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'big'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  const fallbackSelect = card.split('data-model-field="fallback"')[1].split('</select>')[0];
+  assert.doesNotMatch(fallbackSelect, /value="big" selected/);
+  assert.match(fallbackSelect, /<option value="">不使用备用模型<\/option>/);
+  h.page.unmount();
+});
+
+test('resetting an explicit fallback shows the parent stored value', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'fb', inherited_value: 'sub-fb', parent_stored: 'stored-fb',
+    source: 'window', inherited_source: 'role', explicit: true, parent_stored_usable: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'sub-fb', model: '', capabilities: ['text'], max_output_tokens: 1024},
+    {id: 'stored-fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(Object.hasOwn(saved.values.changes, 'max_output_tokens'), false);
+  h.page.unmount();
+});
+
+test('following the parent for the primary revives an emptied fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'S');
+  item.fields.provider = {value: 'S', inherited_value: 'P', source: 'window',
+    inherited_source: 'role', explicit: true};
+  item.fields.fallback = {value: '', inherited_value: '', source: 'default',
+    inherited_source: 'default', explicit: false, emptied: true, recovered_value: 'S'};
+  item.fields.max_output_tokens = {value: 100, inherited_value: 100, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'S', model: '', capabilities: ['text'], max_output_tokens: 50},
+    {id: 'P', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(saved.values.changes.max_output_tokens, 50);
+  h.page.unmount();
+});
+
+test('an inherited primary does not use the parent stored fallback on reset', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'S');
+  item.fields.provider = {value: 'S', inherited_value: 'P', source: 'installation',
+    inherited_source: 'installation', explicit: false};
+  item.fields.fallback = {value: 'P', inherited_value: '', parent_stored: 'S',
+    source: 'window', inherited_source: 'role', explicit: true};
+  item.fields.max_output_tokens = {value: 100, inherited_value: 100, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'S', model: '', capabilities: ['text'], max_output_tokens: 50},
+    {id: 'P', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.deepEqual([...saved.values.reset], ['fallback']);
+  assert.equal(Object.hasOwn(saved.values.changes, 'max_output_tokens'), false);
+  h.page.unmount();
+});
+
+test('resetting a fallback with an unusable parent row leaves it unnamed', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'fb', inherited_value: '', parent_stored: 'removed-fb',
+    parent_stored_usable: false, source: 'window', inherited_source: 'role', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'fb', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /跟随上级（保存后按当前主模型解析）/);
+  assert.doesNotMatch(card, /value="removed-fb" selected/);
+  h.page.unmount();
+});
+
+test('confirming a replaced fallback value saves it explicitly', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'secondary', inherited_value: 'secondary', source: 'default',
+    inherited_source: 'default', explicit: false, replaced: true, stored_value: 'primary'};
+  data.tasks = [item];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'fallback',
+    modelKind: 'content.authoring.draft', value: 'secondary'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(saved.values.changes.fallback, 'secondary');
+  h.page.unmount();
+});
+
+test('an inherited replaced fallback uses the parent stored row when the primary moves', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'task-default', inherited_value: 'task-default', source: 'default',
+    inherited_source: 'installation', explicit: false,
+    parent_stored: 'host-fb', parent_stored_usable: true};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'task-default', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'host-fb', model: '', capabilities: ['text'], max_output_tokens: 1024},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'big'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(saved.values.changes.max_output_tokens, 1024);
+  h.page.unmount();
+});
+
+test('a stale inherited fallback keeps the recovered route when the primary moves', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'primary');
+  item.fields.fallback = {value: 'recovered-fb', inherited_value: 'recovered-fb', source: 'default',
+    inherited_source: 'installation', explicit: false,
+    parent_stored: 'removed-fb', parent_stored_usable: false};
+  item.fields.max_output_tokens = {value: 4096, inherited_value: 4096, source: 'window',
+    inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'primary', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'big', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'recovered-fb', model: '', capabilities: ['text'], max_output_tokens: 1000},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: 'big'});
+  node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'content.authoring.draft'});
+  const saved = h.requests.find(request => request.method === 'POST');
+  assert.ok(saved);
+  assert.equal(saved.values.changes.max_output_tokens, 1000);
+  h.page.unmount();
+});
+
+test('following the parent for both fields leaves a colliding fallback unnamed', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'S');
+  item.fields.provider = {value: 'S', inherited_value: 'H', source: 'window',
+    inherited_source: 'host_conversation', explicit: true};
+  item.fields.fallback = {value: 'FB', inherited_value: '', parent_stored: 'H',
+    parent_stored_usable: true, source: 'window', inherited_source: 'installation', explicit: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'S', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'H', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'FB', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  node.change('[data-model-inherit]', {modelInherit: 'fallback',
+    modelKind: 'content.authoring.draft', checked: true});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /跟随上级（保存后按当前主模型解析）/);
+  assert.doesNotMatch(card, /<option value="H" selected>/);
+  h.page.unmount();
+});
+
+test('a recovered parent primary keeps an inherited fallback unnamed', async () => {
+  const h = harness(), node = h.root(), data = status();
+  const item = editable('content.authoring.draft', 'S');
+  item.fields.provider = {value: 'S', inherited_value: 'H', source: 'window',
+    inherited_source: 'host_conversation', explicit: true};
+  item.fields.fallback = {value: 'H', inherited_value: 'H', source: 'installation',
+    inherited_source: 'installation', explicit: false,
+    parent_stored: 'H', parent_stored_usable: true};
+  data.tasks = [item];
+  data.providers = [
+    {id: 'S', model: '', capabilities: ['text'], max_output_tokens: 8192},
+    {id: 'H', model: '', capabilities: ['text'], max_output_tokens: 8192},
+  ];
+  h.page.mount(node, {sub: 'cfg'});
+  h.requests[0].resolve(data); await flush();
+  node.click('[data-model-open]', {modelOpen: 'content.authoring.draft'});
+  node.change('[data-model-field]', {modelField: 'provider',
+    modelKind: 'content.authoring.draft', value: '__inherit__'});
+  const card = node.innerHTML.split('data-fncard="content.authoring.draft"')[1].split('</article>')[0];
+  assert.match(card, /跟随上级（保存后按当前主模型解析）/);
+  h.page.unmount();
+});
+
+test('main panel Laya logs default to all sources, switch to current, and show scope/action summary', async () => {
+  const {page, node, requests} = await openLayaPage();
+  const initialLogRead = requests.find(item => item.method === 'GET' && item.route === 'model/laya/logs');
+  assert.equal(initialLogRead.params?.scope, 'all');
+  assert.match(node.innerHTML, /data-laya-logs-scope="all"[^>]*aria-pressed="true"/);
+  assert.match(node.innerHTML, /data-laya-logs-scope="current"[^>]*aria-pressed="false"/);
+
+  node.click('[data-laya-logs-scope]', {layaLogsScope: 'current'});
+  const currentRead = requests.filter(item => item.method === 'GET' && item.route === 'model/laya/logs').at(-1);
+  assert.equal(currentRead.params?.scope, 'current');
+  currentRead.resolve({
+    scope: 'current',
+    events: [{
+      status: 'ok', source: 'conversation', mode: 'remote', elapsed_ms: 145,
+      decision: {action: 'silent'}, processing: {action_confidence: 0.824},
+      scope_info: {kind: 'group', native_scope_id: '103111519'},
+      observed_at: new Date().toISOString(),
+    }],
+  });
+  await flush();
+  assert.match(node.innerHTML, /当前会话 · 最近 50 条/);
+  assert.match(node.innerHTML, /群聊 103…519/);
+  assert.match(node.innerHTML, /action=silent \(82\.4%\)/);
+
+  node.click('[data-laya-logs-scope]', {layaLogsScope: 'all'});
+  const allRead = requests.filter(item => item.method === 'GET' && item.route === 'model/laya/logs').at(-1);
+  assert.equal(allRead.params?.scope, 'all');
+  allRead.resolve({
+    scope: 'all',
+    events: [{
+      status: 'ok', source: 'role_intervention', mode: 'remote', elapsed_ms: 90,
+      decision: {intervention_need: 'none'},
+      scope_info: {kind: 'private', native_scope_id: '153000127'},
+      observed_at: new Date().toISOString(),
+    }],
+  });
+  await flush();
+  assert.match(node.innerHTML, /全部来源 · 最近 50 条/);
+  assert.match(node.innerHTML, /私聊 153…127/);
+  page.unmount();
+});
+
+test('group Laya page shows scoped group logs without scope switcher when available', async () => {
+  const h = harness(), node = h.root();
+  h.page.mount(node, {endpoint: '/astrbot_plugin_private_companion/host/targets/group/roles/role/model'});
+  h.requests[0].resolve({...status(), scope_kind: 'group'});
+  await flush();
+  node.click('[data-model-tab]', {modelTab: 'laya'});
+  h.requests.find(item => item.route.endsWith('/laya')).resolve(layaRemoteStatus());
+  const logRead = h.requests.find(item => item.route.endsWith('/laya/logs'));
+  assert.equal(logRead.params, undefined, 'group laya/logs must not pass query params');
+  logRead.resolve({
+    available: true,
+    scope_kind: 'group',
+    events: [{
+      status: 'ok', source: 'conversation', mode: 'remote', elapsed_ms: 112,
+      decision: {action: 'reply'}, processing: {action_confidence: 0.91},
+      scope_info: {kind: 'group', native_scope_id: '103111519'},
+      observed_at: new Date().toISOString(),
+    }],
+  });
+  await flush();
+
+  assert.match(node.innerHTML, /本群运行记录 · 最近 50 条/);
+  assert.match(node.innerHTML, /群聊 103…519/);
+  assert.match(node.innerHTML, /action=reply \(91\.0%\)/);
+  assert.doesNotMatch(node.innerHTML, /data-laya-logs-scope/);
+  h.page.unmount();
+});
+
+test('Laya test and preview surface 401/403 auth summary from ok-enveloped bridge failure payloads', async () => {
+  const {page, node, requests} = await openLayaPage();
+  node.click('[data-laya-test]');
+  requests.find(item => item.method === 'POST' && item.route === 'model/laya/test').resolve({
+    status: 'failed',
+    code: 'laya_auth_failed',
+    reason: 'Laya HTTP 403 · MODEL_ACCESS_DENIED: 当前模型仅对灰度用户开放',
+  });
+  await flush();
+  settleLayaRefresh(requests, []);
+  await flush();
+  assert.match(node.innerHTML, /Laya HTTP 403/);
+  assert.match(node.innerHTML, /服务端拒绝访问（403 Forbidden）/);
+  assert.match(node.innerHTML, /服务端原文：MODEL_ACCESS_DENIED: 当前模型仅对灰度用户开放/);
+
+  node.input('[data-laya-preview]', {value: 'hello'});
+  node.click('[data-laya-decide]');
+  requests.find(item => item.method === 'POST' && item.route === 'model/laya/decide').resolve({
+    status: 'failed',
+    code: 'laya_auth_failed',
+    reason: 'Laya HTTP 401 · invalid_api_key: Incorrect API key provided',
+  });
+  await flush();
+  settleLayaRefresh(requests, []);
+  await flush();
+  assert.match(node.innerHTML, /Laya HTTP 401/);
+  assert.match(node.innerHTML, /鉴权失败（401 Unauthorized）/);
+  assert.match(node.innerHTML, /服务端原文：invalid_api_key: Incorrect API key provided/);
+  page.unmount();
+});
+
+test('video narration accepts OpenAI video relay providers alongside native video models and saves fallback', async () => {
+  const h = harness(), node = h.root(), data = status();
+  data.tasks.push(editable('conversation.video_narration', 'gemini-a', ['text', 'video'], 'background'));
+  data.providers.push(
+    {id: 'gemini-a', model: 'gemini-3.8-flash', capabilities: ['text', 'video'], max_output_tokens: 8192},
+    {id: 'relay-vision', model: 'gpt-4o-video-relay', capabilities: ['text', 'image'], supports_video_relay: true, max_output_tokens: 8192},
+    {id: 'text-only', model: 'plain-llm', capabilities: ['text'], supports_video_relay: false, max_output_tokens: 8192},
+  );
+  h.page.mount(node);
+  try {
+    h.requests[0].resolve(data);
+    await flush();
+    node.click('[data-model-sub]', {modelSub: 'cfg'});
+    node.click('[data-model-cm]', {modelCm: 'precise'});
+    node.click('[data-model-view]', {modelView: 'providers'});
+    assert.match(node.innerHTML, /视觉转接视频/);
+    node.click('[data-model-view]', {modelView: 'tasks'});
+    node.click('[data-model-open]', {modelOpen: 'conversation.video_narration'});
+    const card = node.innerHTML.split('data-fncard="conversation.video_narration"')[1].split('</article>')[0];
+    assert.match(card, /<option value="gemini-a" selected>gemini-a · gemini-3\.8-flash<\/option>/);
+    assert.match(card, /<option value="relay-vision"[^>]*>relay-vision · gpt-4o-video-relay<\/option>/);
+    assert.doesNotMatch(card, /<option value="primary"|<option value="secondary"|<option value="text-only"/);
+    node.change('[data-model-field]', {modelField: 'fallback', modelKind: 'conversation.video_narration', value: 'relay-vision'});
+    node.click('[data-model-action]', {modelAction: 'save-one', modelKind: 'conversation.video_narration'});
+    const post = h.requests.find(request => request.method === 'POST');
+    assert.deepEqual({...post.values.changes}, {fallback: 'relay-vision'});
+    const savedTask = editable('conversation.video_narration', 'gemini-a', ['text', 'video'], 'background');
+    savedTask.fields.fallback = {value: 'relay-vision', inherited_value: null, explicit: true};
+    post.resolve({replayed: false, task: savedTask});
+    await flush();
+  } finally {
+    h.page.unmount();
+  }
 });

@@ -25,7 +25,8 @@ from companion_v2.adapters.astrbot.presence import OneBotPresencePort
 from companion_v2.adapters.astrbot.provider import AstrBotTextProvider, REPLY_TASK_CAPABILITIES
 from companion_v2.configuration.store import open_configuration_store
 from companion_v2.adapters.astrbot.provider_catalog import (TextProviderSettings, assemble_providers,
-    attach_native_video, loaded_routing, routed_fallback)
+    attach_native_video, loaded_routing)
+from companion_v2.model_gateway.pricing import tariff_resolver_for
 from companion_v2.adapters.astrbot.tools import CompositeAstrBotToolPort
 from companion_v2.configuration.registry import FieldRegistry
 from companion_v2.conversation.content.authoring_tasks import authoring_profiles
@@ -46,6 +47,7 @@ from companion_v2.conversation.media.image_narration import image_narration_prof
 from companion_v2.conversation.media.video.narration import video_narration_profile
 from companion_v2.conversation.media.understanding import intake_settings as file_intake_settings
 from companion_v2.screen.interpretation import screen_interpretation_profile
+from companion_v2.device.action_service import phone_profile
 from companion_v2.reality.model_profile import reality_text_profile
 from .settings import HostControlError
 from .display_names import event_person_names
@@ -77,7 +79,7 @@ from .multi_authority import HOST_ID
 from .model_settings import PROVIDER_OUTPUT_FLOOR, conversation_provider_resolver
 from .group_settings import GroupTarget
 from .group_admission import group_trigger_facts, mentioned_account_ids
-from .voice import NativeVoiceReply
+from .voice import NativeVoiceReply, singsing_config_origin, singsing_route_available
 from .relay_tools import RelayToolPort
 
 
@@ -192,16 +194,28 @@ class MultiPrivateBridge(NativePrivateBridge):
                 raise TaskError("host_client_mismatch", "private host account changed during persona lookup")
             self.client(scope)
             recipients = AudienceRef(scope, (actor.subject,))
+            from companion_v2.adapters.astrbot.voice_stt import VOICE_TRANSCRIPT_PREFIX, trusted_stt_transcript
+
+            stt_text = trusted_stt_transcript(event)
+            stt_used = False
             pieces = []
             for part in getattr(message, "message", ()):
                 kind = getattr(getattr(part, "type", None), "value", getattr(part, "type", None))
                 if kind == "Plain" and isinstance(getattr(part, "text", None), str):
-                    pieces.append(part.text)
+                    if stt_text and part.text.strip() == "[语音消息]" and not stt_used:
+                        pieces.append(VOICE_TRANSCRIPT_PREFIX + stt_text)
+                        stt_used = True
+                    else:
+                        if stt_text and stt_text in part.text:
+                            stt_used = True
+                        pieces.append(part.text)
                 elif kind in ("Face", "Mface"):
                     # A sticker is an emotional expression, not an empty message:
                     # keep a bounded marker so the model can answer the feeling
                     # instead of seeing nothing (or refusing the whole turn).
                     pieces.append("[表情]")
+            if stt_text and not stt_used:
+                pieces.append(VOICE_TRANSCRIPT_PREFIX + stt_text)
             raw_message = getattr(message, "raw_message", None)
             raw_segments = raw_message.get("message") if isinstance(raw_message, Mapping) else None
             if isinstance(raw_segments, list):
@@ -469,6 +483,18 @@ class MultiHostSession:
         self.authority.settings = settings
         self.bridge.sync_settings(settings)
 
+    def sync_native_bridge_pairs(self):
+        """Latch each platform's baseline pair once an account on it is confirmed online."""
+        private_snapshot, group_snapshot = self.native_bridge_pairs
+        for bridge, snapshot in ((self.bridge, private_snapshot), (self.bridge.groups, group_snapshot)):
+            connections = getattr(bridge, "connections", None)
+            online = connections.online_platforms() if callable(getattr(connections, "online_platforms", None)) else {}
+            for platform_id, pair in online.items():
+                # Defer recording until the first confirmed online state so swapping
+                # an unauthenticated/waiting client before first login does not look
+                # like a live adapter reload.
+                snapshot.setdefault(platform_id, pair)
+
     def __init__(self, runtime, native_context, *, settings, personas, authority, native_types,
                  provider_fingerprint, runtime_instance_id, now, native_tool_port=None, news_port=None,
                  solar_term_port=None, qzone_transport=None, balance_port=None, weather_ports=None,
@@ -503,18 +529,22 @@ class MultiHostSession:
             persona_window_snapshot_update=persona_window_snapshot_update,
             private_session_lookup=private_session_lookup,
             file_settings=lambda scope, role: file_intake_settings(runtime, scope, role))
-        # Connection refresh updates bridge.platforms in place. Keep the pairs
-        # assembled for this session so adapter reloads remain detectable.
-        self.native_bridge_pairs = (dict(self.bridge.platforms), dict(self.bridge.groups.platforms))
+        # Connection refresh updates bridge.platforms in place even when an account
+        # is still waiting/offline. Record each platform's baseline only once an
+        # account on it is confirmed online so adapter reloads remain detectable
+        # without treating a pre-login client swap as a live session reload.
+        self.native_bridge_pairs = ({}, {})
+        self.sync_native_bridge_pairs()
         from .account_recovery import AccountRecovery
         self.account_recovery = AccountRecovery(self)
+        self._tariff_resolver = tariff_resolver_for(runtime.data_root)
         self.model = AstrBotTextProvider(native_context, bridge=self.bridge,
             binding=ProviderBinding("model.text", common.provider_id, native_types.version, provider_fingerprint),
             provider_id=common.provider_id, version=native_types.version, provider_type=native_types.provider_types,
             function_tool_type=native_types.function_tool, tool_set_type=native_types.tool_set,
             tariff=common.tariff, maximum_output_tokens=max(common.max_output_tokens, PROVIDER_OUTPUT_FLOOR),
             maximum_input_estimate=common.maximum_input_estimate, output_parameter=common.output_parameter,
-            streaming=common.streaming)
+            streaming=common.streaming, tariff_resolver=self._tariff_resolver)
         self.model._current()
         self._model_defaults = TextProviderSettings(common.provider_id, common.tariff,
             max(common.max_output_tokens, PROVIDER_OUTPUT_FLOOR), common.maximum_input_estimate,
@@ -523,7 +553,7 @@ class MultiHostSession:
             text=self.model, settings=self._model_defaults)
         self.models = (self.model,) + assemble_providers(native_context, bridge=self.bridge,
             native_types=native_types, primary_id=common.provider_id, additional=common.additional_providers,
-            defaults=self._model_defaults)
+            defaults=self._model_defaults, tariff_resolver=self._tariff_resolver)
         fallback_provider_id, replacement_rules = loaded_routing(common.fallback_provider_id,
             common.replacement_rules, (model.binding.provider for model in self.models))
         profiles = (ModelTaskProfile(REPLY_KIND, Lane.FOREGROUND, common.provider_id, common.task_prompt,
@@ -547,17 +577,24 @@ class MultiHostSession:
                     image_review_profile(common.provider_id),
                     context_caption_profile(common.provider_id),
                     screen_interpretation_profile(common.provider_id),
+                    phone_profile(common.provider_id, max_output_tokens=min(1024, common.max_output_tokens)),
                     reality_text_profile(common.provider_id),
                     *authoring_profiles(common.provider_id, draft_tokens=common.max_output_tokens),
                     *writing_profiles(common.provider_id, max_output_tokens=common.max_output_tokens),
                     *((image_narration_profile(next(model.binding.provider for model in self.models
                         if "image" in model.local_provider().capabilities)),)
                       if any("image" in model.local_provider().capabilities for model in self.models) else ()),
-                    *((video_narration_profile(next(model.binding.provider for model in self.models
-                        if "video" in model.local_provider().capabilities)),)
-                      if any("video" in model.local_provider().capabilities for model in self.models) else ()))
+                    *((video_narration_profile(next(
+                        (model.binding.provider for model in self.models
+                         if "video" in model.local_provider().capabilities),
+                        next(model.binding.provider for model in self.models
+                             if model.local_provider().supports_video_relay),
+                    )),)
+                      if any("video" in model.local_provider().capabilities
+                             or model.local_provider().supports_video_relay
+                             for model in self.models) else ()))
         # The host budget is a reply budget; structural tasks register a larger default.
-        profiles = routed_fallback(with_thinking_margins(profiles), fallback_provider_id, self.models)
+        profiles = with_thinking_margins(profiles)
         modes = ["onebot_private", "onebot_group"]
         self.sender_binding = ProviderBinding("message.delivery", "astrbot-multi." + ".".join(modes),
             native_types.version, digest([runtime.installation_id, *modes]))
@@ -635,7 +672,7 @@ class MultiHostSession:
         models = assemble_providers(self.bridge.context, bridge=self.bridge, native_types=self.types,
             primary_id=self.settings.common.provider_id,
             additional=self.settings.common.additional_providers, defaults=self._model_defaults,
-            only_ids=(provider_id,))
+            only_ids=(provider_id,), tariff_resolver=self._tariff_resolver)
         return models[0].local_provider() if models else None
 
     def scope(self, target, conversation_id):
@@ -1246,6 +1283,7 @@ class MultiHostSession:
                 context_sections, expression_signal_ids = (), ()
                 perception_options = None
                 perception_context, perception_instructions, perception_guidance = "", (), ""
+                perception_style = None
                 context_materials, preparation_steps = (), ()
                 try:
                     from .core_reply_context import build_core_reply_prompt
@@ -1287,6 +1325,7 @@ class MultiHostSession:
                         perception_context = getattr(prompt, "perception_context", "")
                         perception_instructions = getattr(prompt, "perception_instructions", ())
                         perception_guidance = getattr(prompt, "perception_guidance", "")
+                        perception_style = getattr(prompt, "perception_style", None)
                         preparation_steps = ({"name": "context_build", "state": "returned",
                             "started_at": stamp(build_started_at), "finished_at": stamp(self.now()),
                             "elapsed_ms": getattr(prompt, "build_ms", None)},)
@@ -1303,6 +1342,7 @@ class MultiHostSession:
                     except Exception as error:
                         logger.warning("[CompanionV2] 表情回复准备降级 error_type=%s", type(error).__name__)
                 voice_policy, configured_voice_policy = None, None
+                singsing_enabled = False
                 is_group_repeat = group_admission and group_admission.get("reason") == "repeat"
                 if not is_group_repeat:
                     from companion_v2.conversation.voice_reply import eligible, voice_policy_for_turn
@@ -1325,8 +1365,17 @@ class MultiHostSession:
                         candidate = voice_policy_for_turn(configured_voice_policy, captured.text)
                         primary_mention = self._core_user_mention_matches(
                             event, context, candidate, captured.text, captured.at)
-                        if eligible(candidate, input_text=captured.text, kind=channel, batch_id=turn_id,
-                                     primary_mention=primary_mention):
+                        allow_singing = (getattr(self.settings.common, "voice_singsing_enabled", False)
+                                         and candidate.uses_model_tags and candidate.direction_mode != "off")
+                        voice_eligible = eligible(candidate, input_text=captured.text, kind=channel,
+                                                  batch_id=turn_id, primary_mention=primary_mention)
+                        if allow_singing and (voice_eligible or eligible(
+                                candidate, input_text=captured.text, kind=channel, batch_id=turn_id,
+                                primary_mention=primary_mention, allow_singing=True)):
+                            singsing_enabled = await singsing_route_available(
+                                self.bridge.context, event.unified_msg_origin,
+                                candidate.provider_for_language(channel), config_umo=singsing_config_origin(event))
+                        if voice_eligible or singsing_enabled:
                             if primary_mention:
                                 mention_prompt = "主要用户的已认证账号在本轮原生消息中被提及，且正文命中定向语音词。"
                                 extra_prompt = "\n".join(part for part in (
@@ -1368,6 +1417,7 @@ class MultiHostSession:
                     "perception_context": perception_context,
                     "perception_instructions": perception_instructions,
                     "perception_guidance": perception_guidance,
+                    "perception_style": perception_style,
                     "context_materials": context_materials,
                     "preparation_steps": preparation_steps,
                     "expression_signal_ids": expression_signal_ids,
@@ -1381,6 +1431,7 @@ class MultiHostSession:
                     "outbound_settings": captured_outbound_settings,
                     "astrbot_animated_image_understanding_enabled": astrbot_animated_image_understanding_enabled,
                     "voice_reply_policy": voice_policy,
+                    "voice_singsing_enabled": singsing_enabled,
                     "configured_voice_reply_policy": configured_voice_policy,
                     "voice_provider_instruction": voice_direction,
                     "reaction_reply_enabled": reaction_reply_enabled,

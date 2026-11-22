@@ -1,4 +1,4 @@
-/* 统一配置工作台 · 内核
+﻿/* 统一配置工作台 · 内核
    取代此前 reply / expression / semantic / config-editor 各自实现的保存生命周期。
    各页只声明「字段 + 作用范围 + 接口」，草稿、脏状态、幂等重试、版本冲突、
    层轨与范围来源提示由本文件统一负责。
@@ -50,12 +50,43 @@ window.CompanionWorkbench = (() => {
     configuration_window_selection_required: "此设置包含按窗口或用户关系生效的内容。请先在上方选择窗口，再查看和保存。",
     configuration_window_selection_mismatch: "此设置对应的私聊与所选窗口不同。请在上方选择需要配置的私聊窗口后编辑。",
     configuration_revision_conflict: "配置已经更新。草稿已保留，读取新版本后再核对。",
-    configuration_request_invalid: "请求格式有误，请刷新后重试。",
+    configuration_request_invalid: "请求格式有误或内容过大（角色头像上限 24 KB）。草稿已保留，请调整后再重试。",
     configuration_target_unavailable: "所选会话当前不可用，请在账号与会话中重新选择。",
     configuration_target_inactive: "所选私聊与当前配置上下文不一致，请重新选择账号与会话。",
     configuration_target_changed: "所选会话或角色已经变化，请重新读取后再操作。",
     invalid_configuration_value: "请核对数值类型与范围。",
+    invalid_probability: "请填写 0 到 1 之间的小数。",
     invalid_precision: "数值精度超出允许范围。",
+    invalid_weight: "该权重需为正数。",
+    /* 角色稳定档案的域内码：头像格式/大小与整份档案字数上限由
+       RoleProfileConfigurationOwner 校验。不映射的话，服务端的明确回绝
+       会被说成「连接没有返回保存确认」，进而把编辑器锁在待核对状态。 */
+    role_profile_configuration_invalid: "角色档案没有通过校验：头像需为 24 KB 以内的 JPEG，单个字段与整份档案都有字数上限。草稿已保留，请调整后再保存。",
+    role_profile_target_changed: "当前对象或角色绑定已变化，请重新读取后再保存。",
+    role_profile_scope_invalid: "这份角色档案只能在角色层保存，请重新选择角色后再试。",
+    relationship_profile_scope_invalid: "当前关系资料只能在私聊对象与角色绑定后保存，请选择对应私聊对象后再试。",
+    relationship_profile_target_changed: "当前私聊对象或角色绑定已变化，请重新读取后再保存。",
+    relationship_profile_configuration_invalid: "关系资料未通过校验，请核对字段格式与字数上限。",
+    relationship_profile_snapshot_invalid: "关系资料数据异常，请刷新页面后重试。",
+    system_prompt_scope_invalid: "系统提示词只能在角色层保存，请重新选择角色后再试。",
+    system_prompt_target_changed: "当前对象或角色绑定已变化，请重新读取后再保存。",
+    system_prompt_configuration_invalid: "系统提示词未通过校验，请核对内容与字数上限。",
+    /* 配置总线的存储/协议回绝：都是「没有写入」的明确答复。 */
+    configuration_storage_unavailable: "配置存储暂时不可用，这次没有写入；请稍后重新保存。",
+    configuration_operation_incomplete: "上次保存的操作回执还没写完整，请重新读取后再保存。",
+    configuration_scope_not_supported: "这一项不能保存在当前作用范围，请切换窗口或角色后再试。",
+    configuration_scope_invalid: "当前作用范围不支持这项配置，请切换窗口或角色后再试。",
+    configuration_configuration_invalid: "请提供明确且有效的配置变更。",
+    configuration_section_read_failed: "该配置分区读取失败，请稍后重试或检查插件日志。",
+    configuration_subject_mismatch: "当前配置目标与所选对象不一致，请重新选择后再试。",
+    configuration_restart_required: "该项变更需要重载或重启插件后生效。",
+    unknown_configuration_field: "这次提交包含当前分区不认识的字段，请刷新页面后再保存。",
+    unknown_configuration_group: "未知的配置分区，请刷新页面后重试。",
+    invalid_configuration_patch: "这次提交的字段有重复或冲突，请刷新页面后再保存。",
+    operation_scope_mismatch: "操作与当前作用范围不一致，请重新读取后再试。",
+    scope_installation_mismatch: "当前页面对应的安装实例已变化，请刷新页面后重试。",
+    role_binding_changed: "当前角色绑定已变化，请重新读取后再保存。",
+    supervisor_fenced: "插件运行代际已切换，请重新读取页面后再试。",
     dashboard_identity_required: "请从已登录的 AstrBot 管理界面打开陪伴小屋。",
     core_access_required: "当前账号没有管理权限。",
     staging_not_initialized: "角色数据尚未加载，请重新读取。",
@@ -65,12 +96,9 @@ window.CompanionWorkbench = (() => {
     host_binding_changed: "当前角色绑定已变化，请重新读取角色状态。",
     host_persona_changed: "角色人格已变化，请重新读取角色状态。",
     bridge_timeout: "连接超时，请核对连接后重试。",
+    bridge_unavailable: "页面还没有接上 AstrBot 管理界面；请刷新页面后再试，草稿会保留。",
     invalid_response: "返回数据不完整，请刷新核对。",
-    /* 后端已经明确拒绝的码。页面桥只转发 message（机器码），所以这些码常常
-       是以 Error.message 的身份到达的，见代码里的 isCode()。它们必须当作
-       「没有写入」处理，不能再落进 pending 里反复核对。 */
-    configuration_scope_not_supported: "这一项不支持在当前对象上保存，请按它所属的范围切换对象后再修改。",
-    unknown_configuration_field: "这项设置不属于当前分区，请刷新页面后重新核对。",
+    plugin_web_internal_error: "插件内部处理失败，这次可能没有写入；请稍后重试并核对。草稿会保留。",
     /* 宿主对未注册路由的拒绝：通常是插件更新后还没重载，或新角色路由尚未挂上。 */
     plugin_route_missing: "这个页面的接口还没挂上：插件可能刚更新但未重载，或角色路由还没生效。先刷新本页再试；仍失败就在 AstrBot 插件页重载插件。",
     route_not_found: "当前页面请求的功能路由未注册；请把插件升级到最新版并重启 AstrBot 后重新打开。",
@@ -78,11 +106,60 @@ window.CompanionWorkbench = (() => {
     /* 表达学习分区（expression-page.js）走这个内核渲染，它的域内码放在这里，
        避免分区再自带一张会与内核漂移的第二份表。 */
     expression_settings_invalid: "组合不合法：单批取样条数不能小于最低样本数，候选池不能小于每轮注入规则数；也请核对各项数值范围。",
+    expression_settings_scope_invalid: "表达学习设置不能保存在当前作用范围，请切换角色或会话后再试。",
     expression_configuration_invalid: "请提供明确的配置变更。",
+    expression_learning_scope_invalid: "表达学习策略按角色生效，请先选择已初始化的私聊角色。",
+    expression_learning_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    expression_learning_configuration_invalid: "请核对表达学习策略的数值范围与选项。",
+    expression_learning_private_scope_invalid: "私聊表达学习开关只能在已绑定的私聊对象下保存。",
+    expression_learning_private_target_changed: "当前私聊对象或角色绑定已变化，请重新读取。",
+    expression_learning_private_configuration_invalid: "请核对私聊表达学习开关配置。",
     expression_private_audience_required: "表达学习只适用于私聊对象。",
     expression_group_audience_required: "这一项只适用于群聊对象。",
     expression_owner_unavailable: "表达学习的工作区当前不可用，请重新选择对象。",
     expression_binding_changed: "当前角色绑定已变化，请重新选择后再操作。",
+    /* 生图额度 / 群图审核 / 生图偏好 / 表情检索 / 繁忙闸门 / 预算 / 网页理解 / 递话 / 空间 / 原生创作 / 私聊准入 */
+    image_quota_scope_invalid: "生图额度按安装与角色生效，请选择一个已初始化的私聊对象。",
+    image_quota_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    image_quota_configuration_invalid: "请核对生图每日额度的数值范围（-1 表示不限，0 表示禁止）。",
+    image_review_scope_invalid: "群图审核按会话生效，请选择一个已初始化的私聊对象。",
+    image_review_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    image_review_configuration_invalid: "请核对群图审核方式、尺度、置信度与超时等设置。",
+    image_review_configuration: "群图审核设置未通过校验，请核对审核方式、尺度与模型选项。",
+    image_output_scope_invalid: "生图偏好按角色生效，请选择一个已初始化的私聊对象。",
+    image_output_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    image_output_configuration_invalid: "生图偏好未通过校验，请核对触发方式、风格选项、提示词长度（不超过 4000 字）及场景预设 JSON。",
+    reaction_configuration_scope_invalid: "表情检索配置按插件安装全局生效，请使用管理员账号。",
+    reaction_configuration_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    reaction_configuration_configuration_invalid: "请核对表情检索参数与视觉复核方式。",
+    reaction_settings_invalid: "表情检索参数未通过校验，请核对候选数量、权重与门槛范围。",
+    busy_gate_scope_invalid: "繁忙闸门按会话生效，请选择一个已初始化的私聊对象。",
+    busy_gate_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    busy_gate_configuration_invalid: "请核对忙碌顺延时长与关键词配置。",
+    busy_gate_settings_invalid: "繁忙闸门的关键词需要是短词，且每一项不超过 64 个。",
+    model_budget_scope_invalid: "每日 Token 软限额按安装生效，请使用管理员账号。",
+    model_budget_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    model_budget_configuration_invalid: "请核对每日 Token 软限额开关与上限数值。",
+    model_budget_configuration: "每日 Token 软限额设置未通过校验，请核对开关与上限数值。",
+    web_understanding_scope_invalid: "网页理解按会话生效，请选择一个已初始化的私聊对象。",
+    web_understanding_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    web_understanding_configuration_invalid: "请核对网页理解开关、条数、字数与超时范围。",
+    web_understanding_invalid: "网页理解参数未通过校验，请核对条数、字数与超时范围。",
+    relay_scope_invalid: "跨窗口与跨群递话按会话生效，请选择一个已初始化的私聊对象。",
+    relay_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    relay_configuration_invalid: "请核对递话开关、字数上限、目标列表与默认转述风格。",
+    qzone_scope_invalid: "QQ 空间设置按角色生效，请选择一个已初始化的私聊对象。",
+    qzone_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    qzone_configuration_invalid: "请核对 QQ 空间开关、节流参数、置信度与各主题场景配置。",
+    qzone_scene_list_invalid: "QQ 空间主题的场景清单只能用半角逗号分隔、不能重复，且只能填该主题自己的场景；请对照该主题段落说明里的可选值。",
+    content_authoring_scope_invalid: "原生创作按角色生效，请选择一个已初始化的私聊对象。",
+    content_authoring_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    content_authoring_configuration_invalid: "请核对原生创作开关、方向说明与封面上限设置。",
+    content_authoring_invalid: "原生创作设置未通过校验，请核对创作方向与封面参数。",
+    content_cover_invalid: "作品封面设置未通过校验，请核对开关与同一版本封面上限（1 到 8）。",
+    private_access_scope_invalid: "私聊准入设置不能保存在当前作用范围，请切换对应角色或使用管理员账号。",
+    private_access_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    private_access_configuration_invalid: "请核对私聊默认权限、冷却时间与拒绝回复文案。",
     /* 撤回 / 屏幕 / 熟人卡 / 成长四个分区也走这个内核渲染，域内码同样放在这里。 */
     recall_scope_invalid: "撤回原文转写按会话生效，请选择一个已初始化的私聊对象。",
     recall_target_changed: "当前对象或角色绑定已变化，请重新读取。",
@@ -92,26 +169,37 @@ window.CompanionWorkbench = (() => {
     screen_configuration_invalid: "请核对开关与素材字数上限。",
     person_scope_invalid: "熟人卡按对象生效，请选择一个已初始化的私聊对象。",
     person_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    person_configuration_invalid: "请核对熟人卡开关、回看时长与字数上限。",
     role_growth_scope_invalid: "成长与技能按会话生效，请选择一个已初始化的私聊对象。",
     role_growth_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    role_growth_configuration_invalid: "请核对成长与技能配置参数。",
+    role_growth_skills_scope_invalid: "技能领域只能在角色层保存，请重新选择角色后再试。",
+    role_growth_skills_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    role_growth_skills_configuration_invalid: "请核对技能成长开关、日程影响强度与自定义技能领域（最多 8 项，每项不超过 24 字）。",
     growth_target_changed: "当前对象或角色绑定已变化，请重新读取后再保存。",
     /* 知识库与日记/梦境两个分区同样走这个内核渲染。 */
     knowledge_scope_invalid: "知识库按会话生效，请选择一个已初始化的私聊对象。",
     knowledge_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    knowledge_configuration_invalid: "请核对知识库开关、来源与字数上限。",
     knowledge_settings_invalid: "知识库设置不合法：单轮的引用字符上限不能小于单条素材的字数上限。",
     role_life_scope_invalid: "日记与梦境按会话生效，请选择一个已初始化的私聊对象。",
     role_life_target_changed: "当前对象或角色绑定已变化，请重新读取。",
+    role_life_configuration_invalid: "请核对日记、睡眠作息与休息判定的配置范围。",
     rest_gate_settings_invalid: "休息判定设置不合法：判定方式只能选概率或模型，时段格式形如 23:00-08:30。",
     life_timezone_invalid: "请填写有效的 IANA 时区，例如 Asia/Shanghai。",
     life_clock_invalid: "请填写二十四小时制的时刻，形如 23:50 或 00:30。",
-    /* 书架与群聊参与同样经内核渲染。书架的三个码此前只写在 config-editor.js
-       的导出表里，而那张表无人引用，页面因此会漏出裸机器码。 */
+    life_sleep_variation_invalid: "入睡浮动需为 0 到 120 分钟之间的整数。",
+    life_sleep_window_invalid: "入睡窗口需为 0 到 360 分钟之间的整数。",
+    /* 书架与群聊参与同样经内核渲染。 */
     library_scope_invalid: "书架按角色生效，请选择一个已初始化的私聊对象。",
     library_target_changed: "当前对象或角色绑定已变化，请重新读取。",
     library_configuration_invalid: "请核对开关与两项数量上限的取值范围。",
     group_participation_scope_invalid: "群聊参与按会话生效，请选择一个已初始化的私聊对象。",
     group_participation_target_changed: "当前对象或角色绑定已变化，请重新读取。",
     group_participation_configuration_invalid: "请核对群聊参与设置：概率需在 0 到 1 之间，数字项需在各自范围内；打断语只能是一行、不超过 80 字。",
+    group_participation_configuration: "群聊参与设置未通过校验，请核对概率、时间窗与打断语格式。",
+    group_participation_settings: "群聊参与设置未通过校验，请核对各项开关与数值范围。",
+    group_behavior_command_invalid: "群聊互动习惯操作参数无效，请刷新列表后重试。",
     /* 参考图与衣柜（生图分区 C1）同样经内核渲染。参考图的字段校验码来自
        分组验证器（photo_reference_*），与编辑器的 reference_* 前缀不同名。 */
     reference_scope_invalid: "参考图按角色生效，请选择一个已初始化的私聊对象。",
@@ -144,15 +232,6 @@ window.CompanionWorkbench = (() => {
   const e = value => String(value ?? "").replace(/[&<>"']/g, c =>
     ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
   const error = (code, confirmed = false) => Object.assign(new Error(code), {code, confirmed});
-  /* 读与写的等待预算分开。读取只是投影，15 s 足够，再久就该告诉用户「重新读取」；
-     写入要排宿主的 control lock、落库、轮换 edit token，把 15 s 用在同一档上
-     会让慢一点的保存全都变成「结果未确认」——那是最难处理的一种提示，因为用户
-     既不能重试也不能确认。写成功与否由 operation_key 幂等保证，等久一点不额外花代价。 */
-  const READ_TIMEOUT_MS = 15000;
-  const WRITE_TIMEOUT_MS = 60000;
-  /* 桥的默认预算是 18 s；要让它等得比页面这层更久，把读写的预算都传下去。
-     桥只接受 1000..300000 的整数，传错就会退回它自己的默认值。 */
-  const bridgeBudget = method => (method === "GET" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS);
   function relative(path) {
     if (typeof path !== "string" || !path.startsWith(PREFIX)) throw error("invalid_response");
     const route = path.slice(PREFIX.length);
@@ -177,19 +256,25 @@ window.CompanionWorkbench = (() => {
   const localized = (problem, fallback) => errors[problem?.code]
     || (isCode(problem?.message) ? errors[problem.message] : problem?.message)
     || fallback;
-  /* 「服务端已经看清请求并明确拒绝」的码：写入没有发生，重放同一个 operation_key
-     只会得到同一个拒绝。以前只认 configuration_revision_conflict，其余一律当成
-     「回执没回来」，于是页面挂上 pending、400ms 后自动重放，再失败再挂，用户
-     看到的就是「保存结果尚未确认（连接没有返回保存确认。）」且永远不结束——
-     而真相是这项设置根本不允许在角色层写。 */
-  const DEFINITIVE_CODES = new Set([
-    "configuration_scope_not_supported",
-    "unknown_configuration_field",
-    "invalid_configuration_patch",
-    "invalid_configuration_value",
-    "reply_configuration_invalid",
-    "expression_configuration_invalid",
-  ]);
+  /* 服务端的明确回绝与「结果未知」必须分开处理：
+     - 明确回绝：待核对请求必须结束，否则一次校验失败就把编辑器永久锁死；
+     - 结果未知：请求可能已落库，继续沿用同一个操作标识核对，不能重发新请求。
+
+     AstrBot 的页面桥把 `{status:"error", message:<机器码>}` 压成
+     `new Error(<机器码>)`，`code` 与 `confirmed` 都会丢。所以 `message`
+     是映射表里的机器码时，仍按「服务端已明确回绝」处理。
+     连接层与宿主内部错误不在其列：那两种情况下写入可能已经发生。 */
+  const UNCERTAIN_CODES = new Set(["bridge_timeout", "bridge_unavailable",
+    "invalid_response", "plugin_web_internal_error", "dashboard_bridge_not_ready",
+    "timeout", "request_timeout", "network_error", "canceled", "cancelled", "aborted"]);
+  const isUncertainCode = code => typeof code !== "string" || !code
+    || UNCERTAIN_CODES.has(code) || code.startsWith("bridge_")
+    || code.startsWith("dashboard_bridge_");
+  /* 回绝原因：优先用映射表；未映射的机器码原样带上，方便对照插件日志，
+     不再落进「连接没有返回保存确认」这种误导性的兜底。 */
+  const refusalNotice = (problem, code) => localized(problem, "")
+    || (code ? `保存没有通过（错误码：${code}），草稿已保留，请按提示调整后再试。`
+      : "保存没有通过，草稿已保留，请按提示调整后再试。");
   const icon = name => `<i data-lucide="${name}" aria-hidden="true"></i>`;
   let instanceSequence = 0;
   /* Short-lived stale-while-revalidate cache for workbench reads.  Page
@@ -788,7 +873,7 @@ window.CompanionWorkbench = (() => {
         + "<button type=\"button\" data-wb-word-remove=\"" + e(item.name) + "\""
         + " data-wb-word-index=\"" + index + "\" aria-label=\"删除 "
         + e(wordLabel(word)) + "\" title=\"删除\""
-        + (locked || words.length <= (policy.minItems || 0) ? " disabled" : "")
+        + (words.length <= (policy.minItems || 0) ? " disabled" : "")
         + ">" + icon("x") + "</button></span>").join("");
       const specialLabels = {newline: "换行", space: "空格", tab: "制表符"};
       const specialWords = {newline: "\n", space: " ", tab: "\t"};
@@ -1007,10 +1092,13 @@ window.CompanionWorkbench = (() => {
       return `<div class="wb-textarea-wrap">${textarea}<span class="wb-text-length${count > item.maximumChars ? " is-over-limit" : ""}" data-wb-counter="${e(item.name)}">${count} / ${e(item.maximumChars)} 字</span></div>`;
     }
     const shown = e(toDisplay(item, value));
-    const step = item.kind === "int" ? "1" : String(1 / Math.pow(10, item.decimals));
+    /* 0–1 的概率在界面上按百分数编辑：步长与上下界也必须换算，
+       否则输入框写着 100%，下面却提示 0–1、每次只能加减 0.01。 */
+    const percent = item.kind === "float" && item.maximum === 1 && item.minimum === 0;
+    const step = percent ? "1" : item.kind === "int" ? "1" : String(1 / Math.pow(10, item.decimals));
     const bounds = item.hasBounds
-      ? `<span class="wb-range">${e(item.minimum)} – ${e(item.maximum)}</span>` : "";
-    const unit = item.kind === "float" && item.maximum === 1 && item.minimum === 0 ? " %" : "";
+      ? `<span class="wb-range">${e(toDisplay(item, item.minimum))} – ${e(toDisplay(item, item.maximum))}${percent ? "%" : ""}</span>` : "";
+    const unit = percent ? " %" : "";
     return `<span class="wb-number"><input type="number" data-wb-field="${e(item.name)}"`
       + ` min="${e(toDisplay(item, item.minimum))}" max="${e(toDisplay(item, item.maximum))}"`
       + ` step="${e(step)}" value="${shown}"${dis}>${unit ? `<span class="wb-unit">${unit.trim()}</span>` : ""}${bounds}</span>`;
@@ -1022,8 +1110,7 @@ window.CompanionWorkbench = (() => {
     const value = state.draft[name];
     const provenance = state.status?.provenance?.[name] || {};
     const inherited = provenance.explicit === false && provenance.layer !== null;
-    const layerEditable = item.noWriteLayer ? false
-      : !item.editable.length || item.editable.includes(item.writeLayer || container.writeLayer);
+    const layerEditable = !item.editable.length || item.editable.includes(item.writeLayer || container.writeLayer);
     const locked = state.locked() || !layerEditable;
     const label = e(item.label || name);
     const reset = inherited && !locked
@@ -1039,13 +1126,7 @@ window.CompanionWorkbench = (() => {
     return `<div class="wb-field${dirty}${inheritClass}${layerEditable ? "" : " is-layer-locked"}" data-wb-row="${e(name)}"${visible ? "" : " hidden"}>`
       + (container.presentation === "journal" ? "" : railMarkup(state, name, item, state.status?.provenance, container))
       + `<div class="wb-field-main"><span class="wb-label">${label}${fieldScopeMarkup(state, name, item, state.status?.provenance, container)}</span>`
-      + (item.help && container.presentation !== "journal" ? `<p class="wb-help" id="${e(helpId)}">${e(item.help)}</p>` : "")
-      /* 后端声明这一项在当前对象上不可写（`editable_layers` 不含本层）时，
-         控件是灰的：再让用户点保存只会换来一次必然失败的请求。灰掉的同时说清
-         「为什么、去哪里改」，否则用户只知道点不动。分区可以用 lockedHints
-         覆盖这句话。 */
-      + (!layerEditable ? `<p class="wb-help wb-locked-hint">${icon("lock")}${e(item.lockedHint
-        || "这一项在当前对象上不可写，请切换到它所属的对象后再修改。")}</p>` : "")
+      + (item.help && container.presentation !== "journal" ? `<p class="wb-help" id="${e(helpId)}" title="${e(item.help)}">${e(item.help)}</p>` : "")
       + `<div class="wb-control">${controlMarkup(item, value, locked, state)}</div>`
       + `<p class="wb-field-error" id="${e(errorId)}" data-wb-field-error></p></div>`
       + `<div class="wb-field-side">${reset}</div></div>`;
@@ -1068,7 +1149,7 @@ window.CompanionWorkbench = (() => {
         /* 原来这里左侧还有一块 3:4 的虚线「像位」，只画姓名首字：
            它不读头像、不可点击、对屏幕阅读器隐藏，纯粹占掉 96px 宽。
            删掉这一格，六项基础身份按同一套紧凑两列排下去。 */
-        const identityFields = ["name", "gender", "birthday", "age", "species", "occupation"];
+        const identityFields = ["name", "gender", "birthday", "age", "occupation", "species"];
         rows = `<div class="wb-identity-card"><div class="wb-identity-rows">${identityFields.filter(name => names.includes(name))
             .map(name => fieldMarkup(s, container, name)).join("")}</div></div>`
           + names.filter(name => !identityFields.includes(name)).map(name => fieldMarkup(s, container, name)).join("");
@@ -1157,7 +1238,11 @@ window.CompanionWorkbench = (() => {
     return `<section class="wb-card${journal ? " wb-journal" : ""}" data-wb-card="${e(container.group)}">`
       + heading + `<div class="wb-card-body">`
        + (s.pending ? `<div class="wb-pending"><p>${e(pendingText)}</p>`
-           + `<button type="button" class="button small" data-wb-action="retry"${s.busy ? " disabled" : ""}>核对原保存结果</button></div>` : "")
+           + `<div class="wb-pending-actions">`
+           + `<button type="button" class="button small" data-wb-action="retry"${s.busy ? " disabled" : ""}>核对原保存结果</button>`
+           + `<button type="button" class="button small" data-wb-action="abandon"${s.busy ? " disabled" : ""}`
+           + ` title="不再核对这次请求，读取服务端当前值；草稿会保留">放弃核对并重新读取</button>`
+           + `</div></div>` : "")
       + legend + body
       + `<div class="wb-actions">`
       + `<span class="wb-save-context"><button type="button" class="wb-save${s.busy ? " is-busy" : ""}${s.savedState || ""}"`
@@ -1182,6 +1267,8 @@ window.CompanionWorkbench = (() => {
     return `<div class="wb-notice${tone}" role="status" aria-live="polite">`
       + `${icon(state.bad ? "alert-circle" : state.ok ? "check-circle-2" : "info")}`
       + `<span>${e(state.notice)}</span>`
+      + (state.restrictionCode?.startsWith("configuration_window_selection_")
+        ? `<button type="button" class="button small primary" data-wb-action="pick-window">选择窗口</button>` : "")
       + (state.stale ? `<button type="button" class="button small" data-wb-action="reconcile"${state.busy || state.loading || state.pending ? " disabled" : ""}>核对最新配置</button>` : "")
       + (!state.status && !state.stale ? `<button type="button" class="button small" data-wb-action="reload"${state.busy || state.loading ? " disabled" : ""}>重新读取</button>` : "")
       + `</div>`;
@@ -1191,9 +1278,6 @@ window.CompanionWorkbench = (() => {
   function create(spec) {
     const {
       group, title, note = "", labels = {}, helps = {}, choices = {}, sections = null,
-      /* 按对象不可写的字段可以在这里配一句更具体的「去哪改」；没配的字段会显示
-         通用说明。两者都只影响提示文案，不改变可用性判断。 */
-      lockedHints = {},
       catalogs = {}, rows = {}, inputs = {}, suggestions = {}, segmentedChoices = [],
       visibility = {}, listFields = {}, chipOptions = {}, navigationLimit = 8,
       presentation = "", sectionTabPrefix = "", initialSection = null,
@@ -1240,7 +1324,7 @@ window.CompanionWorkbench = (() => {
        status: null, draft: null, base: null, pending: null, pendingReason: "",
       busy: false, loading: false, denied: false, stale: false, conflicts: {},
       notice: "", bad: false, ok: false, savedState: "", ticket: 0,
-      drawRails: true, container: null, timer: null,
+      drawRails: true, container: null, timer: null, restrictionCode: "",
       instanceId: `wb-${++instanceSequence}`, activeGroupId: initialSection, resetFields: [],
       visibleGroupIds: null,
     };
@@ -1248,8 +1332,6 @@ window.CompanionWorkbench = (() => {
        而不是留一份与继承值相同的显式副本。 */
     let resets_ = [];
     let autoRecoveryKey = "";
-    /* notifyStatus() 用：上一次推给订阅者的快照引用。 */
-    let lastNotified = null;
     let autoRecoveryTimer = null;
 
     const locked = () => state.busy || state.loading || !!state.pending || !state.status || state.denied;
@@ -1349,12 +1431,7 @@ window.CompanionWorkbench = (() => {
         fields[name] = contract(name, definitions[name], choices[name] || null);
         fields[name].label = labels[name] || name;
         fields[name].help = helps[name] || "";
-        fields[name].lockedHint = lockedHints[name] || "";
         fields[name].writeLayer = definitions[name].write_layer || "";
-        /* 分区显式写 `write_layer: null` 表示「这一项在当前对象上不接受写入」
-           （reply 分区对按群聊落库的字段就是这么标的）。缺省（undefined）只表示
-           分区没声明写入层，仍按继承链最后一层渲染——两者不能混为一谈。 */
-        fields[name].noWriteLayer = definitions[name].write_layer === null;
         /* 目录型控件（选项来自读取结果，如 TTS 扩展）与多行文本框行数。 */
         if (typeof catalogs[name] === "function") fields[name].catalog = catalogs[name];
         if (rows[name]) fields[name].rows = rows[name];
@@ -1425,27 +1502,9 @@ window.CompanionWorkbench = (() => {
            `path`（`route` 算完就被丢掉），于是宿主再拼一次插件名 →
            「未找到该路由」+「Plugin bridge endpoint is invalid.」。
            同一约定见 product-page.js 的 relative() 注释。 */
-        /* 写请求给的时间比读长：一次配置写入要在宿主的 control lock 里排队、落库、
-           轮换 edit token；服务器一慢（实测单次读取从 0.06 s 到 7.8 s 都有）就会
-           顶到 15 s，于是明明已经写进去的一次保存被报成「没有返回保存确认」。
-           真没回也不丢：pending 落在 sessionStorage，save() 立刻自核对一次。 */
-        const budget = method === "GET" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS;
-        /* options 透给桥，product-page.js 才会按同一个预算去等宿主；
-           只改页面这层的话，桥仍会在 18 s 时先报超时。 */
-        const options = {timeoutMs: bridgeBudget(method)};
         const response = await Promise.race([
-          method === "GET" ? bridge.apiGet(route, query || body, options)
-            : bridge.apiPost(route, body, options),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              /* 桥自己也会超时并抛 bridge_timeout；谁先到就记谁，核对后的提示语
-                 才说得清是本地这层先放弃，还是连宿主的回执都没等到。 */
-              const late = error("bridge_timeout");
-              late.timeoutMs = budget;
-              late.timeoutStage = "page";
-              reject(late);
-            }, budget);
-          }),
+          method === "GET" ? bridge.apiGet(route, query || body) : bridge.apiPost(route, body),
+          new Promise((_, reject) => {timer = setTimeout(() => reject(error("bridge_timeout")), 15000);}),
         ]);
         const wrapped = isEnvelope(response) ? response : isEnvelope(response?.data) ? response.data : null;
         if (wrapped?.status === "error") throw error(codeOf(wrapped) || "invalid_response", true);
@@ -1466,6 +1525,11 @@ window.CompanionWorkbench = (() => {
         if (typeof problem?.message === "string" && /未找到该路由|route not found/i.test(problem.message)) {
           throw error("plugin_route_missing");
         }
+        /* 页面桥只把信封里的 message 转发过来：机器码落在 Error.message 上，
+           code 与 confirmed 都没有。认识的域内码说明服务端确实回过话，补上
+           confirmed，保存循环才会按「明确回绝」结束，而不是无限核对。 */
+        const routed = !problem?.code && isCode(problem?.message) ? problem.message : "";
+        if (routed && errors[routed] && !isUncertainCode(routed)) throw error(routed, true);
         throw problem;
       } finally { clearTimeout(timer); }
     }
@@ -1514,15 +1578,6 @@ window.CompanionWorkbench = (() => {
         }
         return `${label}要填数字${item?.decimals ? `，最多 ${item.decimals} 位小数` : "，不能带小数"}。`;
       }
-      /* 账号 ID 列表：后端只收 ASCII 十进制、不带前导零的短数字串。
-         不在这里单独说清楚，用户看到的只会是「取值不合法，请核对」。 */
-      if (item?.input === "word-list" && item?.listPolicy?.numericIds) {
-        const words = parseStringList(value) || [];
-        const bad = words.find(word => !/^[0-9]+$/.test(word) || word.startsWith("0"));
-        if (bad !== undefined) {
-          return `${label}只填账号 ID（一串数字，不以 0 开头）：${visibleToken(bad) || "空条目"} 不是账号 ID。`;
-        }
-      }
       if (item?.hasBounds) {
         return `${label}的取值要在 ${toDisplay(item, item.minimum)} 到 ${toDisplay(item, item.maximum)} 之间。`;
       }
@@ -1556,22 +1611,8 @@ window.CompanionWorkbench = (() => {
       row.querySelector("[data-wb-field]")?.setAttribute?.("aria-invalid", "false");
     }
 
-    /* 只把「快照本身」推给订阅者，而且只在快照换了一帧时才推。
-       订阅者（决策页卡片、表达页预览）在自己的回调里会重画、甚至再读一次；
-       如果每次 paint 都推，就是「推→重画→再推」的死循环——同一次读取会
-       一连发十几个请求，界面也会停在半路。真实快照的引用只在读取与保存成功时
-       换新，按引用比较就足够跳过这些重入。 */
-    function notifyStatus() {
-      if (!onStatus) return;
-      const snapshot = state.status || null;
-      if (snapshot === lastNotified) return;
-      lastNotified = snapshot;
-      try { onStatus(snapshot); } catch (_) {}
-    }
-
     function paint() {
       const root = mountPoint();
-      notifyStatus();
       if (!root) return;
       if (!state.status && !state.loading) {
         root.innerHTML = noticeMarkup(state);
@@ -1644,8 +1685,8 @@ window.CompanionWorkbench = (() => {
 
     function selectSection(id, focus = false) {
       const groups = state.container?.groups || [];
-      if (presentation === "journal" && !state.container) {
-        state.activeGroupId = id;
+      if (!state.container) {
+        if (!state.visibleGroupIds || state.visibleGroupIds.has(id)) state.activeGroupId = id;
         return;
       }
       if (!groups.some(group => group.id === id)
@@ -2087,6 +2128,20 @@ window.CompanionWorkbench = (() => {
       if (!action) return;
       if (action === "save") { void save(false); return; }
       if (action === "retry") { void save(true); return; }
+      if (action === "abandon") { void abandonPending(); return; }
+      if (action === "pick-window") {
+        const picker = document.querySelector("[data-role-window]");
+        if (picker) {
+          picker.scrollIntoView?.({behavior: "smooth", block: "center"});
+          picker.focus?.({preventScroll: true});
+          try { picker.showPicker?.(); } catch (_) {}
+        } else {
+          document.querySelector("#shellPanel")?.scrollIntoView?.({behavior: "smooth", block: "start"});
+          state.notice = "请先在页面顶部的「会话」中选择窗口。";
+          state.bad = false; paint();
+        }
+        return;
+      }
       if (action === "reload") { void refresh({force: true}); return; }
       if (action === "reconcile") { void refresh(); return; }
       if (action === "reset") {
@@ -2132,14 +2187,6 @@ window.CompanionWorkbench = (() => {
       }
       if (words.length >= (policy.maxItems || 80)) {
         state.notice = `这个列表最多添加 ${policy.maxItems || 80} 项。`;
-        state.bad = true; state.ok = false; paint();
-        return;
-      }
-      /* 账号 ID 类词条在加入时就按后端的规则挡一次：等到点保存才被拒，
-         用户会看见「保存结果尚未确认」那种更像故障的提示。规则与 valid()
-         的同名字段一致（ASCII 十进制、不以 0 开头、20 位以内）。 */
-      if (policy.numericIds && (!/^[0-9]+$/.test(word) || word.startsWith("0") || word.length > 20)) {
-        state.notice = "主要成员只填账号 ID：一串数字，不以 0 开头，20 位以内（例如 123456789）。";
         state.bad = true; state.ok = false; paint();
         return;
       }
@@ -2629,6 +2676,7 @@ window.CompanionWorkbench = (() => {
           }
         }
         state.denied = false; state.bad = false;
+        state.restrictionCode = "";
         if (recoveredConflict) {
           state.bad = true;
           state.notice = "上次保存遇到配置版本冲突，服务端没有写入；草稿已恢复，请核对后重新保存。";
@@ -2645,6 +2693,7 @@ window.CompanionWorkbench = (() => {
         else if (retried) state.notice = "";
         state.loading = false;
         paint();
+        if (onStatus) onStatus(value);
         if (state.pending) scheduleAutoRecovery(state.pending.operation_key, ticket);
         schedule();
         if (usedCache && !prefetched) {
@@ -2670,6 +2719,9 @@ window.CompanionWorkbench = (() => {
         state.stale = preserveDraft;
         state.loading = false;
         state.denied = true; state.bad = true;
+        const problemCode = typeof problem?.code === "string" ? problem.code : "";
+        state.restrictionCode = problemCode.startsWith("configuration_window_selection_")
+          ? problemCode : "";
         state.notice = localized(problem, "暂时无法读取。请重新读取角色状态后重试。");
         paint();
       }
@@ -2678,7 +2730,8 @@ window.CompanionWorkbench = (() => {
     async function save(retry) {
       const restriction = state.status && statusRestriction?.(state.status);
       if (restriction) {
-        state.denied = true; state.notice = localized(error(restriction)); state.bad = false; paint(); return;
+        state.denied = true; state.restrictionCode = restriction;
+        state.notice = localized(error(restriction)); state.bad = false; paint(); return;
       }
       if (state.busy || state.loading || state.denied) return;
        if (!retry) {
@@ -2718,22 +2771,6 @@ window.CompanionWorkbench = (() => {
         const changes = {};
         for (const [name, value] of Object.entries(state.draft)) {
           if (value !== state.base[name]) changes[wireName(name)] = value;
-        }
-        /* 当前对象上不可写的字段（按群聊落库的那种）不进请求：控件已经灰掉，
-           走到这里说明草稿是更早的一次编辑或会话恢复带来的。发出去只会被后端
-           以 configuration_scope_not_supported 拒绝，用户却要等一轮往返。 */
-        const blocked = Object.keys(state.draft)
-          .filter(name => state.container.fields[name]?.noWriteLayer && state.draft[name] !== state.base?.[name]);
-        if (blocked.length) {
-          const first = blocked[0];
-          state.bad = false;
-          state.notice = state.container.fields[first]?.lockedHint
-            || errors.configuration_scope_not_supported;
-          paint();
-          /* 说明已经写在这一行下面，把视线带过去就够了；灰掉的控件不该标成
-             「填错了」——它根本没有可填的入口。 */
-          fieldRow(first)?.scrollIntoView?.({block: "center", behavior: REDUCED() ? "auto" : "smooth"});
-          return;
         }
         /* 恢复继承：这些字段要显式告诉后端「清掉本层的值」，
            而不是写一份和继承值相同的副本。 */
@@ -2801,6 +2838,7 @@ window.CompanionWorkbench = (() => {
           state.stale = false;
           state.conflicts = {};
           resets_ = [];
+          if (onStatus) onStatus(fresh);
         }
         /* 🔴 保存成功后广播「这个分区已落盘」。
          *
@@ -2844,31 +2882,21 @@ window.CompanionWorkbench = (() => {
         state.busy = false;
         state.bad = true;
         const problemCode = problem?.code || (isCode(problem?.message) ? problem.message : "");
-        /* 只有「真的没等到回执」才该落进 pending 去核对。服务端明确拒绝的码
-           （作用范围不支持、字段不认识、值不合法……）一律算没有写入：继续用同一个
-           operation_key 核对只会拿到同一个拒绝，却会把「保存结果尚未确认」挂成
-           常态。桥只转发 message，所以这些码多数情况下是从 message 认出来的。 */
-        const definitive = problem.confirmed || problemCode === "configuration_revision_conflict"
-          || DEFINITIVE_CODES.has(problemCode);
-        if (definitive) {
+        const conflict = problemCode === "configuration_revision_conflict";
+        /* 明确回绝：服务端已答复「没有写入」，待核对请求到此为止；草稿保留，
+           用户改完可以重新保存。只有连接层/宿主内部错误才继续等待核对——
+           那两种情况写入可能已经落库，重发会变成第二次写。 */
+        const refused = problem.confirmed || conflict
+          || (!!problemCode && !isUncertainCode(problemCode));
+        if (refused) {
            state.pending = null; state.pendingReason = ""; savePending();
            clearAutoRecovery(request.operation_key);
-           state.stale = problemCode === "configuration_revision_conflict";
-           state.notice = localized(problem, "保存未通过。请读取当前设置后核对。");
+           state.stale = conflict;
+           state.notice = conflict
+             ? localized(problem, "配置已经更新。草稿已保留，读取新版本后再核对。")
+             : refusalNotice(problem, problemCode);
         } else {
-           /* 「没有返回保存确认」最容易被误读成「写入失败」，而它其实只是没等到回执：
-              宿主的写请求要排 control lock，慢一点就会被页面这层的超时先截断，
-              写完的那次保存于是被报成未确认。写是幂等的（operation_key + edit_token），
-              所以确认结果不是失败：先挂着 pending 立刻核对一次，核对到就显示「已确认」，
-              核不到才把「结果未确认」留给用户。用户点「核对原保存结果」走的是同一条路径。 */
-           /* 原因仍以连接层的既有说法开头（「连接超时，请核对连接后重试。」这类
-              文案来自 errors 表，用户和测试都认得）；只有真的量到等待时长时才补一句
-              「等了多少秒、是谁先放弃」，说明这次不是写入失败而是没等到回执。 */
-           const base = localized(problem, "连接没有返回保存确认。");
-           const waited = Math.round((problem?.timeoutMs || 0) / 1000);
-           state.pendingReason = problemCode === "bridge_timeout" && waited
-             ? `${base}已等 ${waited} 秒${problem?.timeoutStage === "page" ? "（页面先放弃等待）" : ""}，正在核对`
-             : base;
+           state.pendingReason = localized(problem, "连接没有返回保存确认。");
            state.pending.pending_reason = state.pendingReason.slice(0, 512);
            if (problemCode) state.pending.pending_reason_code = problemCode.slice(0, 80);
            savePending();
@@ -2879,6 +2907,22 @@ window.CompanionWorkbench = (() => {
          }
         paint();
       }
+    }
+
+    /* 自动核对一直失败时，不能把编辑器永久锁在待核对状态。放弃这次请求并
+       重新读取：由服务端当前值回答「那次到底写没写」，草稿保留；如果服务端
+       值已经变了，refresh 会把它标成冲突让用户逐项选择。 */
+    async function abandonPending() {
+      if (!state.pending || state.busy || state.loading) return;
+      const operationKey = state.pending.operation_key;
+      state.pending = null;
+      state.pendingReason = "";
+      savePending();
+      clearAutoRecovery(operationKey);
+      state.notice = "已放弃核对这次请求，正在读取服务端当前配置；草稿会保留。";
+      state.bad = false; state.ok = false;
+      paint();
+      await refresh({force: true, allowCache: false});
     }
 
     async function saveField(name, value) {
@@ -2978,9 +3022,17 @@ window.CompanionWorkbench = (() => {
     }
 
     async function saveBeforeLeave() {
-      if (state.pending) return {error: '上次保存结果待核对，请回到这项配置核对原请求。'};
       if (state.busy || state.loading) return {error: '这项配置正在处理，请稍后再保存。'};
-      await save(false);
+      /* 有待核对请求时，「保存并切换」必须真的用原请求去核对——原来直接
+         回一句「请回到这项配置」，而弹窗本身就把人挡在离开动作前，等于没有
+         出路。核对成功就继续切换；仍然未知才把原因带回弹窗。 */
+      if (state.pending) {
+        await save(true);
+      } else {
+        await save(false);
+        /* 新保存的结果没回来时，自动核对也等不及；这里立即沿用同一请求核对一次。 */
+        if (state.pending) await save(true);
+      }
       return !dirty() && !state.pending ? true
         : {error: state.notice || state.pendingReason || '保存尚未确认，改动已保留，请回到配置中检查。'};
     }
@@ -2990,8 +3042,13 @@ window.CompanionWorkbench = (() => {
       state.draft = state.base ? draftFrom(state.base, state.status) : null;
       resets_ = [];
       state.conflicts = {}; state.stale = false;
-      // An unanswered request stays in sessionStorage for later reconciliation.
+      /* 用户明确选择放弃时，待核对请求也一起结束：不再让它在下次挂载时
+         重新把编辑器锁住；下一次读取会用服务端的当前值回答「到底写没写」，
+         服务端已经把值写进去的话会直接出现在基线上。 */
+      if (state.pending) clearAutoRecovery(state.pending.operation_key);
       state.pending = null;
+      state.pendingReason = "";
+      savePending();
       state.notice = ''; state.bad = false;
       paint();
       return true;
@@ -3019,3 +3076,4 @@ window.CompanionWorkbench = (() => {
       } catch { return []; }
     })};
 })();
+

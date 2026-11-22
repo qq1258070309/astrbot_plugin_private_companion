@@ -14,6 +14,23 @@ from companion_v2.foundation.outcome import Outcome
 
 
 CORE_REPLY_CONTEXT_EXTRA = "_companion_v2_core_reply_context"
+# Pre-send verification rejections that intentionally silence an outbound reply
+# rather than representing a transport or authorization fault. Suppressing them
+# cleanly at the send boundary avoids bubbling unhandled TaskError tracebacks
+# into AstrBot's RespondStage.
+SILENT_SEND_DENIAL_CODES = frozenset({"message_withdrawn"})
+
+
+def _is_silent_send_denial(error: BaseException) -> bool:
+    return isinstance(error, TaskError) and error.code in SILENT_SEND_DENIAL_CODES
+
+
+def _clear_suppressed_result_chain(event: Any) -> None:
+    getter = getattr(event, "get_result", None)
+    result = getter() if callable(getter) else None
+    chain = getattr(result, "chain", None)
+    if isinstance(chain, list):
+        chain.clear()
 
 
 Authorize = Callable[[Any], Awaitable[Any]]
@@ -229,8 +246,12 @@ def prepare_core_reply_event(
         async def authorized_send(message: Any, *args: Any, **kwargs: Any) -> Any:
             try:
                 return await guarded_send(message, *args, **kwargs)
-            except BaseException:
+            except BaseException as error:
                 finish_core_reply_presence(event, force=True)
+                if _is_silent_send_denial(error):
+                    state["silent_suppressed"] = True
+                    _clear_suppressed_result_chain(event)
+                    return None
                 raise
 
         async def guarded_send(message: Any, *args: Any, **kwargs: Any) -> Any:
@@ -253,10 +274,13 @@ def prepare_core_reply_event(
                 if message is None:
                     return None
                 return await state["_original_send"](message, *args, **kwargs)
-            if state.get("group_participation", {}).get("mode") == "skip":
+            if state.get("silent_suppressed") or state.get("group_participation", {}).get("mode") == "skip":
                 return None
             if state["send_unknown"]:
                 raise TaskError("core_reply_delivery_unknown", "the platform send outcome is unknown; do not replay this reply")
+            if state.get("_prepared_decoration"):
+                from .core_reply_segmentation import unwrap_core_forward_node
+                message = unwrap_core_forward_node(event, message)
             from .core_reply_idempotency import NATIVE_TOOL_CHECKED_ATTR, should_drop_native_tool_response
             native_tool_checked = getattr(message, NATIVE_TOOL_CHECKED_ATTR, False)
             from .core_reply_reaction_delivery import capture_core_reaction_intent
@@ -279,12 +303,13 @@ def prepare_core_reply_event(
                                    state.get("voice_segment_count", 1))
                 if isawaitable(message):
                     message = await message
-            from .core_reply_media_delivery import native_reply_messages, native_wire_message
+            from .core_reply_media_delivery import is_optional_singing_message, native_reply_messages, native_wire_message
             from .core_reply_voice import commit_pending_voice_claim, release_pending_voice_claim
             from .core_reply_idempotency import (record_core_reply_delivery,
                                                   should_drop_core_reply_duplicate)
             result = None
-            for part in native_reply_messages(event, message):
+            outbound_parts = native_reply_messages(event, message)
+            for part in outbound_parts:
                 # A repeat right after an accepted body is the same delivery twice.
                 # Only this guarded native loop is compared: send_streaming paths
                 # that do not re-enter it (native streaming bubbles) are not seen.
@@ -304,18 +329,22 @@ def prepare_core_reply_event(
                 from .core_reply_behavior import observe_core_behavior_delivery
                 observe_core_behavior_delivery(event, part, "started")
                 try:
-                    result = await state["_original_send"](wire, *args, **kwargs)
+                    send_result = await state["_original_send"](wire, *args, **kwargs)
                 except BaseException:
                     state["send_unknown"] += 1
                     notify_delivery("unknown")
                     observe_core_behavior_delivery(event, part, "unknown")
                     raise
-                if result is False:
+                if send_result is False:
                     release_pending_voice_claim(event)
+                    if is_optional_singing_message(part):
+                        observe_core_behavior_delivery(event, part, "failed")
+                        break
                     state["send_failed"] += 1
                     notify_delivery("failed")
                     observe_core_behavior_delivery(event, part, "failed")
                     raise TaskError("core_reply_platform_unavailable", "the platform did not accept this reply")
+                result = send_result
                 state["send_returns"] += 1
                 record_core_reply_delivery(event, part)
                 from astrbot.core.message.components import Record
@@ -329,6 +358,49 @@ def prepare_core_reply_event(
                     observe_core_reaction_returned(event, part, submit=state.get("media_submit"))
                 except Exception:
                     pass
+            # In the default separate-after mode, the text has already been
+            # accepted by the platform.  Retrieve the optional image only now,
+            # then deliver it as its own native message so retrieval latency
+            # cannot delay the final text segment.
+            if any(sent_core_text(part).strip() for part in outbound_parts):
+                from .core_reply_reaction_delivery import prepare_deferred_core_reaction_image
+                attachment = await prepare_deferred_core_reaction_image(
+                    event, authorize=authorize_delivery)
+                if attachment is not None:
+                    part = attachment
+                    try:
+                        await authorize_delivery()
+                        wire = await native_wire_message(event, part)
+                        assert_core_reply_connection(event)
+                    except BaseException:
+                        release_pending_voice_claim(event)
+                        raise
+                    state["send_attempts"] += 1
+                    notify_delivery("started")
+                    from .core_reply_behavior import observe_core_behavior_delivery
+                    observe_core_behavior_delivery(event, part, "started")
+                    try:
+                        result = await state["_original_send"](wire, *args, **kwargs)
+                    except BaseException:
+                        state["send_unknown"] += 1
+                        notify_delivery("unknown")
+                        observe_core_behavior_delivery(event, part, "unknown")
+                        raise
+                    if result is False:
+                        release_pending_voice_claim(event)
+                        state["send_failed"] += 1
+                        notify_delivery("failed")
+                        observe_core_behavior_delivery(event, part, "failed")
+                        raise TaskError("core_reply_platform_unavailable", "the platform did not accept this reply")
+                    state["send_returns"] += 1
+                    record_core_reply_delivery(event, part)
+                    notify_delivery("returned")
+                    observe_core_behavior_delivery(event, part, "returned")
+                    try:
+                        from .core_reply_reaction_delivery import observe_core_reaction_returned
+                        observe_core_reaction_returned(event, part, submit=state.get("media_submit"))
+                    except Exception:
+                        pass
             return result
 
         def notify_delivery(stage: str) -> None:
@@ -354,8 +426,12 @@ def prepare_core_reply_event(
         async def authorized_streaming(*args: Any, **kwargs: Any) -> Any:
             try:
                 return await guarded_streaming(*args, **kwargs)
-            except BaseException:
+            except BaseException as error:
                 finish_core_reply_presence(event, force=True)
+                if _is_silent_send_denial(error):
+                    state["silent_suppressed"] = True
+                    _clear_suppressed_result_chain(event)
+                    return None
                 raise
 
         async def guarded_streaming(*args: Any, **kwargs: Any) -> Any:
@@ -363,7 +439,7 @@ def prepare_core_reply_event(
             # Its own streaming result therefore activates the send check here.
             if not state.get("delivery_guard_active") and not is_core_reply_stream(event):
                 return await state["_original_send_streaming"](*args, **kwargs)
-            if state.get("group_participation", {}).get("mode") == "skip":
+            if state.get("silent_suppressed") or state.get("group_participation", {}).get("mode") == "skip":
                 notify_delivery("finished")
                 restore_core_reply_event(event)
                 return None
@@ -457,6 +533,7 @@ def prepare_core_reply_event(
 
     state.pop("_text_presentation", None)
     state.pop("_text_presentation_removed", None)
+    state.pop("_prepared_decoration", None)
     old_task, old_callback = state.pop("_presence_owner_task", None), state.pop("_presence_task_done", None)
     if old_task is not None and old_callback is not None:
         old_task.remove_done_callback(old_callback)
@@ -475,6 +552,7 @@ def prepare_core_reply_event(
         wait_connection_changed=wait_connection_changed,
         delivery_guard_active=False,
         denial_notified=False,
+        silent_suppressed=False,
         send_attempts=0,
         send_returns=0,
         send_unknown=0,
@@ -551,6 +629,7 @@ def adopt_core_reply_event(
         # unknown or already-attempted sends stay fenced by guarded_send.
         if not state.get("send_unknown") and not state.get("send_attempts"):
             state["denial_notified"] = False
+            state["silent_suppressed"] = False
             state["_presence_finished"] = False
             state.pop("_text_presentation", None)
             state.pop("_text_presentation_removed", None)
@@ -605,6 +684,7 @@ def restore_core_reply_event(event: Any) -> None:
     if not isinstance(state, dict):
         return
     state["delivery_guard_active"] = False
+    state.pop("_prepared_decoration", None)
     event.send = state["_original_send"]
     original_streaming = state.get("_original_send_streaming")
     if callable(original_streaming):
@@ -697,7 +777,8 @@ def inject_core_reply_prompt(event: Any, req: Any) -> None:
     voice_instruction = voice_prompt_instruction(
         prepared.get("voice_reply_policy") if isinstance(prepared, Mapping) else None,
         prepared.get("voice_provider_instruction", "") if isinstance(prepared, Mapping) else "",
-        prepared.get("voice_rules_instruction", "") if isinstance(prepared, Mapping) else "")
+        prepared.get("voice_rules_instruction", "") if isinstance(prepared, Mapping) else "",
+        singsing=bool(isinstance(prepared, Mapping) and prepared.get("voice_singsing_enabled")))
     previous_voice = state.pop("_voice_prompt_instruction", None)
     if previous_voice and previous_voice in req.system_prompt:
         req.system_prompt = req.system_prompt.replace(previous_voice, "", 1).rstrip()
