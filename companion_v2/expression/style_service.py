@@ -2194,6 +2194,19 @@ class ExpressionStyleService:
         finally:
             self._scan_budget = None
 
+    async def advance_async(self):
+        """Awaitable tick entry required by the upstream 7.3.0 coordinator.
+
+        This fork keeps its 7.2.x synchronous discovery/scan implementation
+        (including the local private-scope caches). The upstream coordinator
+        awaits the expression-style unit instead of calling it directly, so
+        adapt the sync pass to that awaitable tick contract without changing
+        what is scanned or when. application.py checks that advance is this
+        class own method before choosing this path; a test-patched advance
+        on the instance is called directly by the coordinator instead.
+        """
+        self.advance()
+
     def _scan_pass(self, budget, bindings, group_contexts):
         """One discovery pass' window walk, bounded by `budget`.
 

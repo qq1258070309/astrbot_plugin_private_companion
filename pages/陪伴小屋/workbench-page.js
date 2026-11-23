@@ -1335,6 +1335,8 @@ window.CompanionWorkbench = (() => {
     /* 被显式「恢复继承」的字段：保存时要作为 reset_to_inherit 发出去，
        而不是留一份与继承值相同的显式副本。 */
     let resets_ = [];
+    /* notifyStatus() 用：上一次推给订阅者的快照引用。 */
+    let lastNotified = null;
     let autoRecoveryKey = "";
     let autoRecoveryTimer = null;
 
@@ -1616,8 +1618,20 @@ window.CompanionWorkbench = (() => {
       row.querySelector("[data-wb-field]")?.setAttribute?.("aria-invalid", "false");
     }
 
+    /* 订阅者（决策页卡片、表达页预览）在自己的 onStatus 回调里会重画、甚至再读一次；
+       如果每次 paint 都无条件推，就是「推→重画→再推」的循环。真实快照的引用只在
+       读取与保存成功时换新，按引用比较就足够跳过这些重入。 */
+    function notifyStatus() {
+      if (!onStatus) return;
+      const snapshot = state.status || null;
+      if (snapshot === lastNotified) return;
+      lastNotified = snapshot;
+      try { onStatus(snapshot); } catch (_) {}
+    }
+
     function paint() {
       const root = mountPoint();
+      notifyStatus();
       if (!root) return;
       if (!state.status && !state.loading) {
         root.innerHTML = noticeMarkup(state);
@@ -2729,7 +2743,6 @@ window.CompanionWorkbench = (() => {
         else if (retried) state.notice = "";
         state.loading = false;
         paint();
-        if (onStatus) onStatus(value);
         if (state.pending) scheduleAutoRecovery(state.pending.operation_key, ticket);
         schedule();
         if (usedCache && !prefetched) {
@@ -2874,7 +2887,6 @@ window.CompanionWorkbench = (() => {
           state.stale = false;
           state.conflicts = {};
           resets_ = [];
-          if (onStatus) onStatus(fresh);
         }
         /* 🔴 保存成功后广播「这个分区已落盘」。
          *
