@@ -105,12 +105,14 @@ jobs:
       - name: Mechanical gates
         id: gates
         if: steps.target.outputs.needed == 'true' && steps.merge.outputs.review_needed == 'false'
-        continue-on-error: true
         run: |
-          bash tools/fork_gates.sh \
+          rm -f "$RUNNER_TEMP/gates.json" "$RUNNER_TEMP/gates.log"
+          set -o pipefail
+          bash tools/run_release_gates.sh \
             "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
-            2>&1 | tee "$RUNNER_TEMP/gates.log"
-          echo '{"result":"pass"}' > "$RUNNER_TEMP/gates.json"
+            "$RUNNER_TEMP/gates.json" 2>&1 | tee "$RUNNER_TEMP/gates.log"
+          test -s "$RUNNER_TEMP/gates.json"
+          grep -qx '{"result":"pass"}' "$RUNNER_TEMP/gates.json"
 
       - name: AI compatibility review
         id: ai
@@ -178,6 +180,13 @@ jobs:
           TAG: ${{ steps.target.outputs.tag }}
         run: |
           VERSION="$(python -X utf8 tools/fork_release.py version)"
+          # 发布前硬校验：产物存在、校验和正确、附件非空；任一不满足即让 job 失败。
+          test -n "$(find "$RUNNER_TEMP/fork-release" -maxdepth 1 -name '*.zip' -print -quit)" || { echo "::error::no release ZIP produced"; exit 1; }
+          test -s "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" || { echo "::error::SHA256SUMS.txt missing"; exit 1; }
+          (cd "$RUNNER_TEMP/fork-release" && sha256sum -c SHA256SUMS.txt)
+          for asset in "$RUNNER_TEMP/fork-release"/*.zip "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" "$RUNNER_TEMP/COMPAT_REPORT.md"; do
+            test -s "$asset" || { echo "::error::missing or empty release asset: $asset"; exit 1; }
+          done
           {
             echo "## $VERSION"
             echo
