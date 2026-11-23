@@ -44,6 +44,7 @@ jobs:
 
       - name: Mechanical gates
         run: |
+          set -o pipefail
           bash tools/fork_gates.sh \
             "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
             2>&1 | tee "$RUNNER_TEMP/gates.log"
@@ -91,6 +92,7 @@ jobs:
             echo "裁决依据见附件 COMPAT_REPORT.md，定制明细见 FORK_CUSTOMIZATIONS.md，变更见 CHANGELOG.md。"
           } > "$RUNNER_TEMP/release-notes.md"
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/fork-release"/*.zip \
             "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
             "$RUNNER_TEMP/COMPAT_REPORT.md" \

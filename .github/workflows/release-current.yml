@@ -45,6 +45,7 @@ jobs:
       - name: Mechanical gates
         id: gates
         run: |
+          set -o pipefail
           bash tools/fork_gates.sh \
             "$RUNNER_TEMP/fork-release" "$RUNNER_TEMP/fork-verify" \
             2>&1 | tee "$RUNNER_TEMP/gates.log"
@@ -112,6 +113,7 @@ jobs:
           git tag "$RELEASE_TAG"
           git push origin "$RELEASE_TAG"
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/fork-release"/*.zip \
             "$RUNNER_TEMP/fork-release/SHA256SUMS.txt" \
             "$RUNNER_TEMP/COMPAT_REPORT.md" \
