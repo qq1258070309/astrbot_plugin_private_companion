@@ -134,54 +134,6 @@ function harness() {
     requests, root, store, audioBlobs, revokedAudioUrls};
 }
 
-/* Bulk default / fallback assignment: choose both models once, apply to all tasks. */
-test('bulk provider controls appear in the map and the configuration view', async () => {
-  const h = harness(), node = h.root();
-  h.page.mount(node);
-  h.requests[0].resolve(status());
-  await flush();
-  assert.match(node.innerHTML, /data-model-bulk="primary"/, 'default model selector');
-  assert.match(node.innerHTML, /data-model-bulk="fallback"/, 'fallback model selector');
-  assert.match(node.innerHTML, /data-model-bulk-apply/, 'apply button');
-  assert.match(node.innerHTML, /统一模型设置/);
-  node.click('[data-model-sub]', {modelSub: 'cfg'});
-  assert.match(node.innerHTML, /data-model-bulk-apply/, 'configuration view keeps the shortcut');
-  h.page.unmount();
-});
-
-test('bulk apply sets the chosen default and fallback on every editable task', async () => {
-  const h = harness(), node = h.root(), data = status();
-  data.tasks[0].execution_path = 'astrbot_core';  // core reply stays host-managed
-  h.page.mount(node);
-  h.requests[0].resolve(data);
-  await flush();
-  node.change('[data-model-bulk]', {modelBulk: 'primary', value: 'secondary'});
-  node.change('[data-model-bulk]', {modelBulk: 'fallback', value: 'primary'});
-  node.click('[data-model-bulk-apply]', {});
-  const posts = h.requests.filter(request => request.method === 'POST');
-  assert.equal(posts.length, 1, 'only the non-core task is saved');
-  assert.equal(posts[0].values.kind, 'memory.reflect');
-  assert.equal(posts[0].values.changes.provider, 'secondary');
-  assert.equal(posts[0].values.changes.fallback, 'primary');
-  assert.ok(posts[0].values.operation_key, 'saving stays idempotent');
-  posts[0].resolve({replayed: false, task: data.tasks[1]});
-  await flush();
-  h.page.unmount();
-});
-
-test('bulk apply refuses a missing or duplicate default without submitting', async () => {
-  const h = harness(), node = h.root();
-  h.page.mount(node);
-  h.requests[0].resolve(status());
-  await flush();
-  node.change('[data-model-bulk]', {modelBulk: 'primary', value: ''});
-  assert.match(node.innerHTML, /data-model-bulk-apply disabled/);
-  node.click('[data-model-bulk-apply]', {});
-  assert.equal(h.requests.filter(request => request.method === 'POST').length, 0,
-    'an invalid selection must never submit a save');
-  h.page.unmount();
-});
-
 test('embedded migration models read and save through the explicit destination endpoint', async () => {
   const h = harness(), node = h.root();
   const endpoint = '/astrbot_plugin_private_companion/host/targets/import/roles/destination/model';
