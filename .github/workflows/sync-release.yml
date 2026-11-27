@@ -25,9 +25,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # GITHUB_TOKEN needs workflows:write to push branches that carry .github/workflows/* changes
-  # (upstream sync merges ci.yml updates; without this the Open review PR step is rejected).
-  workflows: write
 
 concurrency:
   group: companion-fork-sync
@@ -96,6 +93,18 @@ jobs:
           print("true" if json.load(open(os.environ["REPORT"]))["needs_review"] else "false")
           ')"
           echo "review_needed=$REVIEW" >> "$GITHUB_OUTPUT"
+
+      - name: Keep fork workflows
+        if: steps.target.outputs.needed == 'true'
+        run: |
+          # Upstream workflow edits are deliberately not adopted: this fork owns
+          # its sync/release workflow contract. Keeping .github/workflows/* at the
+          # fork HEAD also avoids needing workflows:write on GITHUB_TOKEN when
+          # pushing the sync branch or the release commit (GITHUB_TOKEN cannot
+          # carry workflows:write; a PAT would be required instead).
+          git checkout HEAD -- .github/workflows/
+          echo "workflow files kept at fork HEAD:"
+          git diff --name-only HEAD -- .github/workflows/
 
       - name: Prepare fork release
         if: steps.target.outputs.needed == 'true' && steps.merge.outputs.review_needed == 'false'
