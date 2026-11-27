@@ -29,6 +29,14 @@ from .news_events import SOURCE_OWNER as NEWS_SOURCE_OWNER
 from .prompt_templates import (EXPRESSION_INSTRUCTION, LENGTH_INSTRUCTION, NEWS_LENGTH_INSTRUCTION,
                                NEWS_SHARING_INSTRUCTION, effective_template)
 
+GENERATED_IMAGE_INSTRUCTION = (
+    "本轮可主动生成一张新图。适合分享自己的插画、生活场景或创意时，可增加 image_prompt，"
+    "用简短画面描述写出主体、场景和风格。把生成图当作创作，不当作现场照片或事实证据。"
+    "避免把聊天原文、账号、地址等个人信息写入绘图描述。正文独立成立，不预告已生成或已发送。"
+    "一条消息只选一种附图方式。现成表情包用 reaction_intent，新图用 image_prompt。"
+)
+
+
 
 def local_time_fields(at, timezone_name):
     """Project one instant into the configured zone, in the shared prompt vocabulary.
