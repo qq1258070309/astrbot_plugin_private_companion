@@ -656,7 +656,7 @@ test('刷新失败或某一页变短：已显示的记录保留，并提示没�
   assert.equal(h.page.state.data.items.length, 4, '刷新失败不能把已经显示的记录抹掉');
   assert.match(h.element.innerHTML, /已保留当前内容/, '要说清这次没读到，并说明内容已保留');
 
-  /* 再刷新一次，第二页这次只剩一条（比上次短）：旧的那条仍要留着。 */
+  /* 完整刷新成功且服务端只剩三条：权威替换，已被外部归档/移除的第四条不再滞留。 */
   const shrunk = {
     list: [
       {items: [record('g-1', 'active'), record('g-2', 'active')], next: 'c1'},
@@ -666,8 +666,8 @@ test('刷新失败或某一页变短：已显示的记录保留，并提示没�
   };
   click(h, {action: 'refresh'});
   await drive(h, pagedAnswer(shrunk));
-  assert.equal(h.page.state.data.items.length, 4, '页变短时已显示的记录保留');
-  assert.ok(h.page.state.data.items.some(row => row.growth_id === 'g-4'), '上一次读到的第四条还在');
+  assert.equal(h.page.state.data.items.length, 3, '完整刷新成功时应以服务端结果权威替换');
+  assert.equal(h.page.state.data.items.some(row => row.growth_id === 'g-4'), false, '服务端已移除的第四条应同步消失');
 });
 
 /* ---- 确认条：链式版式与详情视图也必须渲染 ---------------------------------
@@ -770,4 +770,19 @@ test('深链补读到多页后，重新读取的请求数有上限', async () =>
   click(h, {action: 'refresh'});
   await drive(h, pagedAnswer(pages));
   assert.equal(listReads(h, second).length, 1, '第二次刷新也只重读一页');
+});
+
+test('桥接 reject 机器错误码时映射为中文业务提示', async () => {
+  const h = harness();
+  const pages = {list: [{items: [record('g-1', 'proposed')], next: null}],
+    reviews: [{items: [], next: null}]};
+  await mountPaged(h, pages);
+  const before = h.requests.length;
+  click(h, {act: 'confirm', id: 'g-1'});
+  await h.settle();
+  const post = h.requests.slice(before).find(request => request.method === 'POST');
+  assert.ok(post, '点击确认应发出 POST 请求');
+  post.reject(new Error('growth_record_unavailable'));
+  await h.settle();
+  assert.match(h.page.state.data.notice, /不在当前授权范围/);
 });

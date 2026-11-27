@@ -25,7 +25,9 @@ from typing import Callable, Sequence
 DEFAULT_TIMEOUT = 20.0
 SCREENSHOT_TIMEOUT = 30.0
 MAX_OUTPUT_BYTES = 1 << 20
+MAX_SCREENSHOT_BYTES = 24 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_UI_DUMP_FALLBACK_PATH = "/data/local/tmp/companion-window.xml"
 ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
 ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
 _IME_ID = re.compile(r"^[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+$")
@@ -94,6 +96,23 @@ def _default_runner(args: Sequence[str], timeout: float, *, stdin: bytes | None 
     )
 
 
+def diagnose_adb_not_found(explicit: str | os.PathLike[str] | None = None) -> dict[str, str]:
+    """Classify why ADB could not be resolved without leaking environment details."""
+    raw = str(explicit or "").strip()
+    if raw:
+        configured = Path(raw).expanduser()
+        if configured.is_dir():
+            reason = "explicit_path_is_dir"
+        elif not configured.exists():
+            reason = "explicit_path_missing"
+        elif not configured.is_file() or (os.name != "nt" and not os.access(configured, os.X_OK)):
+            reason = "explicit_path_not_executable"
+        else:
+            reason = "explicit_path_missing"
+        return {"reason": reason, "configured_adb_path": raw}
+    return {"reason": "auto_discovery_empty", "configured_adb_path": ""}
+
+
 def discover_adb(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Resolve the ADB executable or fail with one actionable code."""
     candidates: list[Path] = []
@@ -101,8 +120,12 @@ def discover_adb(explicit: str | os.PathLike[str] | None = None) -> Path:
         # An explicit path is an operator decision; silently falling back to a
         # different ADB build would make the device run against an unintended one.
         configured = Path(str(explicit).strip()).expanduser()
+        if configured.is_dir():
+            raise AdbError("adb_not_found", "the configured adb path is a directory; point to the adb executable")
         if not configured.is_file():
             raise AdbError("adb_not_found", "the configured adb executable does not exist")
+        if os.name != "nt" and not os.access(configured, os.X_OK):
+            raise AdbError("adb_not_found", "the configured adb path is not executable")
         return configured
     for variable in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
         root = os.environ.get(variable)
@@ -308,29 +331,46 @@ class AdbClient:
         """Return one PNG original; never a path the caller can swap afterwards."""
         result = self._device("exec-out", "screencap", "-p", timeout=SCREENSHOT_TIMEOUT, binary=True)
         data = result.stdout if isinstance(result.stdout, bytes) else _text(result.stdout).encode("utf-8")
+        error = _text(result.stderr)
+        lowered_error = error.casefold()
+        if (result.returncode == 0 and not data) or any(
+            marker in lowered_error for marker in ("flag_secure", "secure", "protected", "permission denied")
+        ):
+            raise AdbError(
+                "adb_screenshot_secure",
+                (error or "current screen is protected by FLAG_SECURE and cannot be captured").strip()[:300],
+                stderr=error,
+            )
         if result.returncode != 0 or not data.startswith(PNG_SIGNATURE):
-            error = _text(result.stderr)
             raise AdbError("adb_screenshot_failed", (error or "screencap did not return a PNG").strip()[:300],
                            stderr=error)
-        if len(data) > 8 * 1024 * 1024:
+        if len(data) > MAX_SCREENSHOT_BYTES:
             raise AdbError("adb_screenshot_too_large", "screencap exceeded the bounded size")
         return data
 
     def ui_dump(self) -> tuple[UiElement, ...]:
-        """Prefer the compressed in-memory dump; fall back to bounded files."""
+        """Prefer the compressed in-memory dump; fall back to bounded tmp files."""
         document = ""
+        last_error = ""
         for arguments in (("dump", "--compressed", "/dev/tty"), ("dump", "/dev/tty")):
             result = self._device("exec-out", "uiautomator", *arguments, timeout=SCREENSHOT_TIMEOUT)
             if result.returncode == 0:
                 document = _text(result.stdout)
                 if "<hierarchy" in document:
                     break
+            else:
+                last_error = (_text(result.stderr) or _text(result.stdout)).strip()
         if "<hierarchy" not in document:
-            fallback = self._device("shell", "uiautomator", "dump", "/sdcard/companion-window.xml",
+            fallback = self._device("shell", "uiautomator", "dump", _UI_DUMP_FALLBACK_PATH,
                                     timeout=SCREENSHOT_TIMEOUT)
             if fallback.returncode != 0:
-                raise AdbError("adb_ui_failed", "uiautomator could not dump the current window")
-            read = self._device("exec-out", "cat", "/sdcard/companion-window.xml", timeout=SCREENSHOT_TIMEOUT)
+                detail = (_text(fallback.stderr) or _text(fallback.stdout) or last_error).strip()[:300]
+                raise AdbError(
+                    "adb_ui_failed",
+                    detail or "uiautomator could not dump the current window",
+                    stderr=_text(fallback.stderr),
+                )
+            read = self._device("exec-out", "cat", _UI_DUMP_FALLBACK_PATH, timeout=SCREENSHOT_TIMEOUT)
             document = _check_text(read)
         return parse_ui_hierarchy(document)
 
@@ -368,6 +408,14 @@ class AdbClient:
                    or re.search(r"^\s*showing=(true|false)\b", delegate, re.M))
         secure = re.search(r"^\s*secure=(true|false)\b", delegate, re.M)
         return (showing.group(1) if showing else "", secure.group(1) if secure else "")
+
+    def require_readable_screen(self) -> None:
+        """Check the current screen without waking or dismissing the keyguard."""
+        display = self.display_state()
+        if display["on"] is False or display["wakefulness"] in ("asleep", "dozing"):
+            raise AdbError("adb_screen_off", "the phone screen is off")
+        if self._keyguard()[0] == "true":
+            raise AdbError("adb_unlock_required", "the phone screen is locked")
 
     def ensure_interactive(self) -> None:
         """Wake the display and dismiss a confirmed swipe-only lock screen."""
@@ -503,6 +551,7 @@ def _check_text(result: subprocess.CompletedProcess) -> str:
 
 _IME_RESTORE_LOCK = threading.Lock()
 _IME_RESTORE_TIMERS: dict[tuple[str, str], threading.Timer] = {}
+_IME_RESTORE_TOKENS: dict[tuple[str, str], object] = {}
 _IME_PENDING_RESTORE: dict[tuple[str, str], str] = {}
 _IME_RESTORE_ERRORS: dict[tuple[str, str], AdbError] = {}
 
@@ -523,10 +572,11 @@ def _restore_input_method(client: "AdbClient", previous: str) -> None:
         return
 
 
-def _default_scheduler(delay: float, fire) -> None:
+def _default_scheduler(delay: float, fire) -> threading.Timer:
     timer = threading.Timer(delay, fire)
     timer.daemon = True
     timer.start()
+    return timer
 
 
 def schedule_ime_restore(client: "AdbClient", previous: str, delay: float, *, scheduler=None) -> None:
@@ -534,9 +584,13 @@ def schedule_ime_restore(client: "AdbClient", previous: str, delay: float, *, sc
     if not previous or previous == ADB_KEYBOARD_IME:
         return
     key = _ime_key(client)
+    token = object()
 
     def fire():
         with _IME_RESTORE_LOCK:
+            if _IME_RESTORE_TOKENS.get(key) is not token:
+                return
+            _IME_RESTORE_TOKENS.pop(key, None)
             _IME_RESTORE_TIMERS.pop(key, None)
             _IME_PENDING_RESTORE.pop(key, None)
         _restore_input_method(client, previous)
@@ -545,8 +599,15 @@ def schedule_ime_restore(client: "AdbClient", previous: str, delay: float, *, sc
         old = _IME_RESTORE_TIMERS.pop(key, None)
         if old is not None:
             old.cancel()
+        _IME_RESTORE_TOKENS[key] = token
         _IME_PENDING_RESTORE[key] = previous
-    (scheduler or _default_scheduler)(float(delay), fire)
+    handle = (scheduler or _default_scheduler)(float(delay), fire)
+    if handle is not None and callable(getattr(handle, "cancel", None)):
+        with _IME_RESTORE_LOCK:
+            if _IME_RESTORE_TOKENS.get(key) is token:
+                _IME_RESTORE_TIMERS[key] = handle
+            else:
+                handle.cancel()
 
 
 def take_ime_restore_error(client: "AdbClient") -> AdbError | None:

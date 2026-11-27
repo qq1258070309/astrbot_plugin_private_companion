@@ -123,9 +123,10 @@
 .mem-badge.is-warn{background:var(--t-warn-quiet);color:var(--t-warn-ink)}
 .mem-badge.is-risk{background:var(--t-risk-quiet);color:var(--t-risk-ink)}
 .mem-badge.is-accent{background:var(--t-accent-quiet);color:var(--t-accent-ink)}
-/* 生命周期徽章：底色用 color-mix 从当前色兑出，一套规则覆盖四种状态 */
+/* 生命周期徽章：底色用 color-mix 从当前色兑出，一套规则覆盖全部状态 */
 .mem-badge.mem-state-active,
 .mem-badge.mem-state-superseded,
+.mem-badge.mem-state-invalidated,
 .mem-badge.mem-state-retracted,
 .mem-badge.mem-state-forgotten,
 .mem-badge.mem-state-archived{
@@ -242,9 +243,10 @@
 }
 .mem-legend b{font-weight:600;font-variant-numeric:tabular-nums;color:var(--t-text)}
 
-/* 生命周期色：四档语义，四处共用（比例带、列表状态条、详情状态环、徽章） */
+/* 生命周期色：四处共用（比例带、列表状态条、详情状态环、徽章） */
 .mem-state-active{color:var(--t-ok)}
 .mem-state-superseded{color:var(--t-text-faint)}
+.mem-state-invalidated{color:var(--t-warn)}
 .mem-state-retracted{color:var(--t-risk)}
 .mem-state-forgotten{color:var(--t-line-firm)}
 .mem-state-archived{color:var(--t-warn)}
@@ -614,11 +616,18 @@
   .mem-detail{
     position:fixed;z-index:40;inset:0;max-height:100dvh;overflow-y:auto;
     background:var(--t-surface-raised);border-radius:0;border:0;
-    transform:translateX(100%);
-    transition:transform .3s cubic-bezier(.16,1,.3,1),visibility .3s ease;
+    opacity:0;transform:translate3d(100%,0,0);
+    transition:transform 220ms cubic-bezier(0.4,0,1,1),opacity 200ms ease-in,visibility 0s linear 220ms;
   }
   .mem-detail:not(.is-open){visibility:hidden;pointer-events:none}
-  .mem-detail.is-open{visibility:visible;pointer-events:auto;transform:none;box-shadow:var(--t-shadow-lift)}
+  .mem-detail.is-open{
+    visibility:visible;pointer-events:auto;opacity:1;transform:translate3d(0,0,0);
+    box-shadow:var(--t-shadow-lift);
+    transition:transform 260ms cubic-bezier(0.22,1,0.36,1),opacity 220ms ease-out,visibility 0s linear 0s;
+  }
+  :root[data-motion="low"] .mem-detail{transform:none}
+  :root[data-motion="off"] .mem-detail,body.reduce-motion .mem-detail{transition:none!important;transform:none}
+  @media(prefers-reduced-motion:reduce){.mem-detail{transition:none!important;transform:none}}
   .mem-detail-close{display:inline-flex!important;margin-right:auto}
   .mem-detail-top{flex-wrap:wrap}
   .mem-vitals-figure b{font-size:var(--fs-display)}

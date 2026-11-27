@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import inspect
 import json
 import logging
+import re
 import traceback
 from types import MappingProxyType
 from typing import Callable, Mapping
@@ -27,6 +28,7 @@ from companion_v2.sources.models import GovernanceState, SourceRecord
 logger = logging.getLogger(__name__)
 
 from .discovery import discover
+from .image_native.types import NativeImageError
 from .images import IMAGE_ACTIONS, ImageReferenceLease, image_result_handler
 from .image_settings import read_image_settings
 from .content import ACTIONS as CONTENT_ACTIONS, ContentConsumer
@@ -35,6 +37,21 @@ from .reality_camera import ACTION as REALITY_CAMERA_ACTION, RealityCameraConsum
 
 
 TOGETHER_CREATE_ACTION = "together.room.create"
+_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,95}")
+_IMAGE_PREFLIGHT_LEASE_CODES = frozenset({
+    "reference_ids_invalid", "reference_media_unavailable", "native_reference_limit",
+    "reference_image_limit", "reference_image_invalid", "reference_fingerprint_mismatch",
+    "reference_not_found", "reference_role_disabled", "reference_group_disabled",
+    "photo_reference_disabled", "photo_reference_group_disabled",
+})
+
+
+def _normalize_error_code(code, state):
+    if state == "succeeded":
+        return None
+    if isinstance(code, str) and _ERROR_CODE_RE.fullmatch(code):
+        return code
+    return "native_operation_failed" if state == "failed" else "native_result_unknown"
 
 
 def together_execution_binding(settings):
@@ -43,6 +60,46 @@ def together_execution_binding(settings):
             "tts_provider_id": voice.provider_for_language(),
             "tts_language": voice.language,
             "tts_timeout_seconds": voice.timeout_seconds}
+
+
+def together_voice_policy(application, context, *, now=None):
+    """Read the live Companion per-language voice policy for one role/window."""
+    reply_settings = getattr(application, "reply_settings", None)
+    capture = getattr(reply_settings, "capture", None)
+    if not callable(capture) or context is None:
+        return None
+    try:
+        from companion_v2.conversation.reply_settings import VOICE_FIELDS
+        from companion_v2.conversation.voice_reply import VoiceReplyPolicy
+
+        observed_at = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        captured = capture(context, observed_at)
+        values = captured.get("settings") if isinstance(captured, Mapping) else None
+        if not isinstance(values, Mapping):
+            return None
+        defaults = VoiceReplyPolicy()
+        return VoiceReplyPolicy(**{
+            key: values.get("voice_" + key, getattr(defaults, key))
+            for key in VOICE_FIELDS
+        })
+    except Exception:
+        return None
+
+
+def together_context_execution(base_binding, application, context, *, now=None):
+    """Overlay live Companion per-language voice defaults onto the 4-key room execution binding."""
+    execution = dict(base_binding or {})
+    policy = together_voice_policy(application, context, now=now)
+    if policy is None:
+        return execution
+    scope_kind = getattr(getattr(getattr(context, "scope", None), "kind", None), "value", "private")
+    channel = "group" if scope_kind == "group" else "private"
+    provider_id = policy.provider_for_language(channel)
+    if provider_id:
+        execution["tts_provider_id"] = provider_id
+    execution["tts_language"] = policy.language
+    execution["tts_timeout_seconds"] = policy.timeout_seconds
+    return execution
 
 
 def _together_provider_id(provider):
@@ -274,6 +331,8 @@ class NativeExtensionRegistry(AstrBotToolPort):
             raise TaskError("native_settings_catalog_changed", "the capability catalog changed; reload the V2 host")
         self._entries.update({entry.host_tool_id: (entry, replacement) for entry in replacement.declarations()})
         self._bundled_extensions = tuple(replacement if item is lease else item for item in self._bundled_extensions)
+        if replacement.manifest.package.extension_id == "game" and self.application is not None:
+            self._attach_game_memory_hook(replacement.port)
         return replacement
 
     async def reconcile_service(self, extension_id):
@@ -416,6 +475,11 @@ class NativeExtensionRegistry(AstrBotToolPort):
         self.application, self.runtime = application, runtime
         if getattr(application, "daily_outfit", None) is not None:
             application.daily_outfit.port = self
+        if getattr(application, "qzone_life_images", None) is not None:
+            application.qzone_life_images.port = self
+        proactive_images = getattr(getattr(application, "proactive", None), "images", None)
+        if proactive_images is not None:
+            proactive_images.port = self
         # The real V2 application always exposes ``tasks.identity``.  Keep
         # registry attachment tolerant of a lightweight host fixture (or a
         # partially constructed application) and defer the Screen consumer
@@ -432,7 +496,28 @@ class NativeExtensionRegistry(AstrBotToolPort):
             self.content = ContentConsumer(self, application)
             from .scheduled_authoring import ScheduledAuthoring
             application.scheduled_authoring = ScheduledAuthoring(self.content)
+        for lease in self._bundled_extensions:
+            if lease.manifest.package.extension_id == "game":
+                self._attach_game_memory_hook(lease.port)
+        for _declaration, lease in self._entries.values():
+            if _declaration.descriptor.package.extension_id == "game":
+                self._attach_game_memory_hook(lease.port)
+                break
         return self
+
+    def _attach_game_memory_hook(self, port):
+        attacher = getattr(port, "attach_web_terminal_callback", None)
+        if not callable(attacher):
+            return
+
+        def record_web_terminal(context, game_view):
+            application = self.application
+            memory_game = getattr(getattr(application, "memory", None), "game", None)
+            if memory_game is None or getattr(memory_game, "closed", False):
+                return None
+            return memory_game.record_web_terminal(context, game_view)
+
+        attacher(record_web_terminal)
 
     def bind_role_guard(self, guard, persona_guard=None):
         if (self._closed or not inspect.iscoroutinefunction(guard)
@@ -473,6 +558,12 @@ class NativeExtensionRegistry(AstrBotToolPort):
                                     previous_package_id=predecessor, observed_at=observed_at)
                                 if not upgraded.is_success:
                                     blocked[package.extension_id] = (package.package_id, upgraded.failure.code)
+                                    if upgraded.failure.code == "capability_descriptor_conflict":
+                                        logger.warning(
+                                            "[CompanionV2] 模块 %s（%s v%s）已被阻断：%s",
+                                            package.extension_id, package.package_id,
+                                            package.package_version, upgraded.failure.reason,
+                                        )
                                     break
                             if package.extension_id in blocked:
                                 continue
@@ -530,6 +621,9 @@ class NativeExtensionRegistry(AstrBotToolPort):
             self._guard(host_tool_id, invocation)
 
     def outfit_image_route(self, context, identity=None):
+        return self.role_image_route(context, identity)
+
+    def role_image_route(self, context, identity=None):
         external = self.application.external if self.application else None
         if external is None:
             return None
@@ -552,19 +646,26 @@ class NativeExtensionRegistry(AstrBotToolPort):
         return persona["prompt"]
 
     async def generate_outfit_image(self, run, prompt, identity):
+        return await self.generate_role_image(
+            run, prompt, identity, invocation_id=run.task.spec.request_ref, call_id="daily-outfit")
+
+    async def generate_role_image(self, run, prompt, identity, *, invocation_id, call_id, on_dispatch=None):
         context = run.task.spec.context
-        declaration = self.outfit_image_route(context, identity)
+        declaration = self.role_image_route(context, identity)
         if declaration is None:
-            raise TaskError("daily_outfit_image_unavailable", "the role has no active Image route")
+            code = "daily_outfit_image_unavailable" if call_id == "daily-outfit" else "proactive_image_route_unavailable"
+            raise TaskError(code, "the role has no active Image route")
         arguments = {"prompt": prompt}
         if declaration.descriptor.tool.action == "image.edit":
             arguments.update(reference_ids=[identity], reference_indices=[], reference_roles=["identity"])
-        invocation = ExternalToolInvocation(run.task.spec.request_ref, run.task.task_id, "daily-outfit",
+        if on_dispatch is None:
+            run.begin_effect()
+        invocation = ExternalToolInvocation(invocation_id, run.task.task_id, call_id,
             context, declaration.descriptor, encode_prompt(arguments), run.task.spec.deadline_at, run.validate, run)
-        run.begin_effect()
-        return await self.invoke(declaration.host_tool_id, invocation, role_references_only=True)
+        return await self.invoke(declaration.host_tool_id, invocation, role_references_only=True,
+                                 on_dispatch=on_dispatch)
 
-    async def invoke(self, host_tool_id, invocation, *, role_references_only=False):
+    async def invoke(self, host_tool_id, invocation, *, role_references_only=False, on_dispatch=None):
         entry = self._entries.get(host_tool_id)
         if entry is None or entry[0].descriptor != invocation.descriptor:
             raise TaskError("native_provider_changed", "the original native declaration is unavailable")
@@ -581,7 +682,12 @@ class NativeExtensionRegistry(AstrBotToolPort):
         reference_lease = None
         if action == "image.mask_edit" or (action == "image.edit"
                 and json.loads(invocation.arguments_json).get("artifact_id", "") == ""):
-            reference_lease = ImageReferenceLease(self, invocation, role_references_only=role_references_only)
+            try:
+                reference_lease = ImageReferenceLease(self, invocation, role_references_only=role_references_only)
+            except TaskError as error:
+                if error.code in _IMAGE_PREFLIGHT_LEASE_CODES:
+                    return self._preflight_failure(invocation, error.code)
+                raise
         screen_check = self.screen.preflight(invocation) if self.screen is not None and invocation.descriptor.tool.action == SCREEN_ACTION else None
         camera_check = None
         if self.camera is not None and action == REALITY_CAMERA_ACTION:
@@ -591,17 +697,7 @@ class NativeExtensionRegistry(AstrBotToolPort):
                 # This host denial happens before port.execute can capture a
                 # frame. Keep its own receipt instead of poisoning later valid
                 # camera requests with an unknown device effect.
-                receipt_ref = "astrbot.camera-preflight." + invocation.invocation_id
-                document = {"invocation_id": invocation.invocation_id, "origin_key": invocation.context.key,
-                    "arguments_hash": invocation.arguments_hash, "binding": invocation.descriptor.binding,
-                    "state": "failed", "effect": "not_committed", "code": error.code,
-                    "observed_at": self.now()}
-                with self.runtime.transaction() as connection:
-                    connection.execute("INSERT OR IGNORE INTO runtime_metadata (key,value) VALUES (?,?)",
-                                       (receipt_ref, encode(document)))
-                return ExternalToolResponse(invocation.invocation_id, invocation.context.key,
-                    invocation.arguments_hash, invocation.descriptor.binding, "failed", "not_committed",
-                    receipt_ref=receipt_ref)
+                return self._preflight_failure(invocation, error.code, prefix="astrbot.camera-preflight.")
         request = invocation_request(invocation)
         if action in IMAGE_ACTIONS and self.runtime is not None:
             from companion_v2.conversation.media.output_settings import effective_settings, apply_prompts
@@ -617,8 +713,10 @@ class NativeExtensionRegistry(AstrBotToolPort):
                 raise TaskError("native_persona_guard_missing", "room creation requires a verified host persona")
             request["host_persona"] = await self.persona_guard(
                 invocation.context.scope, invocation.context.role_binding)
+            live_execution = together_context_execution(
+                self.together_execution, self.application, invocation.context, now=self.now())
             request["host_execution"] = together_room_execution(
-                self.together_execution, entry[1].instance, context=self.context)
+                live_execution, entry[1].instance, context=self.context)
             guard()
         if self.content is not None and invocation.descriptor.tool.action in CONTENT_ACTIONS:
             self.content.sources.synchronize()
@@ -640,6 +738,8 @@ class NativeExtensionRegistry(AstrBotToolPort):
                     self.camera.recheck(invocation, camera_check)
                 if image_references is not None:
                     image_references.recheck()
+                if not guarded and on_dispatch is not None:
+                    on_dispatch()
                 guarded = True
 
             guard()
@@ -671,12 +771,25 @@ class NativeExtensionRegistry(AstrBotToolPort):
             finally:
                 active = False
 
-        raw, guarded = await call(port.execute, request, image_references=reference_lease)
+        try:
+            raw, guarded = await call(port.execute, request, image_references=reference_lease)
+        except NativeImageError as error:
+            if not error.unconfirmed and error.code != "image_authority_revoked":
+                return self._preflight_failure(invocation, error.code)
+            raise
         # A receipt already returned by the provider is a fact about the original
         # operation. Later loss of access revokes materials, not that fact.
         native = parse_result(raw, request=request, side_effect=invocation.descriptor.side_effect)
         if native.state != "succeeded":
-            return self._source_response(invocation, native)
+            return self._source_response(invocation, native,
+                                         error_code=self._native_error_code(port, request, native))
+        if action.startswith("game.") and isinstance(native.result, dict):
+            game_doc = native.result.get("game")
+            binder = getattr(port, "bind_game_context", None)
+            if isinstance(game_doc, dict) and game_doc.get("game_id") and callable(binder):
+                from companion_v2.games.native.provider import _context as _game_ctx, _hash as _game_hash
+                scope_hash = _game_hash(_game_ctx(request["context"]))
+                binder(str(game_doc["game_id"]), invocation.context, scope=scope_hash)
         try:
             if not guarded:
                 raise TaskError("native_guard_unused", "the native provider omitted its dispatch check")
@@ -746,7 +859,33 @@ class NativeExtensionRegistry(AstrBotToolPort):
                     or json.loads(source.payload).get("native") != native.metadata(invocation.descriptor.binding)):
                 raise TaskError("native_handler_invalid", "adoption must preserve native metadata and exact audience")
 
-    def _source_response(self, invocation, native, *, unavailable_code=None):
+    def _preflight_failure(self, invocation, code, *, prefix="astrbot.native-preflight."):
+        normalized = _normalize_error_code(code, "failed")
+        receipt_ref = prefix + invocation.invocation_id
+        if self.runtime is not None:
+            document = {"invocation_id": invocation.invocation_id, "origin_key": invocation.context.key,
+                "arguments_hash": invocation.arguments_hash, "binding": invocation.descriptor.binding,
+                "state": "failed", "effect": "not_committed", "code": normalized,
+                "observed_at": self.now()}
+            with self.runtime.transaction() as connection:
+                connection.execute("INSERT OR IGNORE INTO runtime_metadata (key,value) VALUES (?,?)",
+                                   (receipt_ref, encode(document)))
+        return ExternalToolResponse(invocation.invocation_id, invocation.context.key,
+            invocation.arguments_hash, invocation.descriptor.binding, "failed", "not_committed",
+            receipt_ref=receipt_ref, error_code=normalized)
+
+    @staticmethod
+    def _native_error_code(port, request, native):
+        code = None
+        reader = getattr(port, "operation_error_code", None)
+        if callable(reader) and native.operation_id:
+            try:
+                code = reader(request, native.operation_id)
+            except Exception:
+                code = None
+        return _normalize_error_code(code, native.state)
+
+    def _source_response(self, invocation, native, *, unavailable_code=None, error_code=None):
         source = None
         if native.state == "succeeded":
             metadata = {"native": native.metadata(invocation.descriptor.binding)}
@@ -757,9 +896,10 @@ class NativeExtensionRegistry(AstrBotToolPort):
                 invocation.context.scope, VersionRef(invocation.invocation_id, 1), self.now())
             source = SourceRecord(reference, invocation.context.audience, digest(payload), payload,
                                   GovernanceState.REVOKED if unavailable_code else GovernanceState.ACTIVE)
+        resolved_error = _normalize_error_code(error_code, native.state) if native.state != "succeeded" else None
         return ExternalToolResponse(invocation.invocation_id, invocation.context.key, invocation.arguments_hash,
             invocation.descriptor.binding, native.state, native.effect, source=source,
-            operation_id=native.operation_id, receipt_ref=native.receipt_ref)
+            operation_id=native.operation_id, receipt_ref=native.receipt_ref, error_code=resolved_error)
 
     def executor(self, runtime):
         return map_tools(runtime, self) if self.declarations() else None

@@ -91,6 +91,12 @@ window.CompanionProduct = (() => {
        列出来，所以这几句多半出现在「数据变过了」或「V1 目录不在了」这类真实意外上。 */
     legacy_root_missing:"没有找到旧版数据目录。它通常与当前版本的数据目录平级；也可以在插件配置的「兼容｜旧版资料迁入」里直接填绝对路径。",
     legacy_root_invalid:"这个路径不是目录，请改填旧版数据目录。",
+    legacy_path_empty:"请填写旧版数据目录的绝对路径，或留空以自动查找。",
+    legacy_path_windows_on_posix:"当前 AstrBot 运行在 Linux/容器或手机环境中，无法直接读取 Windows 盘符路径；请先将旧版数据目录传到当前设备，再填写本机或容器内的绝对路径。",
+    legacy_path_not_absolute:"请填写完整的绝对路径（Linux/手机以 / 开头，Windows 如 D:\\...）。",
+    legacy_path_not_found:"找不到该旧版数据目录，请核对目录是否位于当前 AstrBot 所在的服务器、容器或手机内。",
+    legacy_path_is_file:"填写的是文件路径而不是目录，请改为填写包含旧版数据的目录路径。",
+    legacy_path_permission_denied:"当前 AstrBot 进程没有权限读取该目录，请检查权限或将数据复制到插件数据目录同级位置。",
     legacy_plan_stale:"旧版数据在这次试算之后变过，请重新试算再执行，这样写入的才是你看到的那一份。",
     legacy_nothing_to_migrate:"这份旧版数据里没有可以自动迁移的来源。",
     legacy_scope_unavailable:"这份角色设置里没有要写入的配置分组，这一组会跳过，其余照常。",
@@ -177,13 +183,16 @@ window.CompanionProduct = (() => {
      死标签——最常见的是宿主注入那条带 asset_token 的脚本因 token 失败。此时
      必须把它摘掉再试自己的候选地址，否则宿主一旦注入失败，页面就再没有第二次
      机会：那些候选是唯一不依赖宿主的路。 */
+  const failedSdkTags = new WeakSet();
+
   function sdkAlreadyPresent(ready) {
     const tags = [...document.querySelectorAll("script[src]")]
-      .filter(script => String(script.getAttribute("src") || script.src || "")
+      .filter(script => String(script.getAttribute?.("src") || script.src || "")
         .includes("bridge-sdk.js"));
-    const dead = tags.filter(script => script.readyState === "loaded" || script.readyState === "complete");
-    if (ready && dead.length) {
-      for (const script of dead) script.remove();
+    const dead = tags.filter(script => failedSdkTags.has(script)
+      || (ready && script !== sdkLoading));
+    if (dead.length) {
+      for (const script of dead) script.remove?.();
       /* 摘掉之后当作「没有」处理，让调用方继续试候选。 */
       return tags.some(script => !dead.includes(script));
     }
@@ -206,16 +215,20 @@ window.CompanionProduct = (() => {
        `readyState === "loading"` 判断就会永远不插入，整页连不上桥。 */
     const script = document.createElement("script");
     script.src = path;
-    script.addEventListener("load", () => {
-      /* 加载成功但桥没定义（路由返回了别的东西）：继续试下一个候选。 */
-      sdkLoading = null;
+    const finishFailure = () => {
+      failedSdkTags.add(script);
+      if (sdkLoading === script) sdkLoading = null;
+      script.remove?.();
       if (!bridgeOf()) requestBridgeSdk();
+    };
+    script.addEventListener("load", () => {
+      /* 加载成功但桥没定义（路由返回了别的东西）：移除失败节点并继续试下一个候选。 */
+      if (bridgeOf()) { if (sdkLoading === script) sdkLoading = null; return; }
+      finishFailure();
     });
     script.addEventListener("error", () => {
-      /* 这个地址没有：试下一个。全都试完就停下，由等待器超时报错，
-         不再无限重试——那只会刷满控制台。 */
-      sdkLoading = null;
-      requestBridgeSdk();
+      /* 这个地址没有：移除失败节点再试下一个。全都试完就停下，由等待器超时报错。 */
+      finishFailure();
     });
     sdkLoading = script;
     document.head.appendChild(script);
@@ -293,6 +306,7 @@ window.CompanionProduct = (() => {
   let releaseAppearanceContext = null;
   let generation = 0, changed = () => {}, loading = false, notice = "";
   const workspaceFrames = new Map();
+  const pendingWorkspaceFocus = new Map();
   const workspaceDraftRequests = new Map();
   let workspaceDraftSequence = 0;
   function workspaceDirtyDrafts() {
@@ -588,7 +602,11 @@ window.CompanionProduct = (() => {
     const dataOnly = response && typeof response === "object" && !Array.isArray(response)
       && Object.keys(response).length === 1 && hasOwn(response, "data");
     const wrapped = isEnvelope(response) ? response : dataOnly && isEnvelope(response.data) ? response.data : null;
-    if (wrapped?.status === "error") throw fail(codeOf(wrapped) || "invalid_response", true);
+    if (wrapped?.status === "error") {
+      const err = fail(codeOf(wrapped) || "invalid_response", true);
+      if (wrapped.data && typeof wrapped.data === "object" && !Array.isArray(wrapped.data)) err.details = wrapped.data;
+      throw err;
+    }
     let value = wrapped ? wrapped.data : response;
     /* A bridge shim may preserve one anonymous data layer without the
        envelope fields.  Only unwrap the exact {data: ...} shape. */
@@ -627,13 +645,20 @@ window.CompanionProduct = (() => {
         ? error.code : (CODE.test(error?.message || "") ? error.message : "");
       if (code) {
         const confirmed = error.confirmed === true || !isUncertainCode(code);
-        if (errors[code]) throw fail(code, confirmed);
+        const details = error?.details && typeof error.details === "object" ? error.details : undefined;
+        if (errors[code]) {
+          const err = fail(code, confirmed);
+          if (details) err.details = details;
+          throw err;
+        }
         if (confirmed) throw Object.assign(
           new Error(method === "POST"
             ? `保存没有通过（错误码：${code}），草稿已保留，请按提示调整后再试。`
             : `读取没有完成（错误码：${code}），请刷新后重试。`),
-          {code, confirmed: true});
-        throw fail(code, false);
+          {code, confirmed: true, ...(details ? {details} : {})});
+        const err = fail(code, false);
+        if (details) err.details = details;
+        throw err;
       }
       if (/initialized|explicit V2 profile/i.test(error.message)) throw fail("staging_not_initialized", true);
       if (/Dashboard|sign in/i.test(error.message)) throw fail("dashboard_identity_required", true);
@@ -1010,8 +1035,13 @@ window.CompanionProduct = (() => {
   const subjectLabel = item => item?.display_name || nativeId(item?.group_id || item?.participant_id) || "当前聊天对象";
   const platformLabel = item => ({qq:"QQ · OneBot",default:"QQ · OneBot",aiocqhttp:"QQ · OneBot",onebot:"QQ · OneBot",qq_official:"QQ 官方机器人",qq_official_webhook:"QQ 官方机器人（Webhook）",lark:"飞书机器人",telegram:"Telegram",discord:"Discord",slack:"Slack",kook:"KOOK",dingtalk:"钉钉",line:"LINE",satori:"Satori",mattermost:"Mattermost",misskey:"Misskey",webchat:"WebChat",wecom:"企业微信",wecom_ai_bot:"企业微信 AI 机器人",weixin_oc:"微信开放平台",weixin_official_account:"微信公众号"})[item?.platform_name || item?.platform_id] || "当前平台";
   const accountLabel = item => {
-    const id = nativeId(item.account_id);
-    return item.account_name ? item.account_name + (id ? `（${id}）` : "") : id ? `QQ ${id}` : "当前账号";
+    const platform = platformLabel(item);
+    const id = platform === "Telegram" ? String(item.account_id || "") : nativeId(item.account_id);
+    if (item.account_name) return item.account_name + (id ? `（${id}）` : "");
+    if (!id) return "当前账号";
+    if (platform.startsWith("QQ")) return `QQ ${id}`;
+    const prefix = platform === "当前平台" ? "账号" : platform;
+    return `${prefix} ${id}`;
   };
   function readableLabel(value, fallback) {
     const text = typeof value === "string" ? value.trim() : "";
@@ -1385,9 +1415,16 @@ window.CompanionProduct = (() => {
     if(message.kind==="ready"){
       clearTimeout(context.loadTimer);
       setWorkspaceLoadState(owner,"ready");
+      context.ready=true;
       // Display labels never participate in identity checks or request routing.
       sendWorkspaceContext(owner,context);
-      send({kind:"appearance",appearance:{...appearance}});return;
+      send({kind:"appearance",appearance:{...appearance}});
+      const queued=pendingWorkspaceFocus.get(context.kind);
+      if(queued&&Date.now()-queued.at<15000){
+        pendingWorkspaceFocus.delete(context.kind);
+        setTimeout(()=>send({kind:"focus-selector",selector:queued.selector,highlight:queued.highlight!==false}),120);
+      }
+      return;
     }
     if(message.kind==="resize"){if(Number.isFinite(message.height)&&message.height>0)owner.style.height=Math.max(420,Math.min(16000,Math.ceil(message.height)+16))+"px";return;}
     /* 工作区是 opaque origin 的 sandbox iframe，开不出能盖住插件视口的模态层；
@@ -1406,7 +1443,7 @@ window.CompanionProduct = (() => {
     }
     if(message.kind==="designer-mode"){
       if(context.kind!=="designer"||!["create","optimize"].includes(message.mode))return;
-      valid();
+      try{ valid(); }catch{ return; }
       context.tab=message.mode;
       owner.parentElement.dataset.workspaceTab=message.mode;
       owner.title=({create:"创建人格",optimize:"拟人优化"}[message.mode])+"工作区";
@@ -1420,7 +1457,7 @@ window.CompanionProduct = (() => {
       return;
     }
     if(message.kind==="navigate"){
-      valid();
+      try{ valid(); }catch{ return; }
       const target=message.target;
       if(target?.tab==="member-edit"){
         if(context.kind!=="identity")return;
@@ -1702,6 +1739,19 @@ window.CompanionProduct = (() => {
      这两件事在界面上要说得不一样。 */
   const lifeActivities = () => Array.isArray(data.life?.activities) ? data.life.activities : null;
   const lifeJournals  = () => Array.isArray(data.life?.journals) ? data.life.journals : null;
+  function focusWorkspace(kind, selector, {highlight = true} = {}) {
+    if (!kind || !selector) return false;
+    for (const [owner, context] of workspaceFrames) {
+      if (owner.isConnected && context.kind === kind && context.ready) {
+        try {
+          owner.contentWindow?.postMessage({channel: "companion-workspace", kind: "focus-selector", selector, highlight}, "*");
+          return true;
+        } catch (_) { /* ignore cross-frame errors */ }
+      }
+    }
+    pendingWorkspaceFocus.set(kind, {selector, highlight, at: Date.now()});
+    return true;
+  }
   const stateValues   = () => data.state?.state?.values || null;
   const stateLabel = value => states[value] || "";
   const unavailableReason = name => unavailable(name);
@@ -1723,7 +1773,7 @@ window.CompanionProduct = (() => {
     accounts:()=>catalog?.accounts||[], personas:()=>catalog?.personas||[],
     targetLabel,subjectLabel,platformLabel,accountLabel,roleLabel,scopeLabel,actorLabel,executorLabel,
     get manifest(){return manifest;},get data(){return data;},stateCard,stateAge,scheduleCard,capabilityCard,growthCard,memoryCard,
-    workspace,workspaceDirtyDrafts,unmountWorkspace,mountWorkspace,workspaceAddress,providerAddress,extensionsMarkup,providersMarkup,capabilitiesMarkup,providerDetail,growthMarkup,
+    workspace,focusWorkspace,workspaceDirtyDrafts,unmountWorkspace,mountWorkspace,workspaceAddress,providerAddress,extensionsMarkup,providersMarkup,capabilitiesMarkup,providerDetail,growthMarkup,
     extension:id=>manifest?.extensions?.find(p=>p.capability_id===id),
     provider:id=>manifest?.providers?.find(p=>p.capability_id===id),
     capability:id=>manifest?.extensions?.find(p=>p.capability_id===id)||manifest?.providers?.find(p=>p.capability_id===id),

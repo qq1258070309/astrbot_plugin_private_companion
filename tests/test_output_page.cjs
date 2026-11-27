@@ -40,9 +40,11 @@ function fixture(nai = null, album = {}) {
   let outputSettings = {backend: "auto", enabled: false, endpoints: [], comfyui: {}, sd_webui: {},
     operation_routes: {generate: [], edit: []}};
   const role = {role_id: "role-a", model_api: "model", image_material_api: "image-materials"};
+  let scope = "role-a";
   const window = {
+    CompanionConfirm: album.confirm || (async () => true),
     CompanionProduct: {
-      scopeKey: () => "role-a",
+      scopeKey: () => scope,
       role: () => role,
       targets: () => album.targets || [],
       relative: value => value,
@@ -97,6 +99,7 @@ function fixture(nai = null, album = {}) {
     Object, String, Array, Map, Set, Error};
   vm.runInNewContext(source, context, {filename: "output-page.js"});
   return {page: window.CompanionOutputPage, nodes, single, requests, root,
+    changeScope(value) {scope = value;},
     toggleNai(operation, checked) {
       const target = {matches: selector => selector === "[data-output-nai-operation]",
         dataset: {outputNaiOperation: operation}, checked};
@@ -341,6 +344,27 @@ test("gallery supports selection, export, delete and open-folder actions", async
   assert.ok(state.requests.some(request => request.method === "POST" &&
     request.endpoint === "image-materials/album/open-folder"));
   assert.match(gallery.innerHTML, /已打开产出图库目录（已同步 1 张，共 1 张）：C:\\data\\media\\generated-album\\role-a/);
+  state.page.unmount();
+});
+
+test("album delete waits for the page dialog and refuses a stale role", async () => {
+  let answer;
+  const state = fixture(null, {confirm: options => {
+    assert.equal(options.danger, true);
+    return new Promise(resolve => {answer = resolve;});
+  }});
+  state.page.mount(state.root);
+  await settleAlbum();
+  state.toggleAlbum("img-1", true);
+  state.clickAction("album-hide");
+  assert.equal(typeof answer, "function");
+  answer(false);
+  await settleAlbum();
+  state.clickAction("album-hide");
+  state.changeScope("role-b");
+  answer(true);
+  await settleAlbum();
+  assert.ok(!state.requests.some(request => request.endpoint.endsWith("/hide")));
   state.page.unmount();
 });
 
@@ -853,5 +877,65 @@ test("gallery supports daily outfit filter pill and standalone openLightbox relo
   assert.match(lb.innerHTML, /<a[^>]+href="blob:companion-1"[^>]+download="20261122-013000-wardrobe-outfit-0123456789ab\.png"/);
   assert.equal(s.pressKey("Escape"), true);
   assert.equal(lb.hidden, true);
+  s.page.unmount();
+});
+
+test("Switching album filter clears hidden selection so bulk actions cannot affect filtered-out items", async () => {
+  const s = fixture(null, {
+    request(method, endpoint, body) {
+      if (endpoint === "image-materials/album") {
+        return {
+          items: [
+            {
+              image_id: "img-gen-1",
+              thumbnail: "data:image/png;base64,GEN",
+              width: 512,
+              height: 512,
+              created_at: "2026-11-22T02:00:00Z",
+              action: "image.generate",
+            },
+            {
+              image_id: "img-edit-1",
+              thumbnail: "data:image/png;base64,EDIT",
+              width: 512,
+              height: 512,
+              created_at: "2026-11-22T01:00:00Z",
+              action: "image.edit",
+            },
+          ],
+          next_cursor: null,
+          total: 2,
+        };
+      }
+      if (endpoint === "image-materials/album/hide") return {hidden: body.image_ids.length};
+      if (endpoint === "image-materials/album/export") {
+        return {filename: "album.zip", data_url: "data:application/zip;base64,AAA", count: body.image_ids.length};
+      }
+      throw new Error(`unexpected ${method} ${endpoint}`);
+    },
+  });
+
+  s.page.mount(s.root);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const ws = s.single.get("#outputAlbumWorkspace");
+
+  // Select a generated image under "all", then switch filter to "edit".
+  s.toggleAlbum("img-gen-1", true);
+  assert.match(ws.innerHTML, /已选 <b>1<\/b> 张/);
+
+  s.clickAction("album-filter", {outputAlbumFilter: "edit"});
+  assert.match(ws.innerHTML, /当前筛选显示 1 张/);
+  assert.match(ws.innerHTML, /已选 <b>0<\/b> 张/);
+
+  // Attempting bulk hide/export after filter switch must not send any request for the hidden image.
+  s.clickAction("album-hide");
+  s.clickAction("album-export");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(
+    s.requests.some(req => req.endpoint.endsWith("/hide") || req.endpoint.endsWith("/export")),
+    false,
+    "bulk actions must not touch images hidden by the active filter",
+  );
   s.page.unmount();
 });

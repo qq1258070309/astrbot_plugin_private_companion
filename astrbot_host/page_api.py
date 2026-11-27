@@ -1,6 +1,7 @@
 """Authenticated page directory; the host supplies every target and API path."""
 
 import asyncio
+import inspect
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ from uuid import uuid4
 
 from astrbot.api import logger
 from astrbot.api.web import json_response, request
+from companion_v2.adapters.astrbot.memory_owner import read_memory_companion_status
 from companion_v2.execution.models import TaskError, require
 from companion_v2.foundation.outcome import Outcome
 from companion_v2.foundation.refs import ScopeKind, ScopeRef
@@ -28,12 +30,14 @@ from .browser_preferences import (
 from .display_names import display_names
 from .group_remarks import GroupRemarks
 from .identity_derivation import role_display_name
+from .search_catalog import build_search_catalog
 from .settings import HostControlError
 
 
 PREFIX = "/astrbot_plugin_private_companion"
 DISPLAY_PREFERENCES_FILE = "dashboard_display_preferences.json"
 DISPLAY_PREFERENCES_KEYS = frozenset(("appearance", "followLight", "largeText"))
+HINT_PREFERENCE_KEYS = frozenset(("memoryCompanion",))
 DISPLAY_APPEARANCE_VALUES = {
     "theme": frozenset(("courtyard", "dawn", "dusk", "night", "walnut", "contrast")),
     "density": frozenset(("compact", "standard", "roomy")),
@@ -42,6 +46,7 @@ DISPLAY_APPEARANCE_VALUES = {
     "motion": frozenset(("full", "low", "off")),
 }
 MAX_DISPLAY_PREFERENCES_BYTES = 8192
+MAX_HINT_PREFERENCES_BYTES = 2048
 
 
 def _valid_display_preferences(value):
@@ -56,6 +61,42 @@ def _valid_display_preferences(value):
     return type(value["followLight"]) is bool and type(value["largeText"]) is bool
 
 
+def _valid_hint_preferences(value):
+    if type(value) is not dict:
+        return False
+    return all(
+        type(key) is str and key in HINT_PREFERENCE_KEYS and type(flag) is bool
+        for key, flag in value.items()
+    )
+
+
+def read_user_hint_preferences(data_root, username: str) -> dict[str, bool]:
+    """Read persisted per-Dashboard-user dismissed hint flags (read-only)."""
+    defaults = {key: False for key in HINT_PREFERENCE_KEYS}
+    if data_root is None or type(username) is not str or not username.strip():
+        return defaults
+    path = Path(data_root) / DISPLAY_PREFERENCES_FILE
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return defaults
+    if raw.startswith(b"\xef\xbb\xbf") or len(raw) > MAX_DISPLAY_PREFERENCES_BYTES * 16:
+        return defaults
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return defaults
+    if type(document) is not dict or document.get("version") != 1:
+        return defaults
+    hints = document.get("hints")
+    if type(hints) is not dict:
+        return defaults
+    row = hints.get(username.strip())
+    if not _valid_hint_preferences(row):
+        return defaults
+    return {key: bool(row.get(key, False)) for key in HINT_PREFERENCE_KEYS}
+
+
 class PageWebAPI:
     def __init__(self, controller):
         self.controller = controller
@@ -67,14 +108,43 @@ class PageWebAPI:
                  "Refresh the authenticated Companion workspace asset entry"),
                 (PREFIX + "/page/ownership", self.ownership, ["GET"],
                  "Read which plugin currently provides model-facing memory"),
+                (PREFIX + "/page/memory-companion", self.memory_companion, ["GET"],
+                 "Read whether the recommended MemoryCompanion plugin is installed and active"),
                 (PREFIX + "/page/display-preferences", self.display_preferences, ["GET"],
                  "Read this Dashboard account's Companion display preferences"),
                 (PREFIX + "/page/display-preferences", self.save_display_preferences, ["POST"],
                  "Save this Dashboard account's Companion display preferences"),
+                (PREFIX + "/page/hint-preferences", self.hint_preferences, ["GET"],
+                 "Read this Dashboard account's dismissed hint preferences"),
+                (PREFIX + "/page/hint-preferences", self.save_hint_preferences, ["POST"],
+                 "Save this Dashboard account's dismissed hint preferences"),
                 (PREFIX + "/page/browser-preferences", self.browser_preferences, ["GET"],
                  "Read this browser's Companion role and card preferences"),
                 (PREFIX + "/page/browser-preferences", self.save_browser_preferences, ["POST"],
-                 "Save Companion role and card preferences in this browser's cookies")]
+                 "Save Companion role and card preferences in this browser's cookies"),
+                (PREFIX + "/search/catalog", self.search_catalog, ["GET"],
+                 "Read searchable model tasks, plugin schema and native extension metadata")]
+
+    async def search_catalog(self):
+        """Return non-secret searchable metadata for global search and all-features overview."""
+        from .web_api import outcome_response
+
+        try:
+            username = request.username
+            if (
+                type(username) is not str
+                or not username.strip()
+                or username.startswith("api_key:")
+            ):
+                raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard")
+            if request.query:
+                raise TaskError("page_request_invalid", "search catalog does not accept query overrides")
+            if getattr(self.controller, "_terminated", False):
+                raise TaskError("staging_host_terminated", "plugin is stopped")
+            catalog = await asyncio.to_thread(build_search_catalog, self.controller)
+            return outcome_response(Outcome.success(catalog))
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
 
     async def workspace_entry(self):
         """Refresh the current page's short-lived resource token through AstrBot.
@@ -160,6 +230,48 @@ class PageWebAPI:
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
 
+    async def memory_companion(self):
+        """Read whether 「我会牢牢记住你」 is installed, active, or missing.
+
+        Unlike ``/page/ownership``, this route works even before the V2 profile
+        is initialized so onboarding and the home overview can guide new users
+        before their first setup completes.
+        """
+        from .web_api import outcome_response
+
+        try:
+            controller = self.controller
+            if getattr(controller, "_terminated", False):
+                raise TaskError("staging_host_terminated", "plugin is stopped")
+            session = getattr(controller, "session", None) or getattr(controller, "last_session", None)
+            ownership = None
+            if session is not None and getattr(session, "application", None) is not None:
+                try:
+                    ownership = session.application.memory.context.ownership()
+                except Exception:
+                    ownership = None
+            status = await asyncio.to_thread(
+                read_memory_companion_status,
+                getattr(controller, "context", None),
+                ownership=ownership,
+            )
+            dismissed = False
+            try:
+                username = getattr(request, "username", None)
+                if (type(username) is str and username.strip()
+                        and not username.startswith("api_key:")
+                        and getattr(controller, "data_root", None) is not None):
+                    async with self._display_preferences_lock:
+                        hints = await asyncio.to_thread(
+                            read_user_hint_preferences, controller.data_root, username
+                        )
+                    dismissed = bool(hints.get("memoryCompanion", False))
+            except Exception:
+                dismissed = False
+            return outcome_response(Outcome.success({**status, "hint_dismissed": dismissed}))
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
+
     def _display_preferences_identity(self):
         username = request.username
         if (type(username) is not str or not username.strip() or username.startswith("api_key:")
@@ -179,32 +291,41 @@ class PageWebAPI:
             raise TaskError("display_preferences_unavailable", "the plugin data directory is unavailable")
         return Path(root) / DISPLAY_PREFERENCES_FILE
 
-    def _read_display_preferences(self):
+    def _read_preferences_document(self):
         path = self._display_preferences_path()
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
-            return {}
+            return {}, {}
         except OSError as error:
             raise TaskError("display_preferences_unavailable",
                             "the display preferences could not be read") from error
         if raw.startswith(b"\xef\xbb\xbf") or len(raw) > MAX_DISPLAY_PREFERENCES_BYTES * 16:
-            return {}
+            return {}, {}
         try:
             document = json.loads(raw.decode("utf-8"))
         except (UnicodeError, ValueError, RecursionError):
-            return {}
+            return {}, {}
         if (type(document) is not dict or document.get("version") != 1
                 or type(document.get("users")) is not dict):
-            return {}
-        return {key: value for key, value in document["users"].items()
-                if type(key) is str and _valid_display_preferences(value)}
+            return {}, {}
+        users = {key: value for key, value in document["users"].items()
+                 if type(key) is str and _valid_display_preferences(value)}
+        raw_hints = document.get("hints")
+        hints = ({key: {name: bool(val) for name, val in value.items()}
+                  for key, value in raw_hints.items()
+                  if type(key) is str and _valid_hint_preferences(value)}
+                 if type(raw_hints) is dict else {})
+        return users, hints
 
-    def _write_display_preferences(self, rows):
+    def _write_preferences_document(self, users, hints):
         path = self._display_preferences_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name("." + path.name + "." + uuid4().hex + ".tmp")
-        payload = json.dumps({"version": 1, "users": rows}, ensure_ascii=False,
+        body = {"version": 1, "users": users}
+        if hints:
+            body["hints"] = hints
+        payload = json.dumps(body, ensure_ascii=False,
                              allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
         try:
             with temporary.open("x", encoding="utf-8", newline="\n") as stream:
@@ -217,6 +338,74 @@ class PageWebAPI:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _read_display_preferences(self):
+        users, _hints = self._read_preferences_document()
+        return users
+
+    def _write_display_preferences(self, rows):
+        _users, hints = self._read_preferences_document()
+        self._write_preferences_document(rows, hints)
+
+    async def hint_preferences(self):
+        from .web_api import outcome_response
+
+        try:
+            username = self._display_preferences_identity()
+            async with self._display_preferences_lock:
+                _users, hints = await asyncio.to_thread(self._read_preferences_document)
+            row = hints.get(username, {})
+            dismissed = {key: bool(row.get(key, False)) for key in HINT_PREFERENCE_KEYS}
+            return outcome_response(Outcome.success({"dismissedHints": dismissed}))
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
+        except OSError:
+            return outcome_response(Outcome.failed(
+                "display_preferences_unavailable", "the hint preferences could not be read"))
+
+    async def save_hint_preferences(self):
+        from .web_api import outcome_response
+
+        try:
+            username = self._display_preferences_identity()
+            raw = await request.body()
+            if len(raw) > MAX_HINT_PREFERENCES_BYTES:
+                raise ValueError("request is too large")
+
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate field")
+                    result[key] = value
+                return result
+
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                                 parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite value")))
+            if (type(payload) is not dict or set(payload) != {"key", "dismissed"}
+                    or type(payload["key"]) is not str or payload["key"] not in HINT_PREFERENCE_KEYS
+                    or type(payload["dismissed"]) is not bool):
+                raise ValueError("invalid hint preference")
+            key, flag = payload["key"], payload["dismissed"]
+            async with self._display_preferences_lock:
+                def save():
+                    users, hints = self._read_preferences_document()
+                    current = dict(hints.get(username, {}))
+                    current[key] = flag
+                    hints[username] = {name: bool(current.get(name, False)) for name in HINT_PREFERENCE_KEYS}
+                    self._write_preferences_document(users, hints)
+                    return hints[username]
+
+                dismissed = await asyncio.to_thread(save)
+            return outcome_response(Outcome.success({"dismissedHints": dismissed}))
+        except TaskError as error:
+            return outcome_response(Outcome.failed(error.code, str(error)))
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError, OverflowError):
+            return outcome_response(Outcome.failed(
+                "hint_preferences_invalid", "check the hint preferences and retry"))
+        except OSError:
+            return outcome_response(Outcome.failed(
+                "display_preferences_unavailable", "the hint preferences could not be saved"))
 
     async def display_preferences(self):
         from .web_api import outcome_response
@@ -342,13 +531,29 @@ class PageWebAPI:
                 observed_at = controller.now()
                 inventory = getattr(controller.web_api, "target_inventory", None)
 
+            def _accepts_refresh_routes(fn):
+                try:
+                    sig = inspect.signature(fn)
+                except (TypeError, ValueError):
+                    return False
+                param = sig.parameters.get("refresh_routes")
+                if param is not None and param.kind in (
+                    inspect.Parameter.KEYWORD_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ):
+                    return True
+                return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
             def prepare_targets():
                 operator = dashboard_operator(runtime, username, at=observed_at)
                 require(ObjectAccessPolicy(runtime).feature_access(operator,
                     scope=ScopeRef(runtime.installation_id, "companion", ScopeKind.SYSTEM, "page.management"),
                     action="memory.manage", observed_at=observed_at))
+                raw_targets = None
                 if callable(inventory):
-                    targets = inventory()
+                    targets = (inventory(refresh_routes=False)
+                               if _accepts_refresh_routes(inventory) else inventory())
+                    raw_targets = targets
                 else:
                     settings = controller.resolved_settings()
                     targets = [{"target_id": settings.profile_id, "scope_kind": "private",
@@ -384,15 +589,18 @@ class PageWebAPI:
                                      "config", "perception_native", "reality_access", "screen_access", "game_access", "persona", "legacy",
                                      "qzone_extension", "image_material")}}
                                  for role in target["roles"]]} for target in targets]
-                return operator, GroupRemarks(runtime).apply(public)
+                return operator, GroupRemarks(runtime).apply(public), raw_targets
 
-            operator, remarked = await asyncio.to_thread(prepare_targets)
+            operator, remarked, raw_targets = await asyncio.to_thread(prepare_targets)
             public = await display_names(controller).targets(remarked)
             async with controller._control_lock:
                 if controller.runtime is not runtime or controller.settings is not settings_snapshot:
                     raise TaskError("staging_not_initialized", "the profile changed while reading display names")
                 if controller._terminated:
                     raise TaskError("staging_host_terminated", "plugin is stopped")
+                ensure_routes = getattr(controller.web_api, "_ensure_role_routes", None)
+                if callable(ensure_routes) and raw_targets is not None:
+                    ensure_routes(raw_targets)
                 recheck_at = controller.now()
 
             def recheck_access():

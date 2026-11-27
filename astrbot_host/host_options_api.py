@@ -18,10 +18,11 @@ from companion_v2.conversation.voice_reply import VoiceReplyPolicy
 from companion_v2.execution.models import TaskError, digest
 from companion_v2.foundation.outcome import Outcome
 
-from .management_identity import dashboard_operator
+from .management_identity import current_request_username, require_management_operator
 from .service_balance import (NEWAPI_DEFAULT_DIVISOR, configured_balance_port,
                               configured_balance_source, display_amount,
-                              balance_observation_data, balance_failure_data)
+                              balance_observation_data, balance_failure_data,
+                              propagate_balance_port)
 from .weather_settings import WeatherHostSettings
 from .service_balance_provider import balance_provider_choices
 
@@ -72,8 +73,8 @@ class HostOptionsWebAPI:
                 (PREFIX + "/weather", self.weather, ["POST"], "Save host weather source settings")]
 
     def _operator(self):
-        username = request.username
-        if (type(username) is not str or not username.strip() or username.startswith("api_key:")):
+        username = current_request_username(request)
+        if type(username) is not str or not username.strip() or username.startswith("api_key:"):
             raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard")
         if request.query:
             raise TaskError("host_options_request_invalid", "host settings do not accept query overrides")
@@ -82,7 +83,7 @@ class HostOptionsWebAPI:
             raise TaskError("staging_host_terminated", "plugin is stopped")
         if controller.runtime is None:
             raise TaskError("staging_not_initialized", "load the V2 profile first")
-        return dashboard_operator(controller.runtime, username, at=controller.now())
+        return require_management_operator(controller.runtime, username, at=controller.now())
 
     @staticmethod
     def _config_group(config, name):
@@ -310,7 +311,12 @@ class HostOptionsWebAPI:
             candidate = deepcopy(dict(self.controller.config))
             candidate.pop("service_balance", None)
             try:
-                balance_port = configured_balance_port(candidate, context=getattr(self.controller, "context", None))
+                balance_port = configured_balance_port(
+                    candidate,
+                    context=getattr(self.controller, "context", None),
+                    runtime_root=getattr(getattr(self.controller, "runtime", None), "data_root", None),
+                    controller=self.controller,
+                )
             except (ValueError, TypeError, KeyError, UnicodeError, OverflowError):
                 balance_port = None
         else:
@@ -320,22 +326,7 @@ class HostOptionsWebAPI:
         if not callable(save):
             raise TaskError("host_options_save_unavailable", "restart with Dashboard configuration support")
         save(candidate)
-        session = getattr(self.controller, "session", None) or getattr(self.controller, "last_session", None)
-        application = getattr(session, "application", None)
-        if application is not None:
-            application.balance_port = balance_port
-            materials = getattr(application, "keyword_materials", None)
-            invalidate = getattr(materials, "invalidate", None)
-            if callable(invalidate):
-                invalidate("service.balance")
-        schedule = getattr(application, "contact_schedule", None)
-        balance_events = getattr(schedule, "balance_events", None)
-        if balance_events is not None:
-            update_port = getattr(balance_events, "update_port", None)
-            if callable(update_port):
-                update_port(balance_port)
-            else:
-                balance_events.port = balance_port
+        propagate_balance_port(self.controller, balance_port)
         return {"saved": True, "apply_mode": "immediate", **self._view()}
 
     def _balance_test_port(self, data):

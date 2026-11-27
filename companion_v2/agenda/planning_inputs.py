@@ -1,4 +1,4 @@
-﻿"""Bounded planning material from the original calendar, goals and memory owners."""
+"""Bounded planning material from the original calendar, goals and memory owners."""
 
 from datetime import date, datetime, time, timedelta
 import json
@@ -11,6 +11,7 @@ from companion_v2.identity_policy.private_domain import source_ref
 from companion_v2.memory.models import AtomRef
 from companion_v2.memory.pinned import visible_fact
 from companion_v2.role_work.growth.configuration import INFLUENCE_NOTES, skill_settings, skills_enabled
+from companion_v2.role_work.life.scheduling import sleep_schedule_summary
 from .planning_config import (SCHEDULE_MODE_ORCHESTRATED, configured_annual_calendars,
                               configured_weather_location, configured_weather_max_age, planning_values)
 from .weather_material import planning_weather_material
@@ -34,7 +35,9 @@ def _dialogue_fingerprint(dialogue):
                    for item in dialogue]) if dialogue else None
 
 
-def planning_calendar_context(at, end, zone, annual_calendars=()):
+def planning_calendar_context(at, end, zone, annual_calendars=(), *, holiday_enabled=True,
+                              holiday_country="CN", automatic_solar_terms_enabled=True,
+                              solar_term_port=None):
     local_start, local_end = at.astimezone(zone), end.astimezone(zone)
     last_day = local_end.date() - timedelta(days=1) if local_end.time() == time.min else local_end.date()
     holidays = []
@@ -65,7 +68,11 @@ def planning_calendar_context(at, end, zone, annual_calendars=()):
             break
         days.append(row)
         used_chars += size
-    return {"today": project_local_date(at, zone.key, annual_calendars),
+    return {"today": project_local_date(at, zone.key, annual_calendars,
+                                        holiday_enabled=holiday_enabled,
+                                        holiday_country=holiday_country,
+                                        automatic_solar_terms_enabled=automatic_solar_terms_enabled,
+                                        solar_term_port=solar_term_port),
             "fixed_gregorian_holidays_in_window": holidays,
             "configured_annual_calendar": {"basis": "operator_configured_annual_calendar",
              "years": sorted(item.year for item in annual_calendars), "days": days, "partial": partial}}
@@ -130,6 +137,16 @@ def _recent_life_summary(app, context, at):
                 entry[key] = item[key]
         items.append(entry)
     return items or None
+
+
+def _sleep_schedule_summary(app, context):
+    body_clock = getattr(getattr(app, "role_state", None), "body_clock", None)
+    if body_clock is None:
+        return None
+    try:
+        return sleep_schedule_summary(body_clock.sleep_settings(context))
+    except Exception:
+        return None
 
 
 def _content_authoring_summary(app, context, at):
@@ -212,8 +229,17 @@ def capture(planner, context, instruction, mode, slot, occurrence=None, *, weath
     window_days = min(31, settings["planning_horizon_days"]) if mode == "intervention" else settings["planning_horizon_days"]
     end = (datetime.combine(at.astimezone(zone).date() + timedelta(days=1), time(), zone)
            if mode == "daily" else at + timedelta(days=window_days))
-    calendar_context = planning_calendar_context(at, end, zone,
-                                                 configured_annual_calendars(settings["planning_annual_calendars"]))
+    from companion_v2.conversation.perception_settings import read_perception_values
+    perception = read_perception_values(app, context, at, role_only=role_global)
+    solar_term_port = getattr(getattr(app, "messages", None), "solar_term_port", None)
+    calendar_context = planning_calendar_context(
+        at, end, zone,
+        configured_annual_calendars(settings["planning_annual_calendars"]),
+        holiday_enabled=perception["holiday_enabled"],
+        holiday_country=perception["holiday_country"],
+        automatic_solar_terms_enabled=perception["automatic_solar_terms_enabled"],
+        solar_term_port=solar_term_port,
+    )
     inventory, calendar_snapshot = calendar_inventory(app, context, role_global=role_global)
     sources, calendar, goals, memories, inputs = [], [], [], [], []
     intervention_dialogue = (_intervention_dialogue(app, context, at)
@@ -388,6 +414,12 @@ def capture(planner, context, instruction, mode, slot, occurrence=None, *, weath
             ("id", "revision", "sequence", "kind", "state", "title", "start", "end")} if occurrence else None)}
     if current_weather is not None:
         material["current_weather"] = current_weather
+    sleep_schedule = _sleep_schedule_summary(app, context)
+    if sleep_schedule is not None:
+        size = len(json.dumps(sleep_schedule, ensure_ascii=False, separators=(",", ":")))
+        if used_chars + size <= MATERIAL_CHARS:
+            material["sleep_schedule"] = sleep_schedule
+            used_chars += size
     role_state = _role_state_summary(app, context, at)
     if role_state is not None:
         size = len(json.dumps(role_state, ensure_ascii=False, separators=(",", ":")))

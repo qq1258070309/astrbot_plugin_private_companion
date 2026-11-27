@@ -1,4 +1,4 @@
-﻿/* 回复设置适配器：表达页保留离线预览，决策页只挂载群聊判断分区。
+/* 回复设置适配器：表达页保留离线预览，决策页只挂载群聊判断分区。
    此前这里自带一整套字段渲染、草稿存储、幂等重试与版本冲突处理；设置部分现在
    归 workbench-page.js，本文件保留工作台不做的离线分段预览。
 
@@ -99,6 +99,7 @@ window.CompanionReplyPage = (() => {
       private_closing_guard_window_seconds: "收尾判断窗口（秒）",
       private_closing_guard_prompt_enabled: "同时提示模型自然收尾",
       private_debounce_enabled: "启用私聊连续输入防抖",
+      private_debounce_semantic_enabled: "使用本地模型判断是否说完",
       private_debounce_min_ms: "最短静默（毫秒）",
       private_debounce_max_ms: "最长静默（毫秒）",
       private_debounce_total_ms: "单轮总上限（毫秒）",
@@ -153,7 +154,7 @@ window.CompanionReplyPage = (() => {
       reply_mention_speaker_enabled: "群聊回复时 @ 发言者",
       voice_enabled: "启用语音", voice_trigger_mode: "触发方式", voice_generation_mode: "朗读内容",
       voice_conversion_scope: "语音转换范围",
-      voice_segment_mode: "朗读段落（整段会等文字收齐后合成一次）", voice_delivery_mode: "发送形式", voice_position: "语音位置",
+      voice_segment_mode: "朗读段落", voice_delivery_mode: "发送形式", voice_position: "语音位置",
       voice_language: "语音语言", voice_foreign_text_mode: "外语文字",
       voice_direction_mode: "表演指令 / 风格强化",
       voice_provider_id: "通用 TTS 扩展", voice_zh_provider_id: "中文 TTS 扩展",
@@ -209,7 +210,7 @@ window.CompanionReplyPage = (() => {
       reply_quote_skip_chars: "回复去空白后不超过此字数时不附引用；0 表示不跳过。",
       reply_mention_speaker_enabled: "只在群聊中 @ 本轮发言者。",
       voice_trigger_mode: "决定这一轮要不要朗读，以及由谁挑句子。",
-      voice_segment_mode: "整段语气更完整；逐段出音更早。",
+      voice_segment_mode: "整段会等文字收齐后合成一次，语气更完整；逐段出音更早。",
       voice_delivery_mode: "仅语音只在完整覆盖文字时替代文字。",
       voice_language: "本窗口默认朗读语种；当轮换语种不保存。",
       voice_probability: "按百分比编辑，后端按 0–1 的小数保存。",
@@ -272,6 +273,7 @@ window.CompanionReplyPage = (() => {
       private_closing_guard_window_seconds: "只在这个时间窗口内判断收尾；超过窗口后仍按普通消息回复。范围 60–7200 秒。",
       private_closing_guard_prompt_enabled: "未触发静默时，把收尾语境作为本轮提示，提醒模型不要另起话题、追问或再补一条同义道别。",
       private_debounce_enabled: "仅纯文本私聊生效：第一条消息立即开始准备，短线补充并入同一轮，只触发一次模型请求。图片、语音、视频、文件、引用和命令立即处理。",
+      private_debounce_semantic_enabled: "需要在 AstrBot 插件配置中设置本地 ONNX 模型目录。等待补话仍受单轮总上限限制。",
       private_debounce_min_ms: "长消息靠近这个下限；与最长静默相同时使用固定等待，推荐从 1500 毫秒起调整。",
       private_debounce_max_ms: "短消息靠近这个上限；实际窗口还受单轮总上限约束，默认 4000 毫秒。",
       private_debounce_total_ms: "从第一条消息开始计算，达到该时间后不再等待新消息；默认 8000 毫秒，不能小于最长静默。",
@@ -356,7 +358,7 @@ window.CompanionReplyPage = (() => {
                 "group_conversation_followup_max_turns"]},
       {id: "private_debounce", title: "私聊节奏 · 连续输入", help: "第一条消息到达即开始准备，后续文本并入同一轮；总等待不超过配置上限。",
        fields: ["private_debounce_enabled", "private_debounce_min_ms", "private_debounce_max_ms",
-                "private_debounce_total_ms"]},
+                "private_debounce_total_ms", "private_debounce_semantic_enabled"]},
       {id: "silence_policy", title: "沉默策略", help: "统一管理哪些情况允许自动沉默；具体窗口与阈值仍在下方各分区调整。忙碌与休息闸门使用下方独立设置，它们只延期、不取消。Laya 的 wait/silent 与未点名群聊旁听仍由决策和群聊参与设置控制。",
        fields: ["recall_silence_enabled", "private_closing_guard_enabled", "group_air_guard_enabled"]},
       {id: "group_air_guard", title: "空气护栏 · 细则", help: "",
@@ -458,6 +460,7 @@ window.CompanionReplyPage = (() => {
       private_closing_guard_window_seconds: {private_closing_guard_enabled: true},
       private_closing_guard_prompt_enabled: {private_closing_guard_enabled: true},
       private_debounce_min_ms: {private_debounce_enabled: true},
+      private_debounce_semantic_enabled: {private_debounce_enabled: true},
       private_debounce_max_ms: {private_debounce_enabled: true},
       private_debounce_total_ms: {private_debounce_enabled: true},
     },
@@ -1151,9 +1154,58 @@ window.CompanionReplyPage = (() => {
       + `<p>${e(message)}</p></div>`;
   }
 
-  function previewModalMarkup() {
+  let previewModalCloseTimer = null;
+  function previewModalCanAnimate(node) {
+    return Boolean(
+      node
+      && typeof requestAnimationFrame === "function"
+      && typeof window.getComputedStyle === "function"
+      && !document.body?.classList?.contains("reduce-motion")
+      && document.documentElement?.dataset?.motion !== "off"
+      && !window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+    );
+  }
+  function openPreviewModal() {
+    const wasClosing = Boolean(previewModalCloseTimer);
+    clearTimeout(previewModalCloseTimer);
+    previewModalCloseTimer = null;
+    const wasOpen = state.previewConfigOpen;
+    state.previewConfigOpen = true;
+    renderPreview({animateModalEnter: !wasOpen || wasClosing});
+    root?.querySelector?.('[data-reply-action="preview-modal-close"]')?.focus?.();
+  }
+  function closePreviewModal() {
+    if (!state.previewConfigOpen || previewModalCloseTimer) return;
+    const modal = root?.querySelector?.("[data-reply-preview-modal]");
+    const myVersion = version;
+    const finish = () => {
+      previewModalCloseTimer = null;
+      if (!live(myVersion)) return;
+      state.previewConfigOpen = false;
+      renderPreview();
+      if (root?.isConnected) root.querySelector?.('[data-reply-action="preview-config"]')?.focus?.({preventScroll: true});
+    };
+    if (!previewModalCanAnimate(modal) || modal.hidden) {
+      finish();
+      return;
+    }
+    if (modal.contains?.(document.activeElement)) document.activeElement?.blur?.();
+    modal.setAttribute?.("inert", "");
+    modal.classList.remove("is-open");
+    modal.classList.add("is-closing");
+    const delay = document.documentElement?.dataset?.motion === "low" ? 110 : 185;
+    previewModalCloseTimer = setTimeout(finish, delay);
+  }
+  function onKeyDown(event) {
+    if (event.key === "Escape" && state.previewConfigOpen) {
+      event.preventDefault?.();
+      closePreviewModal();
+    }
+  }
+  function previewModalMarkup(animateEnter = false) {
     const option = (key, name, value, options) => `<label class="reply-preview-option"><span>${name}</span><select data-reply-preview-option="${key}">${options.map(([optionKey, label]) => `<option value="${optionKey}"${value === optionKey ? " selected" : ""}>${label}</option>`).join("")}</select></label>`;
-    return `<div class="reply-preview-modal" data-reply-preview-modal${state.previewConfigOpen ? "" : " hidden"} role="dialog" aria-modal="true" aria-labelledby="reply-preview-modal-title">`
+    const openClass = state.previewConfigOpen && !animateEnter ? " is-open" : "";
+    return `<div class="reply-preview-modal${openClass}" data-reply-preview-modal${state.previewConfigOpen ? "" : " hidden"} role="dialog" aria-modal="true" aria-labelledby="reply-preview-modal-title">`
       + `<div class="reply-preview-modal-scrim" data-reply-action="preview-modal-close"></div><div class="reply-preview-modal-card">`
       + `<header><h3 id="reply-preview-modal-title">预览配置</h3><button type="button" class="icon-button" data-reply-action="preview-modal-close" aria-label="关闭预览配置">${icon("x")}</button></header>`
       + `<div class="reply-preview-modal-body"><fieldset><legend>示例预设</legend><div class="reply-preview-modal-segmented">${["simple","complex","custom"].map(key => `<button type="button" class="${state.examplePreset === key ? "is-selected" : ""}" data-reply-example="${key}">${key === "simple" ? "简单示例" : key === "complex" ? "复杂示例" : "自定义"}</button>`).join("")}</div></fieldset>`
@@ -1162,7 +1214,7 @@ window.CompanionReplyPage = (() => {
       + `<p class="reply-preview-modal-lock">${icon("lock-keyhole")} 引用位置由回复分段设置决定</p><label class="reply-preview-modal-switch"><input type="checkbox" data-reply-preview-protection ${state.previewProtection ? "checked" : ""}><span>高亮保护范围</span></label>`
       + `</div></div></div>`;
   }
-  function renderPreview() {
+  function renderPreview({animateModalEnter = false} = {}) {
     const host = anchor("preview");
     if (!host) return;
     if (!previewEnabled()) {
@@ -1173,6 +1225,8 @@ window.CompanionReplyPage = (() => {
     const locked = state.loading || state.denied || !state.status;
     const module = root?.dataset?.expressionModule || "expression-text";
     const title = module === "expression-voice" ? "朗读位置预览" : module === "expression-platform" ? "组件顺序预览" : "分段效果预览";
+    const shouldAnimateEnter = animateModalEnter && state.previewConfigOpen
+      && typeof requestAnimationFrame === "function" && typeof window.getComputedStyle === "function";
     host.innerHTML = `<section class="reply-preview" aria-labelledby="reply-preview-title">`
       + `<header class="reply-preview-head"><h3 id="reply-preview-title">${title}<span class="reply-preview-live">实时</span></h3><div class="reply-preview-head-actions"><button type="button" class="button small" data-reply-action="preview-config">${icon("sliders-horizontal")}预览配置</button><button type="button" class="button small" data-reply-action="preview" ${locked || state.busy ? "disabled" : ""}>立即预览</button></div></header>`
       + `<div class="reply-preview-state-grid"><article class="reply-preview-state${state.busy ? " is-active" : ""}"><strong>${icon("loader-circle")}计算中</strong></article><article class="reply-preview-state${state.preview && !state.previewError && !state.busy ? " is-active is-ok" : ""}"><strong>${icon("check-circle-2")}已更新</strong></article><article class="reply-preview-state${state.previewError ? " is-active is-error" : ""}"><strong>${icon("triangle-alert")}预览失败</strong></article></div>`
@@ -1187,7 +1241,11 @@ window.CompanionReplyPage = (() => {
       + `<p class="reply-preview-status" id="reply-preview-status" role="status" aria-live="polite">${state.busy ? "正在计算预览…" : state.previewError ? e(state.previewError) : "等待预览"}</p>`
       + `<div id="reply-preview-result" class="reply-preview-result" aria-live="polite">`
       + (state.preview ? previewMarkup(state.preview) : '<p class="reply-muted">等待首次预览</p>')
-      + `</div></div></div></section>${previewModalMarkup()}`;
+      + `</div></div></div></section>${previewModalMarkup(shouldAnimateEnter)}`;
+    if (shouldAnimateEnter) {
+      const modal = host.querySelector?.("[data-reply-preview-modal]");
+      if (modal) requestAnimationFrame(() => { if (state.previewConfigOpen && !previewModalCloseTimer) modal.classList?.add?.("is-open"); });
+    }
   }
 
   function previewStatus(message) {
@@ -1363,14 +1421,11 @@ window.CompanionReplyPage = (() => {
       return;
     }
     if (previewAction === "preview-config") {
-      state.previewConfigOpen = true;
-      renderPreview();
-      root?.querySelector?.('[data-reply-action="preview-modal-close"]')?.focus?.();
+      openPreviewModal();
       return;
     }
     if (previewAction === "preview-modal-close") {
-      state.previewConfigOpen = false;
-      renderPreview();
+      closePreviewModal();
       return;
     }
     const target = event.target.closest("[data-wb-word-add], [data-wb-word-remove], [data-wb-replacement-add], [data-wb-replacement-remove], [data-wb-order-start], [data-wb-order-move], [data-wb-order-remove], [data-wb-order-add], [data-wb-order-natural], [data-wb-reset]");
@@ -1385,13 +1440,17 @@ window.CompanionReplyPage = (() => {
     previewTicket++;
     clearTimeout(previewTimer);
     previewTimer = null;
+    clearTimeout(previewModalCloseTimer);
+    previewModalCloseTimer = null;
     if (instance) instance.unmount();
     if (root) {
       root.removeEventListener("input", onInput);
       root.removeEventListener("change", onInput);
       root.removeEventListener("click", onClick);
+      root.removeEventListener("keydown", onKeyDown);
       root.textContent = "";
     }
+    if (typeof window !== "undefined") window.removeEventListener?.("keydown", onKeyDown);
     instance = null; root = null; route = null; activeSections = spec.sections;
     initialSection=null;
     statusListener=null;
@@ -1477,11 +1536,31 @@ window.CompanionReplyPage = (() => {
     return true;
   }
 
+  function perceptionScopeNote(module) {
+    if (module === "forwards") {
+      return "<strong>改写范围与继承说明</strong>"
+        + "<p>控制当前窗口是否展开合并转发的节点内容、媒体与阅读提示；留空时继承角色默认。单条消息转发数、节点上限与嵌套深度由下方全局解析上限统一管控。</p>";
+    }
+    if (module === "image") {
+      return "<strong>普通聊天的图片由 AstrBot 核心管线送入本轮请求</strong>"
+        + "<p>此处配置视觉转述缓存、识图失败冷却与上下文图片描述条数，用于提升重复图片与连续看图体验；场景级开关在「总览 → 适用范围」中管理。</p>";
+    }
+    if (module === "file") {
+      return "<strong>文件理解按格式白名单与体积上限解析</strong>"
+        + "<p>可选择纳入解析的文件格式并设置单文件大小、正文长度与读取超时；未安装的格式解析器会自动跳过，不会阻塞普通文字回复。</p>";
+    }
+    return "<strong>普通聊天的视频已由本插件原生理解</strong>"
+      + "<p>普通聊天的图片、视频和文件由 AstrBot 核心管线送入本轮请求。视频默认开启：支持视频输入的 Gemini 类模型直接读取整段原视频；其他模型用宿主自带的 ffmpeg 抽帧后作为图片送入同一轮请求，不依赖外部视频插件。超时或抽帧失败时本轮不带视频继续，不会阻塞文字回复。本页的转述和文件读取设置用于 V2 独立任务及历史兼容。</p>";
+  }
+
   function setPerceptionModule(module) {
     if (!root || !instance || root.dataset?.replyView !== "perception") return false;
-    const sections = perceptionModuleSections[module] || perceptionModuleSections.overview;
+    const resolved = module in perceptionModuleSections ? module : "overview";
+    const sections = perceptionModuleSections[resolved] || perceptionModuleSections.overview;
     instance.setVisibleGroups?.(sections, sections[0] || "");
-    root.dataset.perceptionModule = module in perceptionModuleSections ? module : "overview";
+    root.dataset.perceptionModule = resolved;
+    const scope = root.querySelector?.('[data-reply-part="scope"]');
+    if (scope) scope.innerHTML = perceptionScopeNote(resolved);
     return true;
   }
 
@@ -1555,9 +1634,9 @@ window.CompanionReplyPage = (() => {
     const diagnostics = [undefined, "decision"].includes(options.view)
       ? '<div data-reply-part="diagnostics"></div>' : "";
     const scopeNote = options.view === "decision"
-      ? '<aside class="reply-scope-note" role="note"><strong>基础唤醒后才进行决策</strong><p>答疑默认关闭，弱相关词默认留空。角色默认供各群继承；选中具体群时编辑本群覆盖，已单独设置的群字段不随角色默认改变。明确 @、引用或直接呼唤优先，其他候选由 Laya 结合有效开关与近期群历史判断是否旁听。私聊收尾沉默只处理纯道别、致谢或简短应声，且角色上一轮已经收尾；带问题、请求、图片或新内容的消息不受影响。私聊纯文本防抖与合并总窗口在「参与节奏 → 私聊节奏 · 连续输入」中配置；图片、语音、视频、文件、引用和命令不参与合并。</p></aside>' : options.view === "perception"
-      ? '<aside class="reply-scope-note" role="note"><strong>普通聊天的视频已由本插件原生理解</strong>' +
-        '<p>普通聊天的图片、视频和文件由 AstrBot 核心管线送入本轮请求。视频默认开启：支持视频输入的 Gemini 类模型直接读取整段原视频；其他模型用宿主自带的 ffmpeg 抽帧后作为图片送入同一轮请求，不依赖外部视频插件。超时或抽帧失败时本轮不带视频继续，不会阻塞文字回复。本页的转述和文件读取设置用于 V2 独立任务及历史兼容。</p></aside>'
+      ? '<aside class="reply-scope-note" role="note"><strong>基础唤醒后才进行决策</strong><p>答疑默认关闭，弱相关词默认留空。角色默认供各群继承；选中具体群时编辑本群覆盖，已单独设置的群字段不随角色默认改变。明确 @、引用或直接呼唤优先，其他候选由 Laya 结合有效开关与近期群历史判断是否旁听。私聊收尾沉默只处理纯道别、致谢或简短应声，且角色上一轮已经收尾；带问题、请求、图片或新内容的消息不受影响。私聊纯文本防抖与合并总窗口在「参与节奏 → 私聊节奏 · 连续输入」中配置；图片、语音、视频、文件、引用和命令不参与合并。</p></aside>'
+      : options.view === "perception"
+      ? `<aside class="reply-scope-note" role="note" data-reply-part="scope">${perceptionScopeNote(options.perceptionModule || "overview")}</aside>`
       : '<aside class="reply-scope-note" role="note" data-reply-part="scope">' +
         expressionScopeNote(options.expressionModule) + '</aside>';
     root.innerHTML = scopeNote + '<div data-reply-part="settings"></div>'
@@ -1566,6 +1645,8 @@ window.CompanionReplyPage = (() => {
     root.addEventListener("input", onInput);
     root.addEventListener("change", onInput);
     root.addEventListener("click", onClick);
+    root.addEventListener("keydown", onKeyDown);
+    if (typeof window !== "undefined") window.addEventListener?.("keydown", onKeyDown);
     instance = window.CompanionWorkbench.create({
       group: GROUP,
       title: options.expressionModule ? moduleTitle : pageSpec.title,

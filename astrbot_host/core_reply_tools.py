@@ -48,7 +48,7 @@ GROUP_READ_ACTIONS = frozenset({"group.memory.query", "group.memory.legacy.query
 # Stable window-level manifests.  The order is part of the cached tool prefix:
 # append new actions at the end and bump TOOL_MANIFEST_VERSION when the schema
 # changes, never splice a tool in because one message looks special.
-TOOL_MANIFEST_VERSION = "2026-11-22.1"
+TOOL_MANIFEST_VERSION = "2026-11-24.1"
 LEAN_GROUP_TOOL_ORDER = ("group.participation.choose", "group.memory.query",
                          "group.memory.remember", "acquaintance.recall",
                          "reaction.search", "slang.search")
@@ -169,7 +169,7 @@ PHONE_TASK_INSTRUCTION = (
     "用户交办手机操作或调整当前订单时，先调用此工具，再根据回执回复。"
     "结账暂停后的「继续」「改一对一配送」「记得用红包」都是当前订单的接续请求，设置 resume_checkout=true，"
     "保留原订单和最新要求。结账设置改动后需要新的订单截图，付款应按新回执单独回复「确认支付」。"
-    "单独要求唤醒手机、解锁或查看当前页面时，登记普通手机任务，shopping 和 resume_checkout 都设为 false。"
+    "单独要求唤醒手机或解锁时，登记普通手机任务，shopping 和 resume_checkout 都设为 false。"
     "若工具返回 phone_checkout_unavailable，说明当前私聊没有可接续订单，按回执准确回应。"
     "收到「点击极速支付」等说法时，按现有结账和确认状态处理；需要新回执时先接续订单，只有后台回执能确认是否实际支付。"
     "state=queued 表示任务已登记，可以回复已接到任务，等后台回执。"
@@ -190,6 +190,18 @@ PHONE_TASK_SPEC = ToolSpec(
         "shopping": {"type": "boolean", "description": "用户交办点餐、购物或其他涉及付款的任务时设为 true。"},
         "resume_checkout": {"type": "boolean", "description": "调整或接续已登记的当前订单时设为 true，goal 写明原订单和本次调整。单独唤醒手机时设为 false。"},
     }, "required": ["goal"], "additionalProperties": False}))
+PHONE_SCREEN_ACTION = "phone.screen.read"
+PHONE_SCREEN_INSTRUCTION = (
+    "用户问 Android 手机上当前显示什么、App 是否已打开或页面写了什么时，调用 phone.screen.read。"
+    "question 保留用户原问题。只在用户明确询问当前手机画面时使用。工具返回 queued 表示正在读取，"
+    "后台会把画面解读发回当前私聊。按回执说明结果，别用桌面屏幕或旧的手机场景摘要替代当前画面。"
+)
+PHONE_SCREEN_SPEC = ToolSpec(
+    PHONE_SCREEN_ACTION, "只读查看当前 Android 手机屏幕，根据截图回答用户的问题。无点击或页面切换。"
+    "结果由后台发送到原私聊。",
+    encode({"type": "object", "properties": {
+        "question": {"type": "string", "minLength": 1, "maxLength": 500, "description": "用户对手机当前画面的具体问题。"},
+    }, "required": ["question"], "additionalProperties": False}))
 
 
 _GROUP_ADMIN_DENIAL_REASONS = {
@@ -368,6 +380,7 @@ class CoreReplyToolSession:
             phone = getattr(app, "phone_actions", None)
             if phone is not None and phone.available(context):
                 offered.append(_OfferedTool(PHONE_TASK_SPEC, "phone"))
+                offered.append(_OfferedTool(PHONE_SCREEN_SPEC, "phone"))
             memory = getattr(tools, "memory", None)
             if memory is not None and not tools._memory_is_external():
                 offered.extend(_OfferedTool(spec, "memory") for spec in memory.catalog_for(context))
@@ -457,21 +470,53 @@ class CoreReplyToolSession:
         from companion_v2.conversation.native_participation import AUTONOMOUS_REASONS, native_participation_turn
         from companion_v2.conversation.reply_settings import GROUP
         call_id = native_call_id(wrapper, "group.participation.choose", arguments)
+        admission = _field(self.prepared, "group_admission", {}) or {}
+        group_trigger = _field(self.prepared, "group_trigger")
+        addressed = self._addressed_group_turn(admission, group_trigger)
         decision = self.state.get("group_participation")
         if decision is not None:
-            if decision["mode"] != arguments["mode"]:
-                raise TaskError("group_participation_fixed", "the original native group choice is already fixed")
-            return {"state": "succeeded", "effect": "none", "payload": dict(decision), "replayed": True}
+            # Issue #836: the latched decision may predate the authenticated
+            # trigger facts (or belong to a batch without the mention).  When
+            # the current facts show an explicit mention/wakeup the cache was
+            # decided without that signal, so discard it and re-decide.
+            if decision["mode"] == "skip" and addressed:
+                self.state.pop("group_participation", None)
+            else:
+                if decision["mode"] != arguments["mode"]:
+                    raise TaskError("group_participation_fixed", "the original native group choice is already fixed")
+                return {"state": "succeeded", "effect": "none", "payload": dict(decision), "replayed": True}
         if arguments["mode"] == "skip":
             if self.state.get("_business_tools_started") or self.state.get("send_attempts", 0):
                 raise TaskError("group_participation_started", "a group turn cannot revoke an operation that already began")
             if not self._skip_is_alone(wrapper):
                 raise TaskError("group_participation_skip_alone", "listening may accompany learning notes, but no business operation")
-        admission = _field(self.prepared, "group_admission", {}) or {}
-        group_trigger = _field(self.prepared, "group_trigger")
-        mentioned = group_trigger["mentioned"] if group_trigger is not None else admission.get("mentioned")
+            # Issue #836: a merged batch may contain an explicit @ or a host
+            # wakeup even when the surrounding conversation is between other
+            # members.  A skip decided on the whole batch would silently drop
+            # that mention.  Refuse the skip unless the reason itself is an
+            # independent conclusion about the mention (e.g. "@我但明说不用理我").
+            if addressed:
+                reason = arguments.get("reason", "")
+                opted_out = (isinstance(reason, str)
+                             and re.search(r"不用|别理|无需回复|不要打扰|不要理|不用理|不理|无需打扰|忙着|稍后|暂时不回复|不要回应", reason))
+                force_reply = self._mention_force_reply_enabled()
+                if not opted_out or force_reply:
+                    # Issue #836: bounded rejection.  Allow the skip once the
+                    # model has already been forced to reconsider and still
+                    # chooses skip, so a stubborn re-judgement cannot loop the
+                    # whole turn.  _latch_group_skip never latches mention
+                    # batches, so a bypassed skip stays non-persistent.
+                    # The mention_force_reply_enabled switch is a hard rule:
+                    # it never uses the bounded bypass, so a mention batch
+                    # cannot be dropped by repeated skip attempts.
+                    rejections = self.state.get("_mention_skip_rejections", 0)
+                    if force_reply or rejections < 1:
+                        self.state["_mention_skip_rejections"] = rejections + 1
+                        raise TaskError("group_participation_mention_skip_rejected",
+                                        "the batch contains an explicit mention of the bot; decide on the mentioned message itself")
+                    logger.warning("Mention skip allowed after bounded reconsideration")
         act, signature = "", ""
-        if arguments["mode"] == "reply" and not mentioned and admission.get("reason") in AUTONOMOUS_REASONS:
+        if arguments["mode"] == "reply" and not addressed and admission.get("reason") in AUTONOMOUS_REASONS:
             try:
                 snapshot = self.application.reply_settings.snapshot(self.context.actor, self.context, self.application.tasks.now())
                 settings = {key.removeprefix(GROUP + "."): value for key, value in snapshot.values.items()}
@@ -500,11 +545,36 @@ class CoreReplyToolSession:
                       if _field(call, "name", _field(_field(call, "function"), "name")) not in annotation_names]
         return len(operations) == 1
 
+    def _mention_force_reply_enabled(self):
+        """Whether the window opted in to the mention force-reply hard rule.
+
+        Reads the registered ``conversation.group_participation`` window value.
+        Any read failure keeps the default (off) so the guard stays identical
+        to the pre-switch behaviour.
+        """
+        try:
+            from companion_v2.conversation.participation import group_participation_settings
+            settings = group_participation_settings(self.application.runtime, self.context)
+            return bool(settings["mention_force_reply_enabled"])
+        except Exception:  # noqa: BLE001 - configuration trouble must not change the guard
+            logger.warning("mention_force_reply_enabled read failed; defaulting to off")
+            return False
+
+    def _addressed_group_turn(self, admission, trigger):
+        facts = admission if trigger is None else trigger
+        return (self.context.scope.kind is ScopeKind.GROUP
+                and isinstance(facts, dict)
+                and bool(facts.get("mentioned") or facts.get("native_wakeup")
+                         or admission.get("reason") == "direct_word"))
+
     def _latch_group_skip(self, wrapper, action, arguments):
         reason = arguments.get("reason", "")
+        admission = _field(self.prepared, "group_admission", {}) or {}
+        group_trigger = _field(self.prepared, "group_trigger")
         if (action != "group.participation.choose" or arguments.get("mode") != "skip"
                 or not isinstance(reason, str)
                 or self.context.scope.kind is not ScopeKind.GROUP
+                or self._addressed_group_turn(admission, group_trigger)
                 or self.state.get("group_participation") is not None
                 or self.state.get("_business_tools_started") or self.state.get("send_attempts", 0)):
             return
@@ -688,7 +758,7 @@ class CoreReplyToolSession:
             elif offered.owner == "evidence":
                 result = await self.evidence()
             elif offered.owner == "phone":
-                result = self._phone_task(arguments)
+                result = self._phone_task(action, arguments)
             elif offered.owner == "interaction":
                 result = await self.poke(arguments)
             elif offered.owner == "external":
@@ -793,12 +863,19 @@ class CoreReplyToolSession:
             return encode({"state": "failed", "effect": "none", "code": "invalid_tool_arguments",
                            "retry_disposition": "input_invalid"})
 
-    def _phone_task(self, arguments):
+    def _phone_task(self, action, arguments):
         """Register one due phone task; execution happens in the background loop."""
         app, context = self.application, self.context
         service = getattr(app, "phone_actions", None)
         if service is None or not service.available(context):
             raise TaskError("phone_disabled", "the phone channel is not enabled for this window")
+        if action == PHONE_SCREEN_ACTION:
+            document = service.create_screen_read(context, arguments["question"], request_id=self.turn_id)
+            if document["state"] != "active":
+                return {"state": document["state"], "effect": "none", "payload": document,
+                        "reason": "本轮已登记过读屏请求，请查看原回执。"}
+            return {"state": "queued", "effect": "committed", "payload": document,
+                    "reason": "读屏请求已登记，解读结果会发回当前私聊。"}
         goal = arguments.get("goal")
         if not isinstance(goal, str) or not goal.strip():
             raise TaskError("invalid_tool_arguments", "a phone task needs a goal")
@@ -882,7 +959,7 @@ class CoreReplyToolSession:
                 "operation_id": receipt.operation_id}
 
 
-def inject_core_reply_tools(event, req, *, application):
+def inject_core_reply_tools(event, req, *, application, provision_image_access: bool = True):
     """Copy the request's ToolSet and append authorized tools for this event only."""
     state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
     if not isinstance(state, dict):
@@ -900,16 +977,19 @@ def inject_core_reply_tools(event, req, *, application):
     if private_chat and (profile == "full" or "extensions" in custom_groups):
         from .content_access import ensure_content_access
         ensure_content_access(application.runtime, session.context, observed_at=application.tasks.now())
+        from .game_access import ensure_game_access
+        ensure_game_access(application.runtime, session.context, observed_at=application.tasks.now())
     media_enabled = (
         not private_chat or profile == "full" or "media" in custom_groups
     )
     if media_enabled:
-        # Consent is scoped to the exact AstrBot conversation. A new conversation id
-        # (persona switch, restart, new private session) makes every retained image
-        # capability invisible until it is provisioned for this scope again, so do it
-        # here, on the real event context, before the catalogue is filtered.
-        from .image_access import ensure_image_access
-        ensure_image_access(application.runtime, session.context, observed_at=application.tasks.now())
+        if provision_image_access:
+            # Consent is scoped to the exact AstrBot conversation. A new conversation id
+            # (persona switch, restart, new private session) makes every retained image
+            # capability invisible until it is provisioned for this scope again, so do it
+            # here, on the real event context, before the catalogue is filtered.
+            from .image_access import ensure_image_access
+            ensure_image_access(application.runtime, session.context, observed_at=application.tasks.now())
         offered, image_values = core_image_tools(session, session.catalog())
     else:
         offered, image_values = session.catalog(), None
@@ -943,6 +1023,8 @@ def inject_core_reply_tools(event, req, *, application):
             req.system_prompt = (req.system_prompt.rstrip() + "\n\n" + LEAN_GROUP_INSTRUCTION).lstrip()
         if any(item.owner == "phone" for item in offered) and PHONE_TASK_INSTRUCTION not in req.system_prompt:
             req.system_prompt += "\n\n" + PHONE_TASK_INSTRUCTION
+        if any(item.spec.action == PHONE_SCREEN_ACTION for item in offered) and PHONE_SCREEN_INSTRUCTION not in req.system_prompt:
+            req.system_prompt += "\n\n" + PHONE_SCREEN_INSTRUCTION
         if any(item.owner == "authoring" for item in offered):
             from companion_v2.conversation.content.authoring_workflow import INSTRUCTION as AUTHORING_INSTRUCTION
             if AUTHORING_INSTRUCTION not in req.system_prompt:
@@ -951,6 +1033,10 @@ def inject_core_reply_tools(event, req, *, application):
             from companion_v2.conversation.diagnostic_tools import DIAGNOSTIC_INSTRUCTION
             if DIAGNOSTIC_INSTRUCTION not in req.system_prompt:
                 req.system_prompt += "\n\n" + DIAGNOSTIC_INSTRUCTION
+        if any(item.spec.action == "qzone.post.publish" for item in offered):
+            from companion_v2.qzone.topic_prompt import CONVERSATION_GUIDANCE as QZONE_CONVERSATION_GUIDANCE
+            if QZONE_CONVERSATION_GUIDANCE not in req.system_prompt:
+                req.system_prompt += "\n\n" + QZONE_CONVERSATION_GUIDANCE
     elif getattr(req, "func_tool", None) is not None:
         req.func_tool = ToolSet(tools=sorted(existing, key=lambda tool: tool.name))
     mounted_tools = getattr(getattr(req, "func_tool", None), "tools", ())
@@ -960,6 +1046,26 @@ def inject_core_reply_tools(event, req, *, application):
         req.system_prompt = (current.rstrip() + "\n\n" + KB_TOOL_INSTRUCTION).lstrip()
     inject_core_image_prompt(session, req, offered, image_values)
     return tuple(tool._action for tool in appended)
+
+
+async def inject_core_reply_tools_async(event, req, *, application):
+    """Async variant of :func:`inject_core_reply_tools` that offloads image-access SQLite I/O."""
+    state = event.get_extra(CORE_REPLY_CONTEXT_EXTRA)
+    if not isinstance(state, dict):
+        return ()
+    session = state.get("_tool_session")
+    if (not isinstance(session, CoreReplyToolSession) or session.application is not application
+            or session.prepared is not state.get("prepared")):
+        session = CoreReplyToolSession(event, state, application)
+        state["_tool_session"] = session
+    private_chat = session.context.scope.kind is ScopeKind.PRIVATE
+    profile = session.private_tool_profile
+    custom_groups = session.private_tool_groups if profile == "custom" else frozenset()
+    media_enabled = not private_chat or profile == "full" or "media" in custom_groups
+    if media_enabled:
+        from .image_access import ensure_image_access_async
+        await ensure_image_access_async(application.runtime, session.context, observed_at=application.tasks.now())
+    return inject_core_reply_tools(event, req, application=application, provision_image_access=False)
 
 
 def inject_core_turn_notes(event, req):
