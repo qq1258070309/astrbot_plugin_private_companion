@@ -1071,6 +1071,13 @@ class CompanionApplication:
 
         def stage_expression_style() -> StagedOffload | None:
             svc = self.expression_style
+            # This fork keeps the 7.3.0 sync-only expression style service, which
+            # does not implement the staged offload contract (_advancing,
+            # _reap_workers, _discover_and_scan_sync). Fall back to the plain
+            # advance_async tick instead of faulting the host on the staged path.
+            if not all(hasattr(svc, name) for name in
+                       ("_advancing", "_reap_workers", "_discover_and_scan_sync")):
+                return None
             if ("advance" in svc.__dict__
                     or type(svc).advance is not ExpressionStyleService.advance):
                 return None
