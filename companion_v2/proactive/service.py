@@ -45,6 +45,7 @@ from companion_v2.storage.repositories import OperationRepository
 from .configuration import GROUP
 from .budget import DIAGNOSTIC_TASK_PREFIX, ContactBudget, local_day_start
 from .contact_models import ContactIntent, ContactJob
+from .generated_images import ProactiveImages
 from .inspirations import ProactiveInspirations
 from .persona_judge import (KIND as JUDGE_KIND, PersonaJudge, JudgeVerdict, exempt_purposes, judge_output,
                             judge_request, signature_for)
@@ -150,6 +151,7 @@ class ProactiveContacts:
         self.sources, self.operations = SourceRepository(self.runtime), OperationRepository(self.runtime)
         self.platform_circuit = ProactivePlatformCircuit(self.runtime)
         self.budget = ContactBudget(self.runtime)
+        self.images = ProactiveImages(self.runtime)
         self.history = self.schedule = self.semantics = None
         self.inspirations = ProactiveInspirations(self)
         # Optional: an unwired host or an unavailable memory leaves proactive
