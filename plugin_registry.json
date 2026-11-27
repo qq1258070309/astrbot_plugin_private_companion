@@ -14,12 +14,12 @@
       "拟人化"
     ],
     "social_link": "https://github.com/qq1258070309",
-    "version": "7.1.20",
+    "version": "7.3.5",
     "astrbot_version": ">=4.27.2",
     "support_platforms": [
       "aiocqhttp"
     ],
-    "updated_at": "2026-11-15T14:55:00Z",
+    "updated_at": "2026-11-27T13:42:03Z",
     "logo": "https://raw.githubusercontent.com/qq1258070309/astrbot_plugin_private_companion/main/logo.png"
   }
 }
