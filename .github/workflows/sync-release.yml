@@ -25,6 +25,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # GITHUB_TOKEN needs workflows:write to push branches that carry .github/workflows/* changes
+  # (upstream sync merges ci.yml updates; without this the Open review PR step is rejected).
+  workflows: write
 
 concurrency:
   group: companion-fork-sync
