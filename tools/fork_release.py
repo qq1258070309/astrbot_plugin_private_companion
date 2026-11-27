@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import re
 import subprocess
@@ -148,6 +149,28 @@ def apply_version(version: str) -> None:
         print(f"warning: README source line not found, skipped", file=sys.stderr)
 
 
+def apply_registry_version(version: str) -> str:
+    """Keep the plugin marketplace registry + its md5 in lockstep with metadata.
+
+    AstrBot's dashboard reads online_version from the custom registry cache,
+    which is fetched from plugin_registry.json at FORK_REPO and validated
+    against plugin_registry-md5.json. If the registry version lags behind
+    metadata.yaml, the cache self-validates on the stale version and the panel
+    never offers an update. Update both files together, registry first.
+    """
+    reg_path = ROOT / "plugin_registry.json"
+    reg = json.loads(read(reg_path))
+    updated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for _key, entry in reg.items():
+        entry["version"] = version
+        entry["updated_at"] = updated_at
+    write(reg_path, json.dumps(reg, ensure_ascii=False, indent=2))
+    md5 = hashlib.md5(reg_path.read_bytes()).hexdigest()
+    write(ROOT / "plugin_registry-md5.json", json.dumps({"md5": md5}, indent=2))
+    print(f"registry version {version} md5 {md5}")
+    return md5
+
+
 def apply_changelog(version: str, upstream: str, tag: str, date: str) -> None:
     text = read(CHANGELOG)
     heading = f"## {version} - {date}"
@@ -270,6 +293,7 @@ def prepare(args: argparse.Namespace) -> None:
     version = upstream + revision
     date = args.date or datetime.date.today().isoformat()
     apply_version(version)
+    apply_registry_version(version)
     reapply_page_order()
     apply_changelog(version, upstream, tag, date)
     write(BASE_FILE, tag + "\n")
@@ -298,6 +322,20 @@ def check(_args: argparse.Namespace) -> None:
     versions = collect_versions()
     version = versions["metadata.yaml"]
     problems = verify_customizations()
+    # Registry + md5 must be in lockstep with metadata, otherwise the panel
+    # keeps showing an old online_version (cache self-validates on stale data).
+    reg_path = ROOT / "plugin_registry.json"
+    try:
+        reg = json.loads(read(reg_path))
+        reg_versions = {e.get("version") for e in reg.values() if isinstance(e, dict)}
+        if reg_versions != {version}:
+            problems.append(f"plugin_registry.json version mismatch: {reg_versions} != {version}")
+        declared_md5 = json.loads(read(ROOT / "plugin_registry-md5.json")).get("md5")
+        actual_md5 = hashlib.md5(reg_path.read_bytes()).hexdigest()
+        if declared_md5 != actual_md5:
+            problems.append(f"plugin_registry-md5.json stale: {declared_md5} != {actual_md5}")
+    except (OSError, ValueError) as exc:
+        problems.append(f"cannot validate plugin registry: {exc}")
     if len(set(versions.values())) != 1:
         problems.append(f"version mismatch: {versions}")
     metadata = read(ROOT / "metadata.yaml")
