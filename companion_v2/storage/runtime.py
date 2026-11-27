@@ -3331,6 +3331,26 @@ class StorageRuntime:
         return self._connection
 
 
+def table_exists(runtime: object, table_name: str) -> bool:
+    """Return whether *table_name* exists on *runtime*, using the runtime cache when available."""
+    checker = getattr(runtime, "has_table", None)
+    if callable(checker):
+        return bool(checker(table_name))
+    reader = getattr(runtime, "read_one", None)
+    if callable(reader):
+        return reader(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ) is not None
+    read_all = getattr(runtime, "read_all", None)
+    if callable(read_all):
+        return bool(read_all(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ))
+    return False
+
+
 def _existing_tables(connection: sqlite3.Connection) -> set[str]:
     rows = connection.execute(
         """
