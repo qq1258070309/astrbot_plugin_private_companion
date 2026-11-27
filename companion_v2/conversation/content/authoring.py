@@ -52,16 +52,21 @@ def _work_type_guidance(work_type: str) -> str:
     return ""
 
 
-def schema_for(action: str) -> dict:
+def schema_for(action: str, *, scheduled: bool = False) -> dict:
     if action == "draft":
-        return CREATE_SCHEMA
-    if action == "continue":
-        return CONTINUE_SCHEMA
-    raise ValueError("unsupported authoring action")
+        schema = CREATE_SCHEMA
+    elif action == "continue":
+        schema = CONTINUE_SCHEMA
+    else:
+        raise ValueError("unsupported authoring action")
+    if scheduled:
+        return {**schema, "properties": {**schema["properties"], "finished": {"type": "boolean"}},
+                "required": [*schema["required"], "finished"]}
+    return schema
 
 
 def authoring_prompt(action: str, brief: str, materials: Mapping[str, str] | None = None, *,
-                     base_version: str = "", work_type: str = "") -> str:
+                     base_version: str = "", work_type: str = "", scheduled: bool = False) -> str:
     """Render one creation or fixed-version continuation instruction."""
     if action not in AUTHORING_ACTIONS:
         raise ValueError("unsupported authoring action")
@@ -79,8 +84,21 @@ def authoring_prompt(action: str, brief: str, materials: Mapping[str, str] | Non
     extension = ""
     if action == "continue":
         extension = f"本次续写基于已经固定的版本 {base_version.strip()}；只在此基础上续写，不重写已发布部分。\n"
-    output = ("新建时给出自然贴切的作品标题和简洁作品类型，并完成完整正文。\n"
-              if action == "draft" else "只给出接续固定版本的新正文，不重复已有章节。\n")
+    output = (
+        "新建时给出自然贴切的作品标题和简洁作品类型，并完成完整正文。"
+        '仅输出单个 JSON 对象，必须且只能包含三个非空字符串字段 "title"、"work_type"、"body"'
+        '（不要增加其它字段，也不要包在额外外层键里），例如：'
+        '{"title": "作品标题", "work_type": "短篇小说", "body": "完整正文"}。\n'
+        if action == "draft" else
+        "只给出接续固定版本的新正文，不重复已有章节。"
+        '仅输出单个 JSON 对象，必须且只能包含一个非空字符串字段 "body"'
+        '（不要输出 title、work_type 或其它字段），例如：'
+        '{"body": "接续正文"}。\n'
+    )
+    if scheduled:
+        fields = "、".join(schema_for(action, scheduled=True)["required"])
+        output = (f"只输出一个 JSON 对象，字段为 {fields}。正文写在 body。"
+                  "作品达到自然收尾时 finished 为 true，留待下次续写时为 false。\n")
     genre_section = f"体裁提示：{genre_guidance}\n" if genre_guidance else ""
     return (
         "请根据创作要求完成作品。宿主会将新作正文保存到原生 Content；"
@@ -91,18 +109,44 @@ def authoring_prompt(action: str, brief: str, materials: Mapping[str, str] | Non
         "尊重角色身份、既有人物关系、叙事视角和用户给出的设定；明确提纲与人工修订优先于自行补全。"
         "续写前核对上文最后的时间、地点、在场人物、动作和未完成冲突，按其自然接续；让情节或人物状态有所推进，避免复述已有内容、避免重复意象和套话堆叠；结尾顺着作品停下，不强加总结或升华。"
         "输出前在内部检查时间线、人物关系、因果和重复问题并自行修正；不要输出检查清单。"
-        f"{genre_section}只输出符合 JSON Schema 的 JSON，不输出推理过程。\n"
+        f"{genre_section}只输出符合要求的 JSON 对象，不要输出推理过程、前言或额外说明。\n"
         f"{output}"
         f"action: {action}\n{extension}要求:\n{brief.strip()}\n可引用素材:\n{rendered or '（无）'}"
     )
 
 
-def parse_output(raw: object, *, action: str) -> ContentDraft:
-    if type(raw) is str:
+def decode_json_object(raw: object) -> Mapping[str, object]:
+    """Parse a model JSON object, tolerating Markdown code fences or surrounding whitespace."""
+    if isinstance(raw, Mapping):
+        return raw
+    if type(raw) is not str:
+        raise ValueError("invalid_json")
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1]).strip()
+        elif "\n" in text and text.endswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("invalid_json") from None
         try:
-            raw = json.loads(raw)
+            parsed = json.loads(text[start:end + 1])
         except json.JSONDecodeError as error:
             raise ValueError("invalid_json") from error
+    if not isinstance(parsed, Mapping):
+        raise ValueError("invalid_json")
+    return parsed
+
+
+def parse_output(raw: object, *, action: str) -> ContentDraft:
+    if type(raw) is str:
+        raw = decode_json_object(raw)
     expected = {"title", "work_type", "body"} if action == "draft" else {"body"}
     if action not in {"draft", "continue"} or not isinstance(raw, Mapping) or set(raw) != expected:
         raise ValueError("invalid_shape")

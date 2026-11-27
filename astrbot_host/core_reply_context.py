@@ -1,4 +1,4 @@
-﻿"""Local, optional V2 background for AstrBot-owned conversation turns.
+"""Local, optional V2 background for AstrBot-owned conversation turns.
 
 The host keeps its own current conversation history, media and model pipeline.
 This bridge only reads the domain owners' authorized background. It never
@@ -15,11 +15,12 @@ from companion_v2.conversation.foreground import ContextContribution, Contributi
 from companion_v2.conversation.awareness_context import INSTRUCTION as CROSS_WINDOW_INSTRUCTION
 from companion_v2.conversation.growth_context import ROLE_GROWTH_INSTRUCTION
 from companion_v2.conversation.health_context import HEALTH_INSTRUCTION
-from companion_v2.conversation.life_context import LIFE_INSTRUCTION
+from companion_v2.conversation.life_context import LIFE_INSTRUCTION, PUBLIC_READING_INSTRUCTION
 from companion_v2.conversation.location_context import LOCATION_CONTEXT_INSTRUCTION
 from companion_v2.conversation.open_items_context import INSTRUCTION as OPEN_ITEMS_INSTRUCTION
 from companion_v2.conversation.phone_context import PHONE_CONTEXT_INSTRUCTION
 from companion_v2.conversation.relationship_context import RELATIONSHIP_INSTRUCTION
+from companion_v2.conversation.screen_context import SCREEN_CONTEXT_INSTRUCTION
 from companion_v2.conversation.self_review_context import SELF_REVIEW_INSTRUCTION
 from companion_v2.conversation.style_context import EXPRESSION_STYLE_INSTRUCTION
 from companion_v2.execution.models import TaskError, digest, encode, require
@@ -33,7 +34,7 @@ from companion_v2.system_prompts.catalog import (
 )
 from companion_v2.system_prompts.context import SystemPromptContext
 from .core_reply_health import health_perception_snapshot
-from .core_reply_mobile import location_scene_snapshot, phone_scene_snapshot
+from .core_reply_mobile import location_scene_snapshot, phone_scene_snapshot, screen_scene_snapshot
 
 
 logger = logging.getLogger(__name__)
@@ -290,11 +291,11 @@ def _legacy_memory_materials(memory, context, native_input, at, timezone_name):
     return tuple(materials)
 
 
-def _cross_window_section(messages, context, at, current_text=""):
+def _cross_window_section(messages, context, at, current_text="", *, input_at=None):
     owner = getattr(messages, "cross_window_context", None)
     if owner is None:
         return ""
-    material = owner.contribution(context, at, current_text=current_text)
+    material = owner.contribution(context, at, current_text=current_text, input_at=input_at)
     if material is None:
         return ""
     return _material_section("跨窗口在场", CROSS_WINDOW_INSTRUCTION, (material,))
@@ -426,7 +427,7 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
 
     optional("account_links", account_link_context)
     optional("cross_window", lambda: _cross_window_section(
-        messages, context, at, getattr(native_input, "text", "")))
+        messages, context, at, getattr(native_input, "text", ""), input_at=_input_received_at(native_input, at)))
     optional("knowledge_reference", lambda: _material_section("角色知识资料", system_text("knowledge", KNOWLEDGE_INSTRUCTION),
         _knowledge_materials(messages, context, native_input, at,
                              official_hits=official_knowledge_hits,
@@ -504,6 +505,11 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
             if location:
                 perception_data["location_context"] = location
                 instructions.append(LOCATION_CONTEXT_INSTRUCTION)
+            if settings.get("screen_context_enabled") is True:
+                screen = screen_scene_snapshot(application, context, at)
+                if screen:
+                    perception_data["screen_context"] = screen
+                    instructions.append(SCREEN_CONTEXT_INSTRUCTION)
         # Personal birthdays are explicit profile data, so they remain available
         # even when generic calendar labels are disabled. User data is included
         # only for the identified private recipient; role data is safe to share
@@ -603,7 +609,33 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
                                      perception_settings()["calendar_timezone"])))
         captured("relationship", "相处背景", system_text("relationship", RELATIONSHIP_INSTRUCTION),
                  getattr(messages, "relationship_context", None))
-        captured("life", "角色生活", LIFE_INSTRUCTION, getattr(messages, "life_context", None))
+
+        has_local_reading = False
+
+        def private_life():
+            nonlocal has_local_reading
+            owner = getattr(messages, "life_context", None)
+            materials = _capture_materials(owner, context, at, runtime=runtime)
+            has_local_reading = any(
+                getattr(item, "purpose", None) == "role_life_activity"
+                and '"kind":"reading"' in (getattr(item, "payload", "") or "")
+                for item in _ready(materials)
+            )
+            return _material_section("角色生活", LIFE_INSTRUCTION, materials)
+
+        def private_public_reading():
+            if has_local_reading:
+                return ""
+            owner = getattr(messages, "life_context", None)
+            if owner is None or not hasattr(owner, "public_reading_contributions"):
+                return ""
+            public_items = owner.public_reading_contributions(context, at)
+            if not public_items:
+                return ""
+            return _material_section("角色近期阅读书目", PUBLIC_READING_INSTRUCTION, public_items)
+
+        optional("life", private_life)
+        optional("public_reading", private_public_reading)
         captured("growth", "角色成长", ROLE_GROWTH_INSTRUCTION,
                  getattr(messages, "role_growth_context", None))
         captured("self_review", "角色自我提醒", SELF_REVIEW_INSTRUCTION,
@@ -656,6 +688,18 @@ def build_core_reply_prompt(application, context, native_input, *, at, keyword_m
                                                owner.contributions(snapshot, context, key))
 
         optional("group_memory", group_memory)
+
+        def group_public_reading():
+            owner = getattr(messages, "life_context", None)
+            if owner is None or not hasattr(owner, "public_reading_contributions"):
+                return ""
+            return _material_section(
+                "角色近期阅读书目",
+                PUBLIC_READING_INSTRUCTION,
+                owner.public_reading_contributions(context, at),
+            )
+
+        optional("public_reading", group_public_reading)
         optional("role_state", role_state)
 
     def expression_style():

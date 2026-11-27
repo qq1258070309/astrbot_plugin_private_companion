@@ -176,7 +176,7 @@ test("Contract: ALL config search entries resolve to valid routes, subtabs, DOM 
   const validDecisionViews = new Set(["overview", "response", "tempo", "safety", "guard", "group"]);
   const validUnderstandingTabs = new Set(["overview", "image", "video", "file", "web", "forwards"]);
   const validContactViews = new Set(["dial", "morning", "tests", "purposes", "gates", "budgets", "sources", "materials"]);
-  const validModelsTabs = new Set(["fn", "voice", "image", "search", "laya", "pricing"]);
+  const validModelsTabs = new Set(["fn", "voice", "image", "search", "laya", "pricing", "quota"]);
   const validSelfSections = new Set(h.run("SELF_PROFILE_SECTIONS.map(([id]) => id)"));
 
   let total = 0;
@@ -284,6 +284,18 @@ test("Contract: ALL config search entries resolve to valid routes, subtabs, DOM 
   const interjectLoc = h.run(`resolveSettingTarget({group:"group_participation",section:"interjection",field:"enable_group_interjection"})`);
   assert.equal(interjectLoc.scopeRequirement, "group");
   assert.ok(interjectLoc.scopeHint);
+
+  const replyEntries = h.window.CompanionReplyPage.searchEntries();
+  const replyFields = new Set(replyEntries.filter(e => e.group === "conversation.presentation").map(e => e.field));
+  assert.ok(replyFields.has("private_tool_profile"), "conversation.presentation must index private_tool_profile");
+  assert.ok(replyFields.has("private_tool_groups"), "conversation.presentation must index private_tool_groups");
+  for (const field of ["private_tool_profile", "private_tool_groups"]) {
+    const loc = h.run(`resolveSettingTarget({group:"conversation.presentation",section:"wakeup_direct",field:${JSON.stringify(field)}})`);
+    assert.equal(loc.next, "manage");
+    assert.equal(loc.tab, "decision");
+    assert.equal(loc.decisionView, "response");
+    assert.equal(loc.root, "#decisionReplyWorkspace");
+  }
 });
 
 test("Contract: searchIndex has zero dead links, zero duplicates, valid destinations, and covers all core pages & subtabs", () => {
@@ -293,7 +305,7 @@ test("Contract: searchIndex has zero dead links, zero duplicates, valid destinat
   const titles = new Set();
   const validHomeSections = new Set(["overview", "observation", "furniture"]);
   const validOutputTabs = new Set(["visual", "capabilities", "gallery", "materials", "creation"]);
-  const validModelsTabs = new Set(["fn", "voice", "image", "search", "laya", "pricing"]);
+  const validModelsTabs = new Set(["fn", "voice", "image", "search", "laya", "pricing", "quota"]);
 
   for (const entry of index) {
     const [title, desc, icon, kind, tab, opts = {}] = entry;

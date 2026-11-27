@@ -294,9 +294,54 @@
    它们铺满整页宽而不是挤在右栏：24 根柱子需要的是横向空间，
    放在 320px 的栏里每根柱子只剩十来像素，谁也读不出来。
    盘面保持 sticky：下面三块可以很长，滚下去时「此刻」不该滚出视野。 */
-.ct-dial-wrap{display:grid;grid-template-columns:minmax(0,300px) minmax(0,1fr);gap:var(--sp-5);align-items:start}
-.ct-dial-stage{position:sticky;top:12px;display:flex;flex-direction:column;align-items:center;gap:var(--sp-3)}
-.ct-controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--ct-v-block);align-content:start;min-width:0}
+.ct-dial-wrap{display:grid;grid-template-columns:minmax(256px,316px) minmax(0,1fr);gap:var(--sp-4);align-items:stretch}
+.ct-dial-stage{
+  position:relative;display:flex;flex-direction:column;align-items:center;justify-content:space-between;
+  gap:var(--sp-3);min-width:0;padding:var(--sp-4);
+  border:1px solid var(--t-line);border-radius:var(--r-md);
+  background:var(--t-surface);box-shadow:var(--t-shadow);
+}
+.ct-dial-face{position:relative;width:100%;max-width:280px;margin:auto 0;display:flex;align-items:center;justify-content:center}
+.ct-dial-legend{
+  display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--sp-2);
+  width:100%;padding-top:var(--sp-3);border-top:1px solid var(--t-line);
+}
+.ct-ring-chip{
+  display:flex;align-items:flex-start;gap:var(--sp-2);min-width:0;
+  padding:var(--sp-1) var(--sp-2);border:1px solid var(--t-line);border-radius:var(--r-sm);
+  background:var(--t-surface-soft);color:var(--t-text-soft);text-align:left;
+  font:inherit;cursor:pointer;
+  transition:border-color var(--dur-fast) ease,background var(--dur-fast) ease;
+}
+.ct-ring-chip:hover{border-color:var(--t-line-firm);background:var(--t-surface-raised)}
+.ct-ring-chip:focus-visible{outline:2px solid var(--t-focus);outline-offset:2px}
+.ct-ring-chip > i{
+  flex:none;width:8px;height:8px;margin-top:var(--sp-1);border-radius:50%;
+  background:var(--ring,var(--t-line-firm));opacity:.45;
+}
+.ct-ring-chip.is-on > i{opacity:1}
+.ct-ring-chip.is-ring-quiet{--ring:var(--t-text-faint)}
+.ct-ring-chip.is-ring-curve{--ring:var(--t-accent)}
+.ct-ring-chip.is-ring-tier{--ring:var(--t-warn)}
+.ct-ring-chip.is-ring-greet{--ring:var(--t-ok)}
+.ct-ring-chip > span{display:flex;flex-direction:column;min-width:0}
+.ct-ring-chip strong{
+  font-size:var(--fs-micro);font-weight:650;color:var(--t-text-strong);
+  line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.ct-ring-chip small{
+  font-size:var(--fs-micro);color:var(--t-text-faint);line-height:1.35;
+  font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.ct-controls{display:grid;grid-template-columns:minmax(0,0.86fr) minmax(0,1.14fr);gap:var(--ct-v-block);align-items:stretch;min-width:0}
+.ct-global-summary{
+  display:grid;gap:var(--sp-2);margin:auto 0 0;padding:var(--sp-3);
+  border:1px solid var(--t-line);border-radius:var(--r-sm);
+  background:var(--t-surface-soft);font-variant-numeric:tabular-nums;
+}
+.ct-global-summary > div{display:flex;align-items:baseline;justify-content:space-between;gap:var(--sp-2);min-width:0}
+.ct-global-summary dt{font-size:var(--fs-micro);color:var(--t-text-faint);white-space:nowrap}
+.ct-global-summary dd{margin:0;font-size:var(--fs-tiny);font-weight:650;color:var(--t-text-strong);text-align:right;white-space:nowrap}
 /* .ct-rest 与 .ct-dial-wrap 是 .ct-main 的两个相邻子项，间距已由那里的
    flex gap 给出，这里不再加 margin——两处都加会得到双倍行距。 */
 .ct-rest{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--ct-v-block);align-items:start}
@@ -413,7 +458,7 @@
   width:30%;max-width:112px;display:flex;flex-direction:column;align-items:center;
   gap:2px;text-align:center;pointer-events:none;
 }
-.ct-center-title{font-size:var(--fs-tiny);font-weight:650;line-height:1.25}
+.ct-center-title{font-size:var(--fs-tiny);font-weight:650;line-height:1.25;white-space:nowrap}
 .ct-center-detail{font-size:var(--fs-micro);line-height:1.35;color:var(--t-text-faint)}
 .ct-center-action{
   pointer-events:auto;padding:3px var(--sp-1);border:0;border-radius:var(--r-xs);
@@ -750,32 +795,64 @@
 }
 .ct-purpose.is-blocked .ct-purpose-name{color:var(--t-text-faint);text-decoration:line-through}
 
-/* 权重条：range 铺满一层（透明轨道专供键盘与无障碍），
-   填充条与数字在上面。 */
-.ct-weight{position:relative;display:flex;align-items:center;gap:var(--sp-2)}
-.ct-weight input[type="range"]{
-  position:relative;z-index:2;flex:1;min-width:0;height:16px;margin:0;
-  background:transparent;-webkit-appearance:none;appearance:none;cursor:pointer;
+/* 权重条：独立轨壳 `.ct-weight-track` 严格与 input[type=range] 等宽，
+   使用归一化比例 `--p = (val - min) / (max - min)` 与半圆点中心补偿
+   `calc(var(--p) * (100% - var(--ct-thumb)) + var(--ct-thumb) / 2)`，
+   消除右侧数字宽度串扰、非零下限偏移及圆点上下错位。 */
+.ct-weight{position:relative;display:flex;align-items:center;gap:var(--sp-2);min-width:0}
+.ct-weight-track{
+  --ct-track:4px;
+  --ct-thumb:14px;
+  position:relative;flex:1;min-width:0;display:flex;align-items:center;height:20px;
 }
-.ct-weight input[type="range"]::-webkit-slider-thumb{
-  -webkit-appearance:none;width:11px;height:11px;border-radius:50%;
-  background:var(--t-accent-solid);border:2px solid var(--t-surface);cursor:grab;
-}
-.ct-weight input[type="range"]::-moz-range-thumb{
-  width:11px;height:11px;border:2px solid var(--t-surface);border-radius:50%;
-  background:var(--t-accent-solid);cursor:grab;
-}
-.ct-weight-fill{
-  position:absolute;left:0;top:50%;height:4px;width:var(--w);transform:translateY(-50%);
-  border-radius:var(--r-pill);background:var(--t-accent);opacity:.7;
-  pointer-events:none;transition:width .12s ease;
-}
-.ct-weight::before{
-  content:"";position:absolute;left:0;right:26px;top:50%;height:4px;transform:translateY(-50%);
+.ct-weight-track::before{
+  content:"";position:absolute;left:0;right:0;top:50%;height:var(--ct-track);transform:translateY(-50%);
   border-radius:var(--r-pill);background:var(--t-surface-sunken);pointer-events:none;
 }
+.ct-weight-fill{
+  position:absolute;left:0;top:50%;height:var(--ct-track);
+  width:calc(var(--p,0) * (100% - var(--ct-thumb)) + var(--ct-thumb) / 2);
+  transform:translateY(-50%);
+  border-radius:var(--r-pill);background:var(--t-accent-solid);opacity:.78;
+  pointer-events:none;
+}
+.ct-weight input[type="range"]{
+  position:relative;z-index:2;display:block;width:100%;height:20px;margin:0;padding:0;
+  background:transparent;-webkit-appearance:none;appearance:none;cursor:pointer;
+}
+.ct-weight input[type="range"]::-webkit-slider-runnable-track{
+  height:var(--ct-track);border-radius:var(--r-pill);background:transparent;
+}
+.ct-weight input[type="range"]::-moz-range-track{
+  height:var(--ct-track);border-radius:var(--r-pill);border:0;background:transparent;
+}
+.ct-weight input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none;box-sizing:border-box;width:var(--ct-thumb);height:var(--ct-thumb);
+  margin-top:calc((var(--ct-track) - var(--ct-thumb)) / 2);border-radius:50%;
+  background:var(--t-accent-solid);border:2px solid var(--t-surface);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--t-accent-solid) 24%,transparent);
+  cursor:grab;transition:transform var(--dur-fast) ease,box-shadow var(--dur-fast) ease;
+}
+.ct-weight input[type="range"]::-moz-range-thumb{
+  box-sizing:border-box;width:var(--ct-thumb);height:var(--ct-thumb);
+  border:2px solid var(--t-surface);border-radius:50%;
+  background:var(--t-accent-solid);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--t-accent-solid) 24%,transparent);
+  cursor:grab;transition:transform var(--dur-fast) ease,box-shadow var(--dur-fast) ease;
+}
+.ct-weight input[type="range"]:hover::-webkit-slider-thumb{
+  transform:scale(1.1);box-shadow:0 0 0 4px var(--t-accent-quiet);
+}
+.ct-weight input[type="range"]:hover::-moz-range-thumb{
+  transform:scale(1.1);box-shadow:0 0 0 4px var(--t-accent-quiet);
+}
+.ct-weight input[type="range"]:active::-webkit-slider-thumb{cursor:grabbing;transform:scale(1.15)}
+.ct-weight input[type="range"]:active::-moz-range-thumb{cursor:grabbing;transform:scale(1.15)}
+.ct-weight input[type="range"]:focus-visible{outline:none}
+.ct-weight input[type="range"]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 3px var(--t-focus)}
+.ct-weight input[type="range"]:focus-visible::-moz-range-thumb{box-shadow:0 0 0 3px var(--t-focus)}
 .ct-weight em{
-  flex:none;width:24px;font-style:normal;font-size:var(--fs-micro);color:var(--t-text-faint);
+  flex:none;width:28px;font-style:normal;font-size:var(--fs-micro);color:var(--t-text-faint);
   text-align:right;font-variant-numeric:tabular-nums;
 }
 
@@ -829,6 +906,8 @@
   min-width:0;min-height:72px;
   padding:var(--sp-3) var(--sp-4);border:1px solid var(--t-line);border-radius:var(--r-md);
   background:var(--t-surface);box-shadow:var(--t-shadow);
+}
+.ct-gates.is-entering .ct-gate{
   animation:ct-gate-in .42s cubic-bezier(.16,1,.3,1) both;
   animation-delay:calc(var(--i,0) * 38ms);
 }
@@ -920,24 +999,45 @@
 }
 .ct-quota-value i{font-style:normal;font-size:var(--fs-micro);color:var(--t-text-faint)}
 .ct-quota input[type="range"]{
-  width:100%;height:18px;margin:0;background:transparent;
+  --ct-track:4px;
+  --ct-thumb:14px;
+  --ct-fill:calc(var(--p,0) * (100% - var(--ct-thumb)) + var(--ct-thumb) / 2);
+  display:block;width:100%;height:20px;margin:0;padding:0;background:transparent;
   -webkit-appearance:none;appearance:none;cursor:pointer;
 }
 .ct-quota input[type="range"]::-webkit-slider-runnable-track{
-  height:4px;border-radius:var(--r-pill);background:var(--t-surface-sunken);
+  height:var(--ct-track);border-radius:var(--r-pill);
+  background:linear-gradient(to right,color-mix(in srgb,var(--t-accent-solid) 78%,transparent) 0,color-mix(in srgb,var(--t-accent-solid) 78%,transparent) var(--ct-fill),var(--t-surface-sunken) var(--ct-fill),var(--t-surface-sunken) 100%);
 }
 .ct-quota input[type="range"]::-moz-range-track{
-  height:4px;border-radius:var(--r-pill);background:var(--t-surface-sunken);
+  height:var(--ct-track);border-radius:var(--r-pill);border:0;
+  background:linear-gradient(to right,color-mix(in srgb,var(--t-accent-solid) 78%,transparent) 0,color-mix(in srgb,var(--t-accent-solid) 78%,transparent) var(--ct-fill),var(--t-surface-sunken) var(--ct-fill),var(--t-surface-sunken) 100%);
 }
 .ct-quota input[type="range"]::-webkit-slider-thumb{
-  -webkit-appearance:none;width:13px;height:13px;margin-top:calc(var(--sp-1) * -1);
+  -webkit-appearance:none;box-sizing:border-box;width:var(--ct-thumb);height:var(--ct-thumb);
+  margin-top:calc((var(--ct-track) - var(--ct-thumb)) / 2);
   border-radius:50%;background:var(--t-accent-solid);
-  border:2px solid var(--t-surface);cursor:grab;
+  border:2px solid var(--t-surface);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--t-accent-solid) 24%,transparent);
+  cursor:grab;transition:transform var(--dur-fast) ease,box-shadow var(--dur-fast) ease;
 }
 .ct-quota input[type="range"]::-moz-range-thumb{
-  width:13px;height:13px;border:2px solid var(--t-surface);border-radius:50%;
-  background:var(--t-accent-solid);cursor:grab;
+  box-sizing:border-box;width:var(--ct-thumb);height:var(--ct-thumb);border:2px solid var(--t-surface);border-radius:50%;
+  background:var(--t-accent-solid);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--t-accent-solid) 24%,transparent);
+  cursor:grab;transition:transform var(--dur-fast) ease,box-shadow var(--dur-fast) ease;
 }
+.ct-quota input[type="range"]:hover::-webkit-slider-thumb{
+  transform:scale(1.1);box-shadow:0 0 0 4px var(--t-accent-quiet);
+}
+.ct-quota input[type="range"]:hover::-moz-range-thumb{
+  transform:scale(1.1);box-shadow:0 0 0 4px var(--t-accent-quiet);
+}
+.ct-quota input[type="range"]:active::-webkit-slider-thumb{cursor:grabbing;transform:scale(1.15)}
+.ct-quota input[type="range"]:active::-moz-range-thumb{cursor:grabbing;transform:scale(1.15)}
+.ct-quota input[type="range"]:focus-visible{outline:none}
+.ct-quota input[type="range"]:focus-visible::-webkit-slider-thumb{box-shadow:0 0 0 3px var(--t-focus)}
+.ct-quota input[type="range"]:focus-visible::-moz-range-thumb{box-shadow:0 0 0 3px var(--t-focus)}
 .ct-quota-scale{
   display:flex;justify-content:space-between;
   font-size:var(--fs-micro);color:var(--t-text-faint);font-variant-numeric:tabular-nums;
@@ -1254,6 +1354,10 @@
   .ct-purpose-groups{grid-template-columns:minmax(0,1fr)}
   .ct-bucket.is-wide .ct-purpose-list{grid-template-columns:minmax(0,1fr)}
 }
+@container ct-main (max-width:860px){
+  .ct-dial-wrap{grid-template-columns:minmax(244px,292px) minmax(0,1fr);gap:var(--sp-4)}
+  .ct-controls{grid-template-columns:minmax(0,1fr)}
+}
 @container ct-main (max-width:780px){
   .ct-dial-wrap{grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:var(--sp-4)}
   .ct-controls{grid-template-columns:minmax(0,1fr)}
@@ -1276,12 +1380,8 @@
 }
 
 /* ===== 中屏 =====
-   1460px 以下（含 1280/1440px 桌面嵌套 iframe）右栏放不下两张控制卡，改竖排；盘面仍在左侧。 */
-@media (max-width:1460px){
-  .ct-controls{grid-template-columns:minmax(0,1fr)}
-}
+   主内容已由 @container ct-main 接管双栏/单栏折行，不再按外层视口宽度强压 .ct-controls。 */
 @media (max-width:1180px){
-  .ct-controls{grid-template-columns:minmax(0,1fr)}
   .ct-purpose-tools{grid-template-columns:repeat(2,minmax(0,1fr))}
   .ct-purpose-search,.ct-purpose-results{grid-column:1 / -1}
   .ct-test-tools{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -1348,7 +1448,14 @@
   .ct-curve-plot{height:76px}
 }
 
+@media (pointer:coarse),(max-width:760px){
+  .ct-weight-track{--ct-thumb:18px;height:36px}
+  .ct-weight input[type="range"]{height:36px}
+  .ct-quota input[type="range"]{--ct-thumb:18px;height:36px}
+}
 @media (max-width:520px){
+  .ct-purpose{grid-template-columns:minmax(0,1fr);row-gap:var(--sp-2)}
+  .ct-purpose-state{grid-column:auto;justify-content:flex-start}
   .ct-purposes-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
   .ct-purpose-stat:nth-child(2){border-right:0}
   .ct-purpose-stat:nth-child(-n+2){border-bottom:1px solid var(--t-line)}
@@ -1460,7 +1567,7 @@
    只压时长的话会先空白一段再「啪」地出现——那不是减弱动效，是闪烁。 */
 @media (prefers-reduced-motion:reduce){
   .ct-dial.is-entering,.ct-dial.is-scanning .ct-bar.is-on,
-  .ct-dial.is-scanning .ct-cursor-dot,.ct-gate,.ct-verdict.is-open .ct-dot,
+  .ct-dial.is-scanning .ct-cursor-dot,.ct-gates.is-entering .ct-gate,.ct-verdict.is-open .ct-dot,
   .ct-center.is-open::before,.ct-spinner,
   .ct-dial-stage.is-pulse-quiet .ct-quiet path,
   .ct-dial-stage.is-pulse-curve .ct-bar.is-on,

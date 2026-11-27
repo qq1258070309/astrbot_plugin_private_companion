@@ -161,6 +161,37 @@ def window_active(windows, *, minutes):
                for candidate in (minutes, minutes + 24 * 60))
 
 
+def _local_datetime(now, timezone):
+    """Localized datetime for the configured sleep timezone; bad zones fall back."""
+    try:
+        zone = zoneinfo.ZoneInfo(str(timezone or DEFAULT_TIMEZONE))
+    except Exception:
+        zone = zoneinfo.ZoneInfo(DEFAULT_TIMEZONE)
+    return normalize_utc(now, field="rest gate time").astimezone(zone)
+
+
+def _active_window_instance(settings, *, now):
+    """Return ``(wake_at, window_key)`` for the explicit rest window containing ``now``.
+
+    ``window_key`` anchors to the window instance's local start date and minute
+    bounds ``(start, end)`` so messages arriving at different seconds or across
+    local midnight within the same window share one stable awake-grace key,
+    while distinct dates or distinct windows remain separate.
+    """
+    windows = settings.windows()
+    if not windows:
+        return None
+    local = _local_datetime(now, settings.sleep_timezone)
+    minutes = local.hour * 60 + local.minute
+    for start, end in windows:
+        for candidate in (minutes, minutes + 24 * 60):
+            if start <= candidate < end:
+                wake_at = now + timedelta(minutes=end - candidate)
+                origin_date = local.date() - timedelta(days=1 if candidate >= 24 * 60 else 0)
+                return wake_at, f"rest_window:{origin_date.isoformat()}:{start}-{end}"
+    return None
+
+
 def window_wake_at(settings, *, now):
     """End of the configured rest window containing ``now``, or ``None``.
 
@@ -168,24 +199,13 @@ def window_wake_at(settings, *, now):
     role sleep; a role that has no sleep receipt can still rest through the
     explicit window without pretending an execution receipt exists.
     """
-    windows = settings.windows()
-    if not windows:
-        return None
-    minutes = local_minutes(now, settings.sleep_timezone)
-    for start, end in windows:
-        for candidate in (minutes, minutes + 24 * 60):
-            if start <= candidate < end:
-                return now + timedelta(minutes=end - candidate)
-    return None
+    matched = _active_window_instance(settings, now=now)
+    return matched[0] if matched is not None else None
 
 
 def local_minutes(now, timezone):
     """Local minute of day for the configured sleep timezone; bad zones fall back."""
-    try:
-        zone = zoneinfo.ZoneInfo(str(timezone or DEFAULT_TIMEZONE))
-    except Exception:
-        zone = zoneinfo.ZoneInfo(DEFAULT_TIMEZONE)
-    local = normalize_utc(now, field="rest gate time").astimezone(zone)
+    local = _local_datetime(now, timezone)
     return local.hour * 60 + local.minute
 
 
@@ -233,6 +253,8 @@ class Settings:
     rest_backlog_max_messages: int
     sleep_timezone: str = DEFAULT_TIMEZONE
     sleep_enabled: bool = False
+    sleep_time: str = "00:30"
+    sleep_minutes: int = 480
 
     def __post_init__(self):
         for name in BOOLEAN_FIELDS:
@@ -252,10 +274,16 @@ class Settings:
         parse_windows(self.rest_reply_active_windows)
         if type(self.sleep_timezone) is not str or not self.sleep_timezone.strip():
             raise ConfigurationError("rest_gate_settings_invalid", "the sleep timezone requires an IANA name")
+        if type(self.sleep_time) is not str or not self.sleep_time.strip():
+            raise ConfigurationError("rest_gate_settings_invalid", "sleep_time requires HH:MM")
+        if type(self.sleep_minutes) is not int or not 1 <= self.sleep_minutes <= 1440:
+            raise ConfigurationError("rest_gate_settings_invalid", "sleep_minutes must be 1..1440")
 
     @classmethod
     def from_values(cls, values=None):
         values = values or {}
+        sleep_time = values.get("sleep_time")
+        sleep_minutes = values.get("sleep_minutes")
         return cls(
             enable_rest_reply_simulation=values.get(
                 "enable_rest_reply_simulation", DEFAULTS["enable_rest_reply_simulation"]),
@@ -272,9 +300,26 @@ class Settings:
                 "rest_backlog_max_messages", DEFAULTS["rest_backlog_max_messages"]),
             sleep_timezone=str(values.get("sleep_timezone") or DEFAULT_TIMEZONE),
             sleep_enabled=values.get("sleep_enabled", False),
+            sleep_time=str(sleep_time) if isinstance(sleep_time, str) and sleep_time.strip() else "00:30",
+            sleep_minutes=sleep_minutes if type(sleep_minutes) is int else 480,
         )
 
+    def uses_default_windows(self):
+        return self.rest_reply_active_windows == DEFAULTS["rest_reply_active_windows"]
+
     def windows(self):
+        # When automatic sleep is configured with a custom bedtime/duration and
+        # the rest-reply active windows remain untouched at their default, align
+        # the night rest window with the role's actual sleep schedule instead of
+        # hardcoding 23:00-08:30.
+        if (self.sleep_enabled and self.uses_default_windows()
+                and (self.sleep_time != "00:30" or self.sleep_minutes != 480)):
+            parts = self.sleep_time.split(":")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start_minute = (int(parts[0]) % 24) * 60 + min(59, int(parts[1]))
+                padded_start = (start_minute - 30) % (24 * 60)
+                padded_duration = min(23 * 60, max(60, self.sleep_minutes) + 60)
+                return ((padded_start, padded_start + padded_duration), (12 * 60 + 20, 13 * 60 + 40))
         return parse_windows(self.rest_reply_active_windows)
 
     def max_backlog(self):
@@ -350,9 +395,11 @@ def sleep_context(runtime, context, *, now, settings=None):
         # window itself is the durable rest bound, and it only applies when the
         # operator enabled the rest-reply simulation and configured windows.
         if settings.enable_rest_reply_simulation:
-            window_wake = window_wake_at(settings, now=now)
-            if window_wake is not None:
+            matched = _active_window_instance(settings, now=now)
+            if matched is not None:
+                window_wake, window_key = matched
                 return {"resting": True, "reason": "rest_window", "sleep": None,
+                        "window_key": window_key,
                         "wake_at": window_wake,
                         "until_seconds": max(0.0, (window_wake - now).total_seconds())}
         return {"resting": False, "reason": "not_sleeping", "sleep": None, "wake_at": None, "until_seconds": None}
@@ -360,9 +407,11 @@ def sleep_context(runtime, context, *, now, settings=None):
     if not active and not settings.sleep_enabled and settings.enable_rest_reply_simulation:
         # Older interrupted receipts must not make a disabled sleep schedule
         # permanently immune to the operator's explicit rest windows.
-        window_wake = window_wake_at(settings, now=now)
-        if window_wake is not None:
+        matched = _active_window_instance(settings, now=now)
+        if matched is not None:
+            window_wake, window_key = matched
             return {"resting": True, "reason": "rest_window", "sleep": None,
+                    "window_key": window_key,
                     "wake_at": window_wake,
                     "until_seconds": max(0.0, (window_wake - now).total_seconds())}
     activity = receipts[-1]
@@ -376,7 +425,8 @@ def sleep_context(runtime, context, *, now, settings=None):
         # The durable timer has already expired; the waking owner completes it.
         return {"resting": False, "reason": "sleep_timer_due", "sleep": activity.activity_id,
                 "wake_at": wake_at, "until_seconds": 0.0}
-    if not window_active(settings.windows(), minutes=local_minutes(now, settings.sleep_timezone)):
+    if (not (settings.sleep_enabled and settings.uses_default_windows())
+            and not window_active(settings.windows(), minutes=local_minutes(now, settings.sleep_timezone))):
         return {"resting": False, "reason": "outside_active_window", "sleep": activity.activity_id,
                 "wake_at": wake_at, "until_seconds": None}
     until = None if wake_at is None else max(0.0, (wake_at - now).total_seconds())
@@ -407,6 +457,17 @@ def awake_grace(state, *, now):
     return {"active": True, "sleep": state.get("awake_sleep"), "until": until}
 
 
+def sleep_grace_key(sleep):
+    """Non-empty identifier tying awake grace to one sleep receipt or explicit rest window."""
+    if not isinstance(sleep, dict):
+        return None
+    for field in ("sleep", "window_key"):
+        value = sleep.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def judgement(settings, *, now, sleep, text="", grace=None, judge=None):
     """The whole decision as a plain mapping; no storage and no model call.
 
@@ -425,7 +486,9 @@ def judgement(settings, *, now, sleep, text="", grace=None, judge=None):
         result["reason"] = (sleep or {}).get("reason") or "not_sleeping"
         return result
     result["resting"] = True
-    if isinstance(grace, dict) and grace.get("active") and grace.get("sleep") == sleep.get("sleep"):
+    grace_key = sleep_grace_key(sleep)
+    if (isinstance(grace, dict) and grace.get("active")
+            and grace_key is not None and grace.get("sleep") == grace_key):
         # V1: a role called awake once is not re-judged for the next messages.
         result["reason"] = "awake_grace"
         return result
@@ -564,7 +627,7 @@ def deferral(runtime, context, *, text="", now, event_key="", source=None, capab
     settings = settings or read_settings(runtime, context)
     sleep = sleep_context(runtime, context, now=now, settings=settings)
     if not settings.enable_rest_reply_simulation:
-        if body_clock is not None and sleep.get("resting") and sleep.get("sleep"):
+        if body_clock is not None and sleep.get("resting") and sleep.get("reason") == "sleep_window" and sleep.get("sleep"):
             body_clock.interrupt(context, sleep["sleep"], observed_at=now,
                                  grace_minutes=settings.rest_reply_awake_grace_minutes)
         return 0.0
@@ -580,11 +643,11 @@ def deferral(runtime, context, *, text="", now, event_key="", source=None, capab
                                entry=backlog_entry(now=now, reason=decision["reason"], source=source,
                                                    capability=capability, sleep=sleep.get("sleep")))
     else:
-        if body_clock is not None and sleep.get("resting") and sleep.get("sleep"):
+        if body_clock is not None and sleep.get("resting") and sleep.get("reason") == "sleep_window" and sleep.get("sleep"):
             body_clock.interrupt(context, sleep["sleep"], observed_at=now,
                                  grace_minutes=settings.rest_reply_awake_grace_minutes)
-        if decision["reason"] != "awake_grace":
-            state = mark_awake(state, now=now, settings=settings, sleep=sleep.get("sleep"))
+        if sleep.get("resting") and decision["reason"] != "awake_grace":
+            state = mark_awake(state, now=now, settings=settings, sleep=sleep_grace_key(sleep))
     if event_key:
         state = dict(state)
         state["last"] = {"event": event_key, "defer": float(decision["defer"]), "reason": decision["reason"]}
@@ -614,20 +677,21 @@ def backlog_prompt(entries, texts, *, timezone=DEFAULT_TIMEZONE, max_messages=4)
     when the original can no longer be read. Nothing is quoted from storage here,
     so a revoked or expired original simply reads as an unreadable message.
     """
+    entries = tuple(entries or ())
     texts = tuple(texts or ())
     limit = max(0, min(MAX_BACKLOG_ENTRIES, int(max_messages)))
     try:
         zone = zoneinfo.ZoneInfo(str(timezone or DEFAULT_TIMEZONE))
     except Exception:
         zone = zoneinfo.ZoneInfo(DEFAULT_TIMEZONE)
+    paired = tuple((entry, texts[i] if i < len(texts) else None) for i, entry in enumerate(entries))
     lines = []
-    for index, entry in enumerate(tuple(entries or ())[-limit:] if limit else (), 1):
+    for index, (entry, raw) in enumerate(paired[-limit:] if limit else (), 1):
         moment = "刚才"
         try:
             moment = datetime.fromisoformat(entry["at"]).astimezone(zone).strftime("%H:%M")
         except (KeyError, TypeError, ValueError):
             pass
-        raw = texts[index - 1] if index - 1 < len(texts) else None
         body = " ".join(str(raw).split())[:MAX_BACKLOG_TEXT_CHARS] if raw else "发来了一条消息"
         lines.append(f"{index}. {moment}｜{body}")
     if not lines:

@@ -13,12 +13,13 @@ import hmac
 import inspect
 import ipaddress
 import math
+import posixpath
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from .amap_geocode import amap_cache_key, reverse_geocode
 try:
     from quart import request
@@ -40,6 +41,14 @@ MOBILE_STATUS_DISCOVERY_TIMEOUT_SECONDS = 4.0
 MOBILE_AMAP_NOTIFY_WAIT_SECONDS = 5.0
 MOBILE_MAX_SESSIONS_PER_USER = 8
 MOBILE_PROXY_MAX_WS_BYTES = 16 * 1024 * 1024
+MOBILE_PROXY_ALLOWED_EXACT: dict[str, tuple[str, ...]] = {
+    'together': ('/avatar',),
+    'game': (),
+}
+MOBILE_PROXY_ALLOWED_PREFIXES: dict[str, tuple[str, ...]] = {
+    'together': ('/join/', '/media/', '/api/novels/', '/assets/'),
+    'game': ('/assets/', '/native-assets/', '/api/room/', '/api/native/', '/room/', '/native/'),
+}
 MOBILE_TELEMETRY_MAX_MEASUREMENTS = 32
 MOBILE_TELEMETRY_MAX_TYPES = 24
 MOBILE_TELEMETRY_MAX_ACTIVITY_METRICS = 8
@@ -63,6 +72,20 @@ _mobile_request_state: contextvars.ContextVar[_MobileRequestState | None] = cont
 
 def _clean(value: Any, limit: int=160) -> str:
     return ' '.join(str(value or '').replace('\x00', ' ').split())[:limit]
+
+
+def _mobile_persona_display_name(value: Any, limit: int=12) -> str:
+    """Format a role display name for mobile UI headers without dangling brackets."""
+    cleaned = _clean(value, 120)
+    if len(cleaned) <= limit:
+        return cleaned
+    for delimiter in ('（', '(', '【', '[', '/', '｜', '|', '—', '–'):
+        head, sep, _rest = cleaned.partition(delimiter)
+        primary = head.strip()
+        if sep and primary and len(primary) <= limit:
+            return primary
+    trimmed = cleaned[:limit].rstrip(' \t（([【/|·、-:：—–')
+    return trimmed or cleaned[:limit]
 
 def _number(value: Any, default: float=0.0) -> float:
     try:
@@ -332,15 +355,19 @@ class MobileGatewayMixin:
         return bool(self._cfg_bool('mobile.screen_upload_enabled', True))
 
     def _mobile_telemetry_enabled(self) -> bool:
-        if hasattr(self, 'health_enabled'):
-            return bool(getattr(self, 'health_enabled'))
-        return bool(self._cfg_bool('mobile.telemetry_enabled', False))
+        return bool(getattr(self, 'health_enabled', False) or self._cfg_bool('mobile.telemetry_enabled', False))
 
     def _mobile_telemetry_ttl(self) -> int:
+        mobile_enabled = bool(self._cfg_bool('mobile.telemetry_enabled', False))
+        health_enabled = bool(getattr(self, 'health_enabled', False))
+        mobile_ttl = max(60, min(7 * 24 * 60 * 60, self._cfg_int('mobile.telemetry_ttl_seconds', 3600, 60, 7 * 24 * 60 * 60)))
         configured = getattr(self, 'health_ttl_seconds', None)
-        if configured is not None:
-            return max(60, min(7 * 24 * 60 * 60, int(configured)))
-        return max(60, min(7 * 24 * 60 * 60, self._cfg_int('mobile.telemetry_ttl_seconds', 3600, 60, 7 * 24 * 60 * 60)))
+        if health_enabled and configured is not None:
+            health_ttl = max(60, min(7 * 24 * 60 * 60, int(configured)))
+            if not mobile_enabled:
+                return health_ttl
+            return max(mobile_ttl, health_ttl)
+        return mobile_ttl
 
     def _mobile_activity_enabled(self) -> bool:
         return bool(self._cfg_bool('mobile.activity_enabled', False))
@@ -1510,21 +1537,88 @@ class MobileGatewayMixin:
         except Exception:
             return fallback
 
+    @staticmethod
+    def _validate_mobile_proxy_path(aio_request: Any, service: str) -> tuple[str | None, str | None, int]:
+        """Validate un-decoded request target against traversal and per-service allowlist."""
+        raw_target = getattr(aio_request, 'raw_path', None)
+        if not isinstance(raw_target, str) or not raw_target.startswith('/') or raw_target.startswith('//'):
+            return None, None, 400
+        if any(bad in raw_target for bad in ('\x00', '\r', '\n', '#')):
+            return None, None, 400
+        raw_path_only, _, raw_query = raw_target.partition('?')
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_path_only):
+            return None, None, 400
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_query):
+            return None, None, 400
+        lowered_raw = raw_path_only.lower()
+        if any(token in lowered_raw for token in ('..', '%2e', '%2f', '\\', '%5c', '%00', '%23', '//')):
+            return None, None, 400
+        decoded_path = unquote(raw_path_only)
+        if not decoded_path.startswith('/') or decoded_path.startswith('//'):
+            return None, None, 400
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded_path):
+            return None, None, 400
+        if any(bad in decoded_path for bad in ('..', '\\', '\x00', '#', '//')):
+            return None, None, 400
+        lowered_decoded = decoded_path.lower()
+        if any(token in lowered_decoded for token in ('%2e', '%2f', '%5c', '%00', '%23')):
+            return None, None, 400
+        if any(segment in ('.', '..') for segment in decoded_path.split('/')):
+            return None, None, 400
+        normalized = posixpath.normpath(decoded_path)
+        if not normalized.startswith('/') or normalized.startswith('//'):
+            return None, None, 400
+        normalized_with_slash = f'{normalized}/' if decoded_path.endswith('/') and normalized != '/' else normalized
+        exact_allowed = MOBILE_PROXY_ALLOWED_EXACT.get(service, ())
+        prefix_allowed = MOBILE_PROXY_ALLOWED_PREFIXES.get(service, ())
+        if normalized not in exact_allowed and not any(
+            normalized_with_slash.startswith(prefix) and len(normalized_with_slash) > len(prefix)
+            for prefix in prefix_allowed
+        ):
+            return None, None, 403
+        return raw_path_only, raw_query, 0
+
     async def _mobile_room_proxy(self, aio_request: Any, service: str) -> Any:
         if web is None or aiohttp is None:
             return web.Response(status=503, text='aiohttp unavailable', content_type='text/plain')
+        raw_path_only, raw_query, reject_status = self._validate_mobile_proxy_path(aio_request, service)
+        if reject_status:
+            logger.warning(
+                '[RealityCompanion] 拒绝非法房间代理路径: service=%s raw_path=%s status=%s',
+                service,
+                _clean(getattr(aio_request, 'raw_path', ''), 120),
+                reject_status,
+            )
+            return web.Response(status=reject_status, text='非法代理路径', content_type='text/plain')
         upstream = self._mobile_room_upstream(service)
         if not upstream:
             return web.Response(status=503, text=f'{service} 房间服务不可用', content_type='text/plain')
-        target = upstream + aio_request.path
-        if aio_request.query_string:
-            target = f'{target}?{aio_request.query_string}'
+        target = f'{upstream}{raw_path_only}'
+        if raw_query:
+            target = f'{target}?{raw_query}'
+        parsed_upstream = urlsplit(upstream)
+        parsed_target = urlsplit(target)
+        if parsed_target.scheme != parsed_upstream.scheme or parsed_target.netloc != parsed_upstream.netloc:
+            return web.Response(status=400, text='非法代理路径', content_type='text/plain')
         forward_headers = self._mobile_room_proxy_headers(aio_request, upstream)
         body = await aio_request.read() if aio_request.can_read_body else None
-        session = self._mobile_proxy_session or aiohttp.ClientSession()
-        owns_session = session is self._mobile_proxy_session
+        shared_session = self._mobile_proxy_session
+        if shared_session is not None and not getattr(shared_session, 'closed', False):
+            session = shared_session
+            close_session = False
+        else:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=10.0))
+            close_session = True
+        stream = None
+        prepared = False
         try:
-            async with session.request(aio_request.method, target, headers=forward_headers, data=body, allow_redirects=True) as response:
+            async with session.request(
+                aio_request.method,
+                target,
+                headers=forward_headers,
+                data=body,
+                allow_redirects=False,
+            ) as response:
                 if response.status >= 400:
                     error_body = await response.read()
                     return web.Response(status=response.status, body=error_body[:MOBILE_MAX_BODY_BYTES], content_type=response.content_type or 'text/plain')
@@ -1534,6 +1628,7 @@ class MobileGatewayMixin:
                     if value:
                         stream.headers[header] = value
                 await stream.prepare(aio_request)
+                prepared = True
                 async for chunk in response.content.iter_chunked(64 * 1024):
                     await stream.write(chunk)
                 await stream.write_eof()
@@ -1541,10 +1636,22 @@ class MobileGatewayMixin:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning('[RealityCompanion] 房间代理转发失败: service=%s path=%s error=%s', service, _clean(aio_request.path, 120), _clean(exc, 160))
+            logger.warning(
+                '[RealityCompanion] 房间代理转发失败: service=%s path=%s prepared=%s error=%s',
+                service,
+                _clean(raw_path_only, 120),
+                prepared,
+                _clean(exc, 160),
+            )
+            if prepared and stream is not None:
+                try:
+                    await stream.write_eof()
+                except Exception:
+                    pass
+                return stream
             return web.Response(status=502, text='房间代理转发失败', content_type='text/plain')
         finally:
-            if not owns_session:
+            if close_session:
                 await session.close()
 
     async def _mobile_room_assets_proxy(self, aio_request: Any) -> Any:
@@ -1554,7 +1661,7 @@ class MobileGatewayMixin:
         if '/join/' in referer:
             return await self._mobile_room_proxy(aio_request, 'together')
         first = await self._mobile_room_proxy(aio_request, 'together')
-        if first.status < 400:
+        if first.status < 400 or first.status in (400, 403):
             return first
         second = await self._mobile_room_proxy(aio_request, 'game')
         return second if second.status < 400 else first
@@ -1594,7 +1701,9 @@ class MobileGatewayMixin:
                     task.cancel()
             finally:
                 for task in tasks:
-                    task.cancel()
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1692,7 +1801,7 @@ class MobileGatewayMixin:
                 personas = personas.values() if isinstance(personas, dict) else personas
                 persona = next((item for item in personas if item.role == context.role_binding.role), None)
                 name = getattr(persona, 'persona_id', '')
-            return {'bot_name': _clean(name, 12), 'source': 'v2_persona'}
+            return {'bot_name': _mobile_persona_display_name(name, 12), 'source': 'v2_persona'}
         except Exception:
             return {'bot_name': '', 'source': 'unavailable'}
 
@@ -2131,6 +2240,13 @@ class MobileGatewayMixin:
             site = web.TCPSite(runner, host=self._mobile_host(), port=self._mobile_port())
             await site.start()
         except Exception as exc:
+            proxy_session = self._mobile_proxy_session
+            self._mobile_proxy_session = None
+            if proxy_session is not None:
+                try:
+                    await proxy_session.close()
+                except Exception as close_exc:
+                    logger.debug('[RealityCompanion] 移动端网关失败后关闭代理会话异常: %s', _clean(close_exc, 160))
             try:
                 await runner.cleanup()
             except Exception as cleanup_exc:

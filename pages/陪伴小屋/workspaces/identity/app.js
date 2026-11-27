@@ -85,11 +85,17 @@
     || person?.admin_nickname || ["core", "important"].includes(person?.identity_tier));
   const personFilter = person => isPrivateUser(person) ? "stable"
     : person?.group_member ? "temporary" : person ? "discovered" : null;
-  const peerLabel = item => (item.platform_name === "wechat_native" ? "微信" :
-    item.platform_name === "weixin_oc" ? "微信" : /^\d+$/.test(String(item.native_account_id || "")) ? "QQ" : "账号")
-    + " " + (item.native_account_id || "未知");
-  const accountLabel = (item) => item.account_name || (/^\d+$/.test(String(item.account_id || ""))
-    ? `QQ ${item.account_id}` : "当前 Bot 账号");
+  const accountPlatform = item => ({
+    telegram:"Telegram", wechat_native:"微信", weixin_oc:"微信",
+    default:"QQ", qq:"QQ", aiocqhttp:"QQ", onebot:"QQ", qq_official:"QQ", qq_official_webhook:"QQ",
+  })[item.platform_name || item.platform_id || item.platform] || "账号";
+  const peerLabel = item => {
+    const id = String(item.native_account_id || "未知"), platform = accountPlatform(item);
+    // QQ Official people have an opaque ID, which is not a QQ number.
+    return (platform === "QQ" && !/^\d+$/.test(id) ? "账号" : platform) + " " + id;
+  };
+  const accountLabel = item => item.account_name || (item.account_id && (accountPlatform(item) === "Telegram"
+    || /^\d+$/.test(String(item.account_id))) ? accountPlatform(item) + " " + item.account_id : "当前 Bot 账号");
   const groupsOf = (person) => person.groups && typeof person.groups === "object" ? person.groups : {};
   const groupIdsOf = (person) => Object.keys(groupsOf(person));
   const personaIdsOf = (person) => {
@@ -103,7 +109,7 @@
     : JSON.stringify([person.platform, person.bot_id, person.account_id, ["role", person?.role_id || ""]]);
   const personaDisplayLabel = (person) => personaIdsOf(person).map(value => value || "默认人格").join("、")
     || person?.role_name || "当前人格";
-  const routeSnapshot = (person) => Object.fromEntries(["platform", "bot_id", "account_id", "role_id", "persona_ids",
+  const routeSnapshot = (person) => Object.fromEntries(["platform", "platform_name", "bot_id", "account_id", "role_id", "persona_ids",
     "revision", "settings_available", "private_target", "private_chat", "private_contact",
     "legacy_private_contact", "legacy_maintained", "admin_nickname", "identity_tier",
     "display_name", "native_account_id", "role_name", "private", "groups", "total"]
@@ -1300,7 +1306,7 @@
       return;
     }
     window.CompanionPrivateMembers.mount(panel, selected, {
-      bridge, groupLabel: id => groupLabel(groupById(id)),
+      bridge, peerLabel, accountLabel, groupLabel: id => groupLabel(groupById(id)),
       openGroup: id => navigateToGroup(id),
       onChanged(person, patch, {identity = false} = {}) {
         if (!data) return;
@@ -1774,12 +1780,19 @@
     }
   }
 
+  let strangerSequence = 0;
+  let refreshLoading = false;
+  const formatClock = (date = new Date()) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+
   async function loadStrangers() {
     const section = $("stranger-contacts");
     if (!section || !bridge) return;
     const status = $("stranger-status");
+    const seq = ++strangerSequence;
+    const dirSeq = requestSequence;
     try {
       const payload = unwrap(await bridge.apiGet("acquaintance/strangers", {}));
+      if (seq !== strangerSequence || dirSeq !== requestSequence) return;
       strangerItems = Array.isArray(payload?.items) ? payload.items : [];
       renderStrangers();
       const count = $("stranger-count");
@@ -1787,6 +1800,7 @@
       if (status) status.hidden = true;
       section.hidden = false;
     } catch {
+      if (seq !== strangerSequence || dirSeq !== requestSequence) return;
       // A failed read must not erase what the page already showed: keep the last
       // successful copy, put the rows back to that state, and say it is stale.
       renderStrangers();
@@ -1799,7 +1813,7 @@
       section.hidden = false;
     }
   }
-  async function supplementDirectory(sequence, edits) {
+  async function supplementDirectory(sequence, edits, manual = false) {
     try {
       const result = unwrap(await bridge.apiGet(endpoint, {}));
       if (sequence !== requestSequence) return;
@@ -1808,7 +1822,7 @@
         return;
       }
       applyDirectory(result, {background: true});
-      setSyncState("ready", "V2 数据已同步");
+      setSyncState("ready", manual ? `V2 数据已同步 · 刚刚已刷新 ${formatClock()}` : "V2 数据已同步");
     } catch (error) {
       if (sequence !== requestSequence) return;
       const failure = localized(error);
@@ -1827,20 +1841,30 @@
     }
   }
 
-  async function load({preserveNotice = false} = {}) {
+  async function load({preserveNotice = false, manual = false} = {}) {
+    if (manual && refreshLoading) return false;
     const sequence = ++requestSequence;
     const refresh = $("refresh");
+    refreshLoading = true;
     refresh.disabled = true;
-    refresh.classList.add("is-loading");
+    refresh.classList.add("is-loading", "is-refreshing");
+    refresh.setAttribute?.("aria-busy", "true");
     setSyncState("", "正在读取");
     try {
       const result = unwrap(await bridge.apiGet(endpoint, {read_mode: "stored"}));
       if (sequence !== requestSequence) return;
       applyDirectory(result);
-      void loadStrangers();
-      setSyncState("ready", result.directory_refresh_pending ? "本地关系已读取，正在更新补充资料" : "V2 数据已同步");
+      if (manual) {
+        await loadStrangers();
+        if (sequence !== requestSequence) return;
+      } else {
+        void loadStrangers();
+      }
+      setSyncState("ready", result.directory_refresh_pending
+        ? "本地关系已读取，正在更新补充资料"
+        : (manual ? `V2 数据已同步 · 刚刚已刷新 ${formatClock()}` : "V2 数据已同步"));
       if (!preserveNotice) notice("");
-      if (result.directory_refresh_pending) void supplementDirectory(sequence, memberChangeSequence);
+      if (result.directory_refresh_pending) void supplementDirectory(sequence, memberChangeSequence, manual);
       return true;
     } catch (error) {
       if (sequence !== requestSequence) return;
@@ -1859,8 +1883,10 @@
       return false;
     } finally {
       if (sequence === requestSequence) {
+        refreshLoading = false;
         refresh.disabled = false;
-        refresh.classList.remove("is-loading");
+        refresh.classList.remove("is-loading", "is-refreshing");
+        refresh.setAttribute?.("aria-busy", "false");
       }
     }
   }
@@ -1919,7 +1945,7 @@
   });
   $("refresh").addEventListener("click", async () => {
     if (!await window.CompanionPrivateMembers.beforeLeave()) return;
-    notice(""); load();
+    notice(""); load({manual: true});
   });
   /* 这里只做转发：设置弹窗由外壳（陪伴小屋）统一渲染，工作区里再画一份会
      出现两套配置控件争同一个 sparse owner。 */

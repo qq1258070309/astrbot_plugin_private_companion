@@ -8,9 +8,18 @@
     authorization_missing: "请先启用生活日程与执行权限。", life_view_stale: "记录或权限已经变化，请刷新后重新确认。", life_reading_unresolved: "原阅读结果尚未确定，不能重复调用。",
     life_reading_active: "当前片段仍在阅读，请完成或取消后再入睡。", life_sleeping: "角色正在睡眠，请先醒来再阅读。", life_command_invalid: "生活记录或操作信息已变化，请刷新后重新尝试。", journal_trigger_unresolved: "原书写仍在进行、结果未知或已经成功，不能重复执行。",
     configuration_revision_conflict: "设置已变化，请刷新后重新保存。", core_access_required: "当前账号没有本体管理权限。", source_revoked: "原文已撤回，依赖它的内容已停止使用。", life_activity_not_removable: "只有已完成或已取消的阅读记录可以删除。" };
-  let bridge, state, selected, dialogAction, dialogItem, busy = false, dirty = false, tab = "archive";
-  let datePages = [null], datePage = 0, activityCursor = null, polling = null;
+  let bridge, state, selected, dialogAction, dialogItem, busy = false, loading = false, loadSeq = 0, dirty = false, tab = "archive";
+  let datePages = [null], datePage = 0, activityCursor = null, readingCursor = null, sleepCursor = null, polling = null;
   let embedded = false, sleepOverviewUserToggled = false, settingSleepOverview = false;
+  const formatClock = (date = new Date()) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+  function setRefreshState(active) {
+    const btn = $("refresh");
+    if (!btn) return;
+    btn.disabled = active || busy;
+    btn.classList?.toggle?.("is-refreshing", active);
+    btn.setAttribute?.("aria-busy", active ? "true" : "false");
+    btn.textContent = active ? "刷新中…" : "刷新记录";
+  }
   const renderedKeys = { journalList: null, journalDetail: null, reading: null, sleep: null, receipts: null, sleepSummary: null };
   const animatedLists = new Set();
   const pending = new Map();
@@ -94,7 +103,7 @@
       }, delay);
     }
   }
-  const booleanFields = ["enabled", "diary_enabled", "sleep_enabled", "reading_enabled", "derive_enabled"];
+  const booleanFields = ["enabled", "diary_enabled", "sleep_enabled", "reading_enabled", "reading_share_in_group", "derive_enabled"];
   const configFields = [...booleanFields, "timezone", "diary_time", "sleep_time", "sleep_timezone", "sleep_variation_minutes", "sleep_window_minutes", "sleep_minutes"];
   const date = value => value ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "—";
   const kind = item => item.kind === "dream" ? "梦境" : "日记";
@@ -127,19 +136,31 @@
     return data;
   }
   function notice(text, error = false) { $("notice").textContent = text; $("notice").className = error ? "error" : ""; $("notice").hidden = !text; }
+  function activeActivityCursor() {
+    if (tab === "reading") return readingCursor;
+    if (tab === "sleep") return sleepCursor;
+    return activityCursor;
+  }
+  function nextActivityCursorForTab() {
+    if (!state) return null;
+    if (tab === "reading") return "next_reading_activity" in state ? state.next_reading_activity : state.next_activity;
+    if (tab === "sleep") return "next_sleep_activity" in state ? state.next_sleep_activity : state.next_activity;
+    return state.next_activity;
+  }
   function controls(value) {
     busy = value;
     document.querySelectorAll("button, select").forEach(b => { b.disabled = value; });
     $("close-dialog").disabled = false;
     $("newer").disabled = value || datePage === 0; $("older").disabled = value || !state?.next_date;
-    $("more-activities").disabled = value || !state?.next_activity;
-    $("first-activities").disabled = value || !activityCursor;
+    $("more-activities").disabled = value || !nextActivityCursorForTab();
+    $("first-activities").disabled = value || !activeActivityCursor();
     $("start-host").disabled = value || state?.host_state === "running";
     $("stop-host").disabled = value || !state || ["new", "stopped"].includes(state.host_state);
     ["write-diary", "start-sleep"].forEach(id => { $(id).disabled = value || !state?.config.enabled || state?.host_state !== "running"; });
     /* 配置没读到（state 为 null）时别让用户对着能点的表单白点：整组禁用，
        具体原因由 load() 的提示给出，刷新成功后自动恢复。 */
     $("config-form").querySelectorAll("input, button").forEach(el => { el.disabled = value || !state; });
+    if ($("refresh")) $("refresh").disabled = value || loading;
   }
   async function api(method, body) {
     try {
@@ -228,7 +249,8 @@
   }
   function renderActivities(background = false) {
     for (const type of ["reading", "sleep"]) {
-      const items = state.activities.filter(a => a.kind === type);
+      const dedicated = type === "reading" ? state.reading_activities : state.sleep_activities;
+      const items = Array.isArray(dedicated) ? dedicated : state.activities.filter(a => a.kind === type);
       const key = JSON.stringify(type === "reading"
         ? { items: items.map(activitySignature), reading_enabled: Boolean(state.config?.reading_enabled), next_reading_at: state.next_reading_at || null }
         : { items: items.map(activitySignature) });
@@ -307,10 +329,13 @@
       return;
     }
     $("sleep-scope").textContent = plan.enabled ? "当前角色 · 各会话共享" : "未启用";
-    const executorName = plan.executor_is_current ? "当前私聊窗口" : "同一角色的其他私聊窗口";
+    const executorLabel = plan.executor_window?.label || "";
+    const executorName = plan.executor_is_current
+      ? "当前私聊窗口（本页）"
+      : (executorLabel || "同一角色的其他私聊窗口");
     $("sleep-executor").textContent = !plan.enabled ? "未安排"
       : plan.executor_state !== "available" ? "暂无有效授权窗口"
-        : `${executorName}${plan.executor_is_current ? "（本页）" : ""}`;
+        : executorName;
     $("sleep-next").textContent = plan.next_sleep_at
       ? `${date(plan.next_sleep_at)} · ${date(plan.next_wake_at)}` : "未安排";
     $("sleep-active-wake").textContent = plan.active_wake_at ? date(plan.active_wake_at) : "当前没有进行中的睡眠";
@@ -345,7 +370,7 @@
   }
   function render(background = false) {
     $("role").textContent = roleName();
-    $("participant").textContent = display().subject_name || "当前聊天对象";
+    $("participant").textContent = display().subject_name || display().target_label || state.window_label || "当前聊天对象";
     $("host-state").textContent = names[state.host_state] || "状态待核对";
     $("routine-state").textContent = state.config.enabled ? "已启用" : "未启用";
     const hostTone = state.host_state === "running" ? "ok" : state.host_state === "draining" ? "warn" : "muted";
@@ -364,13 +389,27 @@
     renderArchive(background); renderActivities(background); renderReceipts(background); controls(busy);
     if (state.failure_code) notice(errors[state.failure_code] || "生活日程已暂停，请检查执行权限与设置。", true);
   }
-  async function load(preserveNotice = false, background = false) {
+  async function load(preserveNotice = false, background = false, manual = false) {
     if (!bridge) return;
+    if (manual && loading) return;
+    const seq = ++loadSeq;
+    loading = true;
+    if (!background) setRefreshState(true);
+    if (manual) notice("");
     try {
-      state = await api("GET", { ...(datePages[datePage] ? { before: datePages[datePage] } : {}), ...(activityCursor ? { after_activity: activityCursor } : {}) });
-      if (!preserveNotice) notice(""); render(background);
+      const next = await api("GET", {
+        ...(datePages[datePage] ? { before: datePages[datePage] } : {}),
+        ...(activityCursor ? { after_activity: activityCursor } : {}),
+        ...(readingCursor ? { after_reading: readingCursor } : {}),
+        ...(sleepCursor ? { after_sleep: sleepCursor } : {}),
+      });
+      if (seq !== loadSeq) return;
+      state = next;
+      if (!preserveNotice) notice(manual ? `刚刚已刷新 ${formatClock()}` : "");
+      render(background);
       schedulePolling();
     } catch (error) {
+      if (seq !== loadSeq) return;
       state = selected = null;
       resetRenderKeys();
       clearTimeout(polling); polling = null;
@@ -394,6 +433,11 @@
       $("editor").close();
       notice(`${error.message} 配置暂时无法读取或保存，请点「刷新记录」重试。`, true);
       controls(false);
+    } finally {
+      if (seq === loadSeq) {
+        loading = false;
+        setRefreshState(false);
+      }
     }
   }
   function open(action, item = null) {
@@ -417,6 +461,7 @@
     tab = b.dataset.tab; document.querySelectorAll("[data-tab]").forEach(x => x.setAttribute("aria-current", x === b ? "page" : "false"));
     document.querySelectorAll(".tab-panel").forEach(p => { p.hidden = p.id !== tab; }); $("activity-pages").hidden = !["reading", "sleep"].includes(tab);
     syncSleepOverviewForTab(tab);
+    controls(busy);
   }));
   $("config-form").addEventListener("input", () => { dirty = true; });
   $("config-form").addEventListener("submit", e => {
@@ -440,7 +485,7 @@
   });
   $("retry-form").addEventListener("submit", e => { e.preventDefault(); send("diary", { local_date: $("retry-date").value, retry_of: $("retry-id").value.trim() }); });
   $("close-dialog").addEventListener("click", () => $("editor").close());
-  $("refresh").addEventListener("click", () => load());
+  $("refresh").addEventListener("click", () => load(false, false, true));
   async function hostControl(action) {
     if (busy || !bridge) return;
     controls(true); notice(action === "start" ? "正在载入当前角色并启动…" : "正在停止运行…");
@@ -460,8 +505,18 @@
   $("write-diary").addEventListener("click", () => send("diary"));
   $("older").addEventListener("click", () => { datePages[++datePage] = state.next_date; load(); });
   $("newer").addEventListener("click", () => { datePage--; load(); });
-  $("more-activities").addEventListener("click", () => { activityCursor = state.next_activity; load(); });
-  $("first-activities").addEventListener("click", () => { activityCursor = null; load(); });
+  $("more-activities").addEventListener("click", () => {
+    if (tab === "reading" && "next_reading_activity" in state) readingCursor = state.next_reading_activity;
+    else if (tab === "sleep" && "next_sleep_activity" in state) sleepCursor = state.next_sleep_activity;
+    else activityCursor = state.next_activity;
+    load();
+  });
+  $("first-activities").addEventListener("click", () => {
+    if (tab === "reading" && "next_reading_activity" in (state || {})) readingCursor = null;
+    else if (tab === "sleep" && "next_sleep_activity" in (state || {})) sleepCursor = null;
+    else activityCursor = null;
+    load();
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { clearTimeout(polling); polling = null; return; }
     if (bridge && !busy) load(true, true);

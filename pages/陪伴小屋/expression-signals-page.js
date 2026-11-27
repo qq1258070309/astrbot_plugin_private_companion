@@ -54,7 +54,9 @@ window.CompanionExpressionSignalsPage = (() => {
   const formatTime = value => typeof value === "string" && Number.isFinite(Date.parse(value))
     ? new Date(value).toLocaleString("zh-CN", {hour12: false, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"})
     : "时间未知";
+  const formatClock = (date = new Date()) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
   const operationKey = action => `expression-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const MAX_REFRESH_PAGES = 10;
 
   let root = null;
   let mountTicket = 0;
@@ -62,6 +64,7 @@ window.CompanionExpressionSignalsPage = (() => {
   let apiBase = "";
   let scopeKey = "";
   let sources = [];
+  let getSourcesFn = null;
   let importSourceKey = "";
   let filter = "all";
   let stateFilter = "active";
@@ -72,7 +75,10 @@ window.CompanionExpressionSignalsPage = (() => {
   let rotatedBySource = {};
   let rotatedRules = 0;
   let countsBySource = {};
+  let kindCountsBySource = {};
   let busy = false;
+  let refreshing = false;
+  let refreshedAt = "";
   let writing = false;
   let notice = "";
   let error = false;
@@ -82,6 +88,12 @@ window.CompanionExpressionSignalsPage = (() => {
   let transferBusy = false;
   let transferNotice = "";
   let transferError = false;
+  let dedupeOpen = false;
+  let dedupeBusy = false;
+  let dedupeAction = "";
+  let dedupePreview = null;
+  let dedupeNotice = "";
+  let dedupeError = false;
   let importJSON = "";
   let importPreview = null;
   let exportPackage = null;
@@ -91,16 +103,43 @@ window.CompanionExpressionSignalsPage = (() => {
   let sourceFilter = "all";
   let pendingUpdate = false;
 
-  /* 每个 (来源, 状态) 一份分页记录：`cursors` 是已经读过的页游标（第 1 页是 ""），
-     刷新时按它原地重读同一批页；`cursor` 是下一页的游标。 */
-  function pageState() {
+  function normalizeSources(candidates) {
+    if (!Array.isArray(candidates)) return [];
+    return candidates.map((source, index) => {
+      const value = relative(source?.replyApi);
+      return value ? {...source,
+        key: String(source.key || source.scopeKey || value || index),
+        scopeKey: source.scopeKey || source.key || "", apiBase: value} : null;
+    }).filter(Boolean);
+  }
+  /* 每个 (来源, 状态) 一份分页记录：`pageCount` 记录已加载页数，刷新时沿实时游标
+     从首页顺读回同一页数，完整成功时以服务端返回权威替换。 */
+  function pageState(existingPages = {}) {
     const states = [stateFilter === "active" ? "adopted" : stateFilter];
     return Object.fromEntries(sources.map(source => [source.key,
-      Object.fromEntries(states.map(state => [state,
-        {items: [], cursors: [""], cursor: "", done: false, loaded: false}]))]));
+      Object.fromEntries(states.map(state => {
+        const previous = existingPages[source.key]?.[state];
+        return [state, previous || {items: [], cursors: [""], pageCount: 1, cursor: "", done: false, loaded: false}];
+      }))]));
   }
-  /* 同一页内的行合并：按 key 就地更新、旧行不撤。
-     刷新时后端的窗口会比上一次短（时间窗在滚动），撤掉旧行等于用户眼前少了几条。 */
+  function syncSources() {
+    if (typeof getSourcesFn !== "function") return;
+    try {
+      const latest = normalizeSources(getSourcesFn());
+      if (!latest.length && !sources.length) return;
+      sources = latest;
+      apiBase = sources[0]?.apiBase || "";
+      scopeKey = sources[0]?.scopeKey || "";
+      if (!sources.some(source => source.key === importSourceKey)) importSourceKey = sources[0]?.key || "";
+      if (sourceFilter !== "all" && !sources.some(source => source.key === sourceFilter)) sourceFilter = "all";
+      const activeKeys = new Set(sources.map(source => source.key));
+      pages = pageState(pages);
+      for (const map of [capacityBySource, rotatedBySource, countsBySource, kindCountsBySource]) {
+        for (const key of Object.keys(map)) if (!activeKeys.has(key)) delete map[key];
+      }
+    } catch (_) {}
+  }
+  /* 仅用于部分读取失败（partial）时保留未成功续读的旧行；完整读取成功时直接以服务端结果替换。 */
   function mergeRows(previous, incoming) {
     const merged = previous.slice();
     const positions = new Map(merged.map((row, position) => [row._key, position]));
@@ -170,8 +209,42 @@ window.CompanionExpressionSignalsPage = (() => {
   function queryFor(state, cursor) {
     const query = {state, limit: 50};
     if (filter !== "all") query.dimension = filter;
+    if (kindFilter !== "all") query.kind = kindFilter;
     if (cursor) query.after_id = cursor;
     return query;
+  }
+  function formatUnavailableNotice(unavailableIssues) {
+    const labels = unavailableIssues.map(issue => `「${issue.label}」`);
+    if (labels.length === 1) return `${labels[0]}还没有可读取的表达学习记录，已显示其他来源。`;
+    if (labels.length === 2) return `${labels[0]}、${labels[1]}还没有可读取的表达学习记录，已显示其他来源。`;
+    return `${labels[0]}、${labels[1]}等 ${labels.length} 个来源还没有可读取的表达学习记录，已显示其他来源。`;
+  }
+  function authoritativeKindCounts() {
+    const activeSources = sourceFilter === "all" ? sources : sources.filter(source => source.key === sourceFilter);
+    const hasServerCounts = activeSources.some(source => {
+      const value = kindCountsBySource[source.key];
+      return value && typeof value === "object";
+    });
+    if (!hasServerCounts) {
+      return {
+        all: items.length,
+        style: items.filter(item => kindOf(item) === "style").length,
+        grammar: items.filter(item => kindOf(item) === "grammar").length,
+      };
+    }
+    let style = 0, grammar = 0;
+    for (const source of activeSources) {
+      const reported = kindCountsBySource[source.key];
+      if (reported && typeof reported === "object") {
+        style += Math.max(0, Number(reported.style) || 0);
+        grammar += Math.max(0, Number(reported.grammar) || 0);
+      } else {
+        const fallbackRows = Object.values(pages[source.key] || {}).flatMap(entry => entry.items || []);
+        style += fallbackRows.filter(item => kindOf(item) === "style").length;
+        grammar += fallbackRows.filter(item => kindOf(item) === "grammar").length;
+      }
+    }
+    return {all: style + grammar, style, grammar};
   }
   function rebuildItems() {
     const seen = new Set();
@@ -223,26 +296,29 @@ window.CompanionExpressionSignalsPage = (() => {
   /* 需要读哪些页：
        reset   每个 (来源,状态) 只读第 1 页；
        append  只读「还有下一页」的那几页，游标各取各的；
-       refresh 把已经读过的页（`cursors`）按原样重读一遍，不再只读第 1 页。 */
+       refresh 从首页沿实时游标重读已加载的页数（`pageCount`），不丢失已加载页也消除游标漂移。 */
   function pagesToRead(mode) {
     const wanted = [];
     sources.forEach(source => Object.entries(pages[source.key] || {}).forEach(([state, page]) => {
-      if (mode === "reset") {wanted.push({source, state, cursors: [""]}); return;}
+      if (mode === "reset") { wanted.push({source, state, append: false, startCursor: "", rounds: 1}); return; }
       if (mode === "append") {
-        if (page.cursor && !page.done) wanted.push({source, state, cursors: [page.cursor]});
+        if (page.cursor && !page.done) wanted.push({source, state, append: true, startCursor: page.cursor, rounds: 1});
         return;
       }
-      /* 还没成功读过（首次读取失败）的来源也要在刷新里重试第 1 页。 */
-      wanted.push({source, state, cursors: page.loaded && page.cursors.length ? page.cursors.slice() : [""]});
+      const rounds = page.loaded ? Math.max(1, Number(page.pageCount) || page.cursors.length || 1) : 1;
+      wanted.push({source, state, append: false, startCursor: "", rounds});
     }));
     return wanted;
   }
-  /* 按游标列表逐页读。中途某页读不到就停在该页：已经读到的行仍然有效，
-     `next` 会停在失败的那页游标上，「加载更多」下次会重试它。 */
-  async function readChain(source, state, cursors) {
+  /* 按模式逐页读：refresh 从首页沿实时 next_cursor 续读 `rounds` 页；
+     中途某页失败时停在该页并标记 failure，保留前缀与旧行。 */
+  async function readChain(source, state, options = {}) {
+    const append = options.append === true;
+    const rounds = append ? 1 : Math.min(MAX_REFRESH_PAGES, Math.max(1, Number(options.rounds) || 1));
     const rows = [], used = [];
+    let cursor = append ? (options.startCursor || "") : "";
     let next = "", meta = null, failure = null, unavailable = "";
-    for (const cursor of cursors) {
+    for (let round = 0; round < rounds; round += 1) {
       let page;
       try {
         page = await api("GET", source.apiBase + "/style", queryFor(state, cursor));
@@ -263,41 +339,54 @@ window.CompanionExpressionSignalsPage = (() => {
       used.push(cursor);
       rows.push(...page.items.map(item => ({...item, _state: state, _source: source,
         _key: source.key + "::" + item.signal_id})));
-      next = typeof page.next_cursor === "string" && page.next_cursor ? page.next_cursor : "";
+      const nextCursor = typeof page.next_cursor === "string" && page.next_cursor ? page.next_cursor : "";
+      next = nextCursor === cursor ? "" : nextCursor;
+      if (!next) break;
+      cursor = next;
     }
     return {source, state, rows, next, used, meta, failure, unavailable};
   }
   /* 读取有三种模式：
-       reset   换筛选/状态/首次挂载：重建页记录，只读第 1 页（用户主动重置）；
+       reset   换筛选/状态/首次挂载：重建页记录，只读第 1 页；
        append  「加载更多」：往后读一页并追加；
-       refresh 重新读取 / 写操作后 / 跨工作区通知：按已读游标原地重读同一批页，
-               按 key 合并，**不减少**已经显示的行。
-     除用户主动切筛选外，任何刷新路径都不走 reset —— 那是「列表被打回第一页」的根源。 */
+       refresh 重新读取 / 写操作后 / 跨工作区通知：同步最新来源并沿实时游标重读已加载页数，
+               完整读取成功时以服务端返回权威替换，部分失败时仅保留失败来源旧行并明示。 */
   async function read(current = mountTicket, options = {}) {
     const mode = typeof options === "string" ? options
       : options.append === true ? "append" : options.mode || "reset";
     const reset = mode === "reset";
-    if (!mounted(current) || !sources.length || writing || editor || (!reset && busy)) return false;
+    const manual = typeof options === "object" && options?.manual === true;
+    if (!mounted(current) || writing || editor || (!reset && busy)) return false;
+    if (mode === "refresh") syncSources();
+    if (!sources.length) {
+      busy = false; refreshing = false; items = []; rebuildItems();
+      notice = "没有可读取的表达规则来源。"; error = true; render();
+      return false;
+    }
     const request = ++readTicket;
     const requestedFilter = filter;
+    const requestedKindFilter = kindFilter;
     const requestedStateFilter = stateFilter;
     const anchor = reset ? null : rememberScroll();
     if (reset) {
       pages = pageState(); items = []; capacity = null; capacityBySource = {}; rotatedBySource = {};
-      rotatedRules = 0; countsBySource = {}; confirming = null; notice = ""; error = false;
-      readIssues = []; selectedExportIds = new Set();
+      rotatedRules = 0; countsBySource = {}; kindCountsBySource = {}; confirming = null; notice = ""; error = false;
+      readIssues = []; selectedExportIds = new Set(); refreshedAt = "";
+    } else if (manual) {
+      notice = ""; error = false;
     }
     const requestsToRead = pagesToRead(mode);
-    if (!requestsToRead.length) { busy = false; rebuildItems(); render(); return true; }
-    busy = true; render();
-    const results = await Promise.allSettled(requestsToRead.map(({source, state, cursors}) =>
-      readChain(source, state, cursors)));
+    if (!requestsToRead.length) { busy = false; refreshing = false; rebuildItems(); render(); return true; }
+    busy = true; refreshing = mode === "refresh"; render();
+    const results = await Promise.allSettled(requestsToRead.map(({source, state, append, startCursor, rounds}) =>
+      readChain(source, state, {append, startCursor, rounds})));
     if (!mounted(current) || request !== readTicket || requestedFilter !== filter
-        || requestedStateFilter !== stateFilter) return false;
+        || requestedKindFilter !== kindFilter || requestedStateFilter !== stateFilter) return false;
     const discovered = [];
     results.forEach((result, index) => {
-      const {source,state} = requestsToRead[index];
-      const target = pages[source.key][state];
+      const {source, state} = requestsToRead[index];
+      const target = pages[source.key]?.[state];
+      if (!target) return;
       if (result.status === "rejected") {
         const code = issueCode(result.reason);
         discovered.push({kind: "error", label: issueLabel(source, result.reason), code,
@@ -309,19 +398,21 @@ window.CompanionExpressionSignalsPage = (() => {
         const code = errorCode(value.unavailable);
         discovered.push({kind: "unavailable", label: sourceLabel(source), code,
           detail: reason(code || value.unavailable)});
-        /* 刷新时这条来源刚刚变得不可读：已经显示的行留着（上一刻还是有效的），
-           只在整表重置时清空。 */
-        if (reset) { target.cursor = ""; target.done = true; target.loaded = true; }
+        if (reset || mode === "refresh") {
+          target.items = []; target.cursors = [""]; target.pageCount = 1;
+          target.cursor = ""; target.done = true; target.loaded = true;
+        }
         return;
       }
       if (value.failure) {
         discovered.push({kind: "error", label: value.failure.label, code: value.failure.code,
           detail: value.failure.detail});
-        /* 首页就没读到：旧行与旧游标都不能动，否则等于把用户的列表清空。 */
+        /* 首页就没读到：旧行、旧游标与页数都不动，避免把已显示的列表清空。 */
         if (!value.used.length) return;
       }
       const page = value.meta;
       if(page?.counts && typeof page.counts==="object") countsBySource[source.key]=page.counts;
+      if(page?.kind_counts && typeof page.kind_counts==="object") kindCountsBySource[source.key]=page.kind_counts;
       if (page?.capacity && Number.isInteger(page.capacity.active) && Number.isInteger(page.capacity.limit)) {
         capacityBySource[source.key] = page.capacity;
       }
@@ -336,17 +427,24 @@ window.CompanionExpressionSignalsPage = (() => {
       if (reset) {
         target.items = dedupeRows(value.rows);
         target.cursors = value.used.length ? value.used.slice() : [""];
+        target.pageCount = Math.max(1, target.cursors.length);
       } else if (mode === "append") {
         target.items = dedupeRows(target.items.concat(value.rows));
         target.cursors = target.cursors.concat(value.used);
-      } else {
+        target.pageCount = Math.max(1, target.cursors.length);
+      } else if (value.failure) {
+        /* 链中某页失败时保留原有页数与未重读到的后页：下次刷新继续把所有已加载页补齐。 */
         target.items = mergeRows(target.items, value.rows);
-        /* 链中某页失败时保留原来的游标列表：否则失败的页与它后面的页会被永久踢出
-           刷新范围，已显示的行就再也不会被刷新到。 */
-        if (!value.failure && value.used.length) target.cursors = value.used.slice();
+      } else {
+        /* 完整读取成功：以服务端返回权威替换，外部停用/删除的规则即时消失。 */
+        target.items = dedupeRows(value.rows);
+        target.cursors = value.used.length ? value.used.slice() : [""];
+        target.pageCount = Math.max(1, target.cursors.length);
       }
-      target.cursor = value.next;
-      target.done = !target.cursor;
+      if (!value.failure) {
+        target.cursor = value.next;
+        target.done = !target.cursor;
+      }
       target.loaded = true;
     });
     const capacities=Object.values(capacityBySource);
@@ -354,6 +452,7 @@ window.CompanionExpressionSignalsPage = (() => {
     rebuildItems();
     rotatedRules = rotatedRuleCount();
     busy = false;
+    refreshing = false;
     readIssues = (reset || mode === "refresh") ? discovered : readIssues.concat(discovered.filter(issue =>
       !readIssues.some(existing => existing.kind === issue.kind && existing.label === issue.label)));
     /* 勾选与确认条跟着刷新走：状态已经变了的规则可能不再出现在当前列表里。 */
@@ -363,7 +462,8 @@ window.CompanionExpressionSignalsPage = (() => {
       if (confirming && !present.has(confirming)) confirming = null;
     }
     const failedCount = readIssues.filter(issue => issue.kind === "error").length;
-    const unavailableCount = readIssues.filter(issue => issue.kind === "unavailable").length;
+    const unavailableIssues = readIssues.filter(issue => issue.kind === "unavailable");
+    const unavailableCount = unavailableIssues.length;
     const legacyRules = readIssues.filter(issue => issue.kind === "legacy")
       .reduce((total, issue) => total + (Number(issue.count) || 0), 0);
     if (failedCount) {
@@ -378,12 +478,13 @@ window.CompanionExpressionSignalsPage = (() => {
       /* 全部来源都不可读时没有「其他来源」可言，别给一句自相矛盾的提示。 */
       notice = unavailableCount === sources.length
         ? "全部来源都还没有可读取的表达学习记录。"
-        : `${unavailableCount} 个来源还没有可读取的表达学习记录，已显示其他来源。`;
+        : formatUnavailableNotice(unavailableIssues);
       error = false;
     } else if (!reset) {
       /* 刷新成功后把上一轮的失败提示收掉。 */
       notice = ""; error = false;
     }
+    if (manual && failedCount === 0) refreshedAt = formatClock();
     render();
     if (anchor !== null) restoreScroll(anchor);
     if (pendingUpdate && mounted(current)) { pendingUpdate = false; void read(current, "refresh"); }
@@ -536,9 +637,47 @@ window.CompanionExpressionSignalsPage = (() => {
       writing = false; draft.error = ERRORS[errorCode(problem?.code)] || "保存结果未确认，可重试保存或取消后重新读取。"; render();
     }
   }
+  function renderDedupePanel() {
+    if (!dedupeOpen) return "";
+    const stateLabel = {adopted: "已启用", pending: "待审", retired: "已停用", rejected: "已拒绝"};
+    const preview = dedupePreview;
+    const totalDuplicates = Number(preview?.duplicate_count || 0);
+    const totalGroups = Number(preview?.group_count || 0);
+    const byState = preview?.by_state || {};
+    const stateChips = [["adopted", "已启用"], ["pending", "待审"], ["retired", "已停用"], ["rejected", "已拒绝"]]
+      .filter(([key]) => Number(byState[key] || 0) > 0)
+      .map(([key, label]) => `<span class="lh-expression-dedupe-chip">${label} <b>${e(byState[key])}</b> 条</span>`)
+      .join("");
+    const previewGroups = Array.isArray(preview?.groups) ? preview.groups.slice(0, 8) : [];
+    const summaryHtml = preview
+      ? totalDuplicates > 0
+        ? `<div class="lh-expression-dedupe-summary" role="status">
+            <div class="lh-expression-dedupe-metrics"><strong>发现 ${e(totalGroups)} 组 · ${e(totalDuplicates)} 条重复规则</strong><div class="lh-expression-dedupe-chips">${stateChips}</div></div>
+            ${previewGroups.length ? `<ul class="lh-expression-dedupe-groups">${previewGroups.map(group => `<li>
+              <div class="lh-expression-dedupe-group-head"><span class="lh-signal-state">${e(stateLabel[group.state] || group.state)}</span>
+              <span class="lh-signal-kind is-${group.kind === "grammar" ? "grammar" : "style"}">${group.kind === "grammar" ? "语法句式" : "情境表达"}</span>
+              ${group._sourceLabel ? `<span class="lh-signal-scope">${e(group._sourceLabel)}</span>` : ""}</div>
+              <p><b>保留：</b>${e(group.survivor?.pattern || "主规则")}（${e(group.survivor?.injections || 0)} 次注入）</p>
+              <small>将安全合并并归档 ${e((group.duplicates || []).length)} 条重复项：${e((group.duplicates || []).slice(0, 3).map(item => item.pattern).filter(Boolean).join(" / "))}</small>
+            </li>`).join("")}</ul>` : ""}
+          </div>`
+        : `<p class="lh-expression-dedupe-empty" role="status">当前可读取来源没有发现内容重复的表达规则。</p>`
+      : "";
+    return `<section class="lh-expression-dedupe" aria-label="重复条目排查与安全合并">
+      <div class="lh-expression-dedupe-head"><strong>排查与合并重复条目</strong><button type="button" class="lh-refresh" data-dedupe-close aria-label="收起" title="收起"><i data-lucide="chevron-up"></i></button></div>
+      <p class="lh-expression-dedupe-desc">保留注入次数更多或更新的主规则，并把依据与注入次数合并过去；其余重复项仅归档标记，不会物理删除数据库记录。</p>
+      <div class="lh-expression-dedupe-actions">
+        <button type="button" class="lh-command" data-dedupe-scan ${dedupeBusy || busy || writing ? "disabled" : ""}>${dedupeBusy && dedupeAction === "scan" ? "正在扫描…" : "重新扫描"}</button>
+        <button type="button" class="lh-command is-primary" data-dedupe-apply ${dedupeBusy || busy || writing || !totalDuplicates ? "disabled" : ""}>${dedupeBusy && dedupeAction === "apply" ? "正在合并…" : totalDuplicates ? `确认合并 ${totalDuplicates} 条重复` : "确认合并重复条目"}</button>
+      </div>
+      ${dedupeBusy && !preview ? `<p class="lh-expression-dedupe-empty" role="status">正在扫描各来源的重复表达规则…</p>` : ""}
+      ${summaryHtml}
+      ${dedupeNotice ? `<p class="lh-inline-status ${dedupeError ? "is-error" : "is-ok"}" role="status"><span>${e(dedupeNotice)}</span></p>` : ""}
+    </section>`;
+  }
   function render() {
     if (!root) return;
-    const kindCounts = Object.fromEntries(KIND_FILTERS.map(([key]) => [key, key === "all" ? items.length : items.filter(item => kindOf(item) === key).length]));
+    const kindCounts = authoritativeKindCounts();
     const kindFilters = KIND_FILTERS.map(([key, label]) => `<button type="button" class="lh-signal-filter${kindFilter === key ? " is-active" : ""}" data-signal-kind="${key}" aria-pressed="${kindFilter === key}"${writing ? " disabled" : ""}>${label}<span>${kindCounts[key] || 0}</span></button>`).join("");
     const stateTabs = STATE_FILTERS.map(([key, label]) => {
       const state=key==="active"?"adopted":key;
@@ -548,13 +687,19 @@ window.CompanionExpressionSignalsPage = (() => {
     }).join("");
     const visible = items.filter(item=>(kindFilter==="all" || kindOf(item)===kindFilter)
       && (sourceFilter==="all" || item._source.key===sourceFilter));
+    const activeTotal = Math.max(visible.length, Number(kindCounts[kindFilter]) || 0);
+    const loadedHint = (hasMore() || activeTotal > visible.length)
+      ? `<span class="lh-signal-loaded-hint">当前已加载 ${visible.length} / ${activeTotal} 条</span>` : "";
     const rows = visible.map(renderItem).join("");
     const unavailablePending = stateFilter === "pending"
       ? items.filter(item => item.unavailable_reason && item.unavailable_reason !== "expression_rule_window_rotated").length : 0;
     const cleanup = unavailablePending
       ? `<button type="button" class="lh-command" data-signal-cleanup ${busy || writing ? "disabled" : ""}>清理失效候选</button>` : "";
-    const more = hasMore() ? `<button type="button" class="lh-signal-more lh-command" data-signal-more ${busy ? "disabled" : ""}>加载更多</button>` : "";
-    const cap = capacity ? `待审与启用 ${capacity.active} / ${capacity.limit}${rotatedRules > 0 ? ` · 另有 ${rotatedRules} 条仅原会话窗口` : ""}` : `${items.length} 条`;
+    const remainingCount = Math.max(0, activeTotal - visible.length);
+    const more = hasMore() ? `<button type="button" class="lh-signal-more lh-command" data-signal-more ${busy ? "disabled" : ""}>${remainingCount > 0 ? `加载更多（剩余 ${remainingCount} 条）` : "加载更多"}</button>` : "";
+    const capacitySourceCount = Object.keys(capacityBySource).length;
+    const capacityScopeNote = capacitySourceCount > 1 ? `（${capacitySourceCount} 个来源合计上限）` : "";
+    const cap = capacity ? `待审与启用 ${capacity.active} / ${capacity.limit}${capacityScopeNote}${rotatedRules > 0 ? ` · 另有 ${rotatedRules} 条仅原会话窗口` : ""}` : `${items.length} 条`;
     const issueList = readIssues.length ? `<details class="lh-signal-evidence"><summary>查看读取明细 · ${readIssues.length} 个来源</summary><ol>${readIssues.map(issue => `<li data-code="${e(issue.code)}"><b>${e(issue.label)}</b>：${e(issue.detail)}</li>`).join("")}</ol></details>` : "";
     const importTargets=sources.length>1?`<label class="lh-expression-transfer-target"><span>导入目标</span><select data-share-target aria-label="规则导入目标">${sources.map(source=>`<option value="${e(source.key)}" ${source.key===importSourceKey?"selected":""}>${e(sourceLabel(source))}</option>`).join("")}</select></label>`:"";
     const transfer = transferOpen ? `<section class="lh-expression-transfer" aria-label="表达规则分享与导入">
@@ -570,11 +715,12 @@ window.CompanionExpressionSignalsPage = (() => {
         ${importPreview ? `<div class="lh-expression-import-preview" role="status"><div><strong>${e(importPreview.title || "表达分享包")}</strong><span>${e(importPreview.importable_rule_count)} 条待导入 / ${e(importPreview.duplicate_rule_count)} 条重复 / ${e(importPreview.capacity_blocked_count)} 条超出容量</span></div>${importPreview.candidates?.length ? `<ul>${importPreview.candidates.slice(0, 6).map(item => `<li><b>${e(DIMENSION[item.dimension] || item.dimension)}</b><span>${e(item.observation)}</span><small>${e(item.proposal)}</small>${renderApplicability(item.applicability)}</li>`).join("")}</ul>` : ""}${importPreview.rejected_count ? `<details><summary>${e(importPreview.rejected_count)} 项未通过</summary><ul>${(importPreview.rejected || []).slice(0, 10).map(item => `<li>第 ${e(Number(item.group_index) + 1)} 组${item.rule_index == null ? "" : `第 ${e(Number(item.rule_index) + 1)} 条`}：${e(item.reason)}</li>`).join("")}</ul></details>` : ""}<small>确认后进入待审列表，采纳后才会用于回复。</small></div>` : ""}
       </div>${transferNotice ? `<p class="lh-inline-status ${transferError ? "is-error" : ""}" role="status">${e(transferNotice)}</p>` : ""}</section>` : "";
     root.innerHTML = `<section class="lh-signal-list" aria-label="表达规则库"><header class="lh-signal-head"><div><h3>表达规则库</h3><span class="lh-signal-capacity">${e(cap)}</span></div>
-      <div class="lh-signal-head-tools"><a class="lh-command" href="#manage/learning/strategy">学习设置</a>${cleanup}<button type="button" class="lh-command" data-share-toggle aria-expanded="${transferOpen}">${transferOpen ? "收起分享" : "分享 / 导入"}</button><button type="button" class="lh-refresh" data-signal-refresh aria-label="重新读取" title="重新读取" ${busy || transferBusy ? "disabled" : ""}><i data-lucide="refresh-cw"></i></button></div></header>
+      <div class="lh-signal-head-tools"><a class="lh-command" href="#manage/learning/strategy">学习设置</a>${cleanup}<button type="button" class="lh-command" data-dedupe-toggle aria-expanded="${dedupeOpen}" ${busy || writing || transferBusy ? "disabled" : ""}>${dedupeOpen ? "收起查重" : "合并重复条目"}</button><button type="button" class="lh-command" data-share-toggle aria-expanded="${transferOpen}">${transferOpen ? "收起分享" : "分享 / 导入"}</button><span class="refresh-cluster">${refreshedAt ? `<span class="refresh-stamp" role="status">刚刚已刷新 ${e(refreshedAt)}</span>` : ""}<button type="button" class="lh-refresh${refreshing ? " is-refreshing" : ""}" data-signal-refresh aria-label="重新读取" title="重新读取" aria-busy="${refreshing ? "true" : "false"}" ${busy || transferBusy || dedupeBusy ? "disabled" : ""}><i data-lucide="refresh-cw"></i></button></span></div></header>
       <div class="lh-signal-state-filters" role="group" aria-label="规则状态">${stateTabs}</div>
-      <div class="lh-signal-toolbar"><div class="lh-signal-filters" role="group" aria-label="表达学习类型">${kindFilters}</div></div>
+      <div class="lh-signal-toolbar"><div class="lh-signal-filters" role="group" aria-label="表达学习类型">${kindFilters}</div>${loadedHint}</div>
       <div class="lh-signal-selects"><label>表达维度<select data-signal-dimension-filter><option value="all">全部维度</option>${Object.entries(DIMENSION).map(([key,label])=>`<option value="${key}" ${filter===key?"selected":""}>${label}</option>`).join("")}</select></label>
       ${sources.length>1?`<label>记录来源<select data-rule-source-filter><option value="all">全部来源</option>${sources.map(source=>`<option value="${e(source.key)}" ${sourceFilter===source.key?"selected":""}>${e(sourceLabel(source))}</option>`).join("")}</select></label>`:""}</div>
+      ${renderDedupePanel()}
       ${transfer}
       ${renderEditor()}
       ${notice ? `<div class="lh-inline-status ${error ? "is-error" : ""}" role="status"><span>${e(notice)}</span>${issueList}</div>` : ""}
@@ -621,14 +767,24 @@ window.CompanionExpressionSignalsPage = (() => {
   }
   async function cleanupUnavailable() {
     if (busy || writing || !sources.length) return;
-    if (!window.confirm("清理后这些候选会进入「已拒绝」，不能再采纳。确定清理所有原文已失效的待审候选？")) return;
     const current = mountTicket;
+    const endpoints = sources.map(source => source.apiBase);
+    const confirmed = await window.CompanionConfirm?.({
+      title: "清理失效候选",
+      message: "清理后这些候选会进入「已拒绝」，不能再采纳。确定清理所有原文已失效的待审候选？",
+      confirmText: "清理", cancelText: "取消", danger: true,
+    });
+    if (!mounted(current) || busy || writing) return;
+    if (confirmed == null) { notice = "当前页面无法弹出确认框，未执行清理。"; error = true; render(); return; }
+    if (confirmed !== true || sources.length !== endpoints.length
+        || sources.some((source, index) => source.apiBase !== endpoints[index])) return;
     busy = true; writing = true; notice = ""; error = false; render();
     let rejected = 0, failed = false;
     try {
-      for (const source of sources) {
+      for (const endpoint of endpoints) {
+        if (!mounted(current)) return;
         try {
-          const result = await api("POST", source.apiBase + "/style/cleanup", {
+          const result = await api("POST", endpoint + "/style/cleanup", {
             operation_key: operationKey("cleanup"),
           });
           rejected += Number(result.rejected || 0);
@@ -737,14 +893,96 @@ window.CompanionExpressionSignalsPage = (() => {
     anchor.href = url; anchor.download = "private-companion-expression-pack.json";
     document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
   }
+  async function scanDuplicates() {
+    if (dedupeBusy || busy || writing || !sources.length) return;
+    const current = mountTicket;
+    dedupeBusy = true; dedupeAction = "scan"; dedupeNotice = ""; dedupeError = false; render();
+    const targetSources = sourceFilter === "all" ? sources : sources.filter(source => source.key === sourceFilter);
+    const results = await Promise.allSettled(targetSources.map(source =>
+      api("POST", source.apiBase + "/style/dedupe", {dry_run: true}).then(value => ({source, value}))));
+    if (!mounted(current)) return;
+    const byState = {adopted: 0, pending: 0, retired: 0, rejected: 0};
+    const groups = [];
+    const actionableSources = [];
+    let groupCount = 0, duplicateCount = 0, okCount = 0;
+    for (const outcome of results) {
+      if (outcome.status !== "fulfilled") continue;
+      okCount += 1;
+      const {source, value} = outcome.value;
+      const sourceDup = Number(value?.duplicate_count || 0);
+      groupCount += Number(value?.group_count || 0);
+      duplicateCount += sourceDup;
+      if (sourceDup > 0) actionableSources.push(source);
+      const stateCounts = value?.by_state || {};
+      for (const key of Object.keys(byState)) byState[key] += Number(stateCounts[key] || 0);
+      if (Array.isArray(value?.groups)) {
+        for (const group of value.groups) groups.push({...group, _sourceLabel: sourceLabel(source)});
+      }
+    }
+    dedupeBusy = false; dedupeAction = "";
+    if (!okCount) {
+      dedupePreview = null;
+      dedupeNotice = "当前来源暂无法完成重复条目扫描，请稍后重试。";
+      dedupeError = true;
+    } else {
+      dedupePreview = {group_count: groupCount, duplicate_count: duplicateCount, by_state: byState, groups, sources: actionableSources};
+      if (okCount < targetSources.length) {
+        dedupeNotice = "部分来源暂不可扫描，已汇总可用来源的查重结果。";
+        dedupeError = false;
+      }
+    }
+    render();
+  }
+  async function applyDedupe() {
+    if (dedupeBusy || busy || writing || !dedupePreview?.duplicate_count) return;
+    const current = mountTicket;
+    const targets = Array.isArray(dedupePreview.sources) && dedupePreview.sources.length ? dedupePreview.sources : sources;
+    dedupeBusy = true; dedupeAction = "apply"; dedupeNotice = ""; dedupeError = false; render();
+    let mergedTotal = 0, failed = 0;
+    for (const source of targets) {
+      try {
+        const result = await api("POST", source.apiBase + "/style/dedupe", {
+          dry_run: false, operation_key: operationKey("dedupe"),
+        });
+        mergedTotal += Number(result?.merged_count || 0);
+      } catch (_) {
+        failed += 1;
+      }
+    }
+    if (!mounted(current)) return;
+    dedupeBusy = false; dedupeAction = ""; dedupePreview = null;
+    await read(current, "refresh");
+    if (!mounted(current)) return;
+    if (failed) {
+      dedupeNotice = mergedTotal
+        ? `已安全合并 ${mergedTotal} 条重复规则，另有 ${failed} 个来源未能完成，可重新扫描确认。`
+        : "部分来源合并失败，请重新扫描后再试。";
+      dedupeError = !mergedTotal;
+    } else {
+      dedupeNotice = mergedTotal
+        ? `已安全合并并归档 ${mergedTotal} 条重复规则，主规则的注入次数与依据已合并保留。`
+        : "当前已没有需要合并的重复条目。";
+      dedupeError = false;
+    }
+    render();
+  }
   function onClick(event) {
-    if (writing || transferBusy) return;
+    if (writing || transferBusy || dedupeBusy) return;
     if (event.target.closest("[data-rule-save]")) { void saveRule(); return; }
     if (event.target.closest("[data-rule-cancel]")) { editor=null; render(); return; }
     if (editor) return;
     const edit = event.target.closest("[data-signal-edit]");
     if (edit) { editRule(edit.dataset.signalEdit); return; }
-    if (event.target.closest("[data-share-toggle]")) { transferOpen = !transferOpen; render(); return; }
+    if (event.target.closest("[data-dedupe-toggle]")) {
+      dedupeOpen = !dedupeOpen;
+      if (dedupeOpen) { transferOpen = false; dedupeNotice = ""; dedupeError = false; void scanDuplicates(); }
+      else render();
+      return;
+    }
+    if (event.target.closest("[data-dedupe-close]")) { dedupeOpen = false; render(); return; }
+    if (event.target.closest("[data-dedupe-scan]")) { void scanDuplicates(); return; }
+    if (event.target.closest("[data-dedupe-apply]")) { void applyDedupe(); return; }
+    if (event.target.closest("[data-share-toggle]")) { transferOpen = !transferOpen; if (transferOpen) dedupeOpen = false; render(); return; }
     if (event.target.closest("[data-share-close]")) { transferOpen = false; render(); return; }
     if (event.target.closest("[data-share-export]")) { void exportRules(); return; }
     if (event.target.closest("[data-share-clear-selection]")) { selectedExportIds = new Set(); render(); return; }
@@ -755,8 +993,8 @@ window.CompanionExpressionSignalsPage = (() => {
     const stateButton = event.target.closest("[data-signal-state]");
     if (stateButton) { const next = STATE_FILTERS.some(([key]) => key === stateButton.dataset.signalState) ? stateButton.dataset.signalState : "active"; if (next !== stateFilter) { stateFilter = next; void read(mountTicket); } return; }
     const kindButton = event.target.closest("[data-signal-kind]");
-    if (kindButton) { const next = KIND_FILTERS.some(([key]) => key === kindButton.dataset.signalKind) ? kindButton.dataset.signalKind : "all"; if (next !== kindFilter) { kindFilter = next; render(); } return; }
-    if (event.target.closest("[data-signal-refresh]")) { void read(mountTicket, "refresh"); return; }
+    if (kindButton) { const next = KIND_FILTERS.some(([key]) => key === kindButton.dataset.signalKind) ? kindButton.dataset.signalKind : "all"; if (next !== kindFilter) { kindFilter = next; void read(mountTicket); } return; }
+    if (event.target.closest("[data-signal-refresh]")) { void read(mountTicket, {mode: "refresh", manual: true}); return; }
     if (event.target.closest("[data-signal-more]")) { void read(mountTicket, "append"); return; }
     if (event.target.closest("[data-signal-cleanup]")) { void cleanupUnavailable(); return; }
     const action = event.target.closest("[data-signal-action]");
@@ -848,20 +1086,23 @@ window.CompanionExpressionSignalsPage = (() => {
   }
   function mount(host, options = {}) {
     unmount(); root = host;
-    const candidates=Array.isArray(options.sources)?options.sources:options.replyApi?[{replyApi:options.replyApi,scopeKey:options.scopeKey,label:"当前来源"}]:[];
-    sources=candidates.map((source,index)=>{const value=relative(source.replyApi);return value?{...source,
-      key:String(source.key||source.scopeKey||value||index),scopeKey:source.scopeKey||source.key||"",apiBase:value}:null;}).filter(Boolean);
-    apiBase=sources[0]?.apiBase||"";scopeKey=sources[0]?.scopeKey||"";importSourceKey=sources[0]?.key||"";
+    getSourcesFn = typeof options.getSources === "function" ? options.getSources : null;
+    const candidates = Array.isArray(options.sources) ? options.sources
+      : options.replyApi ? [{replyApi: options.replyApi, scopeKey: options.scopeKey, label: "当前来源"}]
+        : getSourcesFn ? (() => { try { const list = getSourcesFn(); return Array.isArray(list) ? list : []; } catch (_) { return []; } })() : [];
+    sources = normalizeSources(candidates);
+    apiBase = sources[0]?.apiBase || ""; scopeKey = sources[0]?.scopeKey || ""; importSourceKey = sources[0]?.key || "";
     filter = FILTERS.some(([key]) => key === options.state) ? options.state : "all";
-    items = []; pages = {}; capacity = null; rotatedBySource = {}; rotatedRules = 0; notice = ""; busy = false; writing = false; error = false; readIssues = []; confirming = null;
+    items = []; pages = {}; capacity = null; rotatedBySource = {}; rotatedRules = 0; countsBySource = {}; kindCountsBySource = {}; notice = ""; busy = false; refreshing = false; refreshedAt = ""; writing = false; error = false; readIssues = []; confirming = null;
     transferOpen = false; transferBusy = false; transferNotice = ""; transferError = false; importJSON = ""; importPreview = null;
+    dedupeOpen = false; dedupeBusy = false; dedupeAction = ""; dedupePreview = null; dedupeNotice = ""; dedupeError = false;
     exportPackage = null; selectedExportIds = new Set();
-    editor=null;kindFilter="all";sourceFilter="all";stateFilter="active";pendingUpdate=false;
+    editor = null; kindFilter = "all"; sourceFilter = "all"; stateFilter = "active"; pendingUpdate = false;
     root?.addEventListener("click", onClick); root?.addEventListener("change", onChange); root?.addEventListener("input", onInput);
     window.addEventListener?.("companion-expression-updated", onUpdated); const current = ++mountTicket;
     if (sources.length) void read(current); else { notice = "没有可读取的表达规则来源。"; error = true; render(); }
   }
-  function unmount() { mountTicket++; readTicket++; root?.removeEventListener("click", onClick); root?.removeEventListener("change", onChange); root?.removeEventListener("input", onInput); window.removeEventListener?.("companion-expression-updated", onUpdated); root = null; apiBase = ""; scopeKey = ""; sources=[];items = []; pages = {}; capacity = null;capacityBySource={};rotatedBySource={};rotatedRules=0; readIssues=[]; busy = false; writing = false; transferBusy = false; confirming = null; pendingUpdate = false; }
+  function unmount() { mountTicket++; readTicket++; root?.removeEventListener("click", onClick); root?.removeEventListener("change", onChange); root?.removeEventListener("input", onInput); window.removeEventListener?.("companion-expression-updated", onUpdated); root = null; apiBase = ""; scopeKey = ""; sources = []; getSourcesFn = null; items = []; pages = {}; capacity = null; capacityBySource = {}; rotatedBySource = {}; rotatedRules = 0; countsBySource = {}; kindCountsBySource = {}; readIssues = []; busy = false; refreshing = false; refreshedAt = ""; writing = false; transferBusy = false; dedupeOpen = false; dedupeBusy = false; dedupeAction = ""; dedupePreview = null; dedupeNotice = ""; dedupeError = false; confirming = null; pendingUpdate = false; }
   /* 测试专用：页内行状态的只读快照（items 只留 key 字段），不要拿它回写页面状态。 */
   function snapshotPages() {
     return Object.fromEntries(Object.entries(pages).map(([sourceKey, byState]) => [sourceKey,

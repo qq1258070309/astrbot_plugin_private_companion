@@ -17,7 +17,8 @@ from .model_api import ModelWebAPI, PREFIX as MODEL_PREFIX
 from .life_api import LifeWebAPI, PREFIX as LIFE_PREFIX
 from .relationships_api import RelationshipWebAPI, MANAGEMENT_PREFIX as RELATIONSHIP_PREFIX
 from .growth_api import GrowthWebAPI, PREFIX as GROWTH_PREFIX
-from .web_api import StagingWebAPI, outcome_response
+from .web_api import StagingWebAPI, http_handler, outcome_response
+from .management_identity import current_request_username, require_controller_management_operator
 from .group_settings import GroupTarget
 from .group_memory_api import GroupMemoryWebAPI
 from .group_model_api import GroupModelWebAPI
@@ -43,6 +44,7 @@ from .image_material_api import ImageMaterialsWebAPI, PREFIX as IMAGE_MATERIAL_P
 from .qzone_api import QzoneWebAPI, PREFIX as QZONE_PREFIX
 from .host_options_api import HostOptionsWebAPI
 from .storage_api import StorageWebAPI
+from .tuning_api import TuningWebAPI
 from .works_api import WorksWebAPI
 from .display_names import display_names
 from .identity_derivation import role_display_name
@@ -77,8 +79,11 @@ def configuration_routes(reply_route, view, *, allowed_sections=None):
 
 class TargetControllerView:
     """Do not store a globally selected target while concurrent requests await."""
-    def __init__(self, controller, target_id, role_id):
-        self.controller, self.target_id, self.role_id = controller, target_id, role_id
+    def __init__(self, controller, target_id, role_id, *, context_target_id=None):
+        settings = getattr(controller, "settings", None)
+        canonical = settings.canonical_role_id(role_id) if settings is not None else role_id
+        self.controller, self.target_id, self.role_id = controller, target_id, canonical
+        self._context_target_id = context_target_id or target_id
 
     def __getattr__(self, name):
         return getattr(self.controller, name)
@@ -90,12 +95,12 @@ class TargetControllerView:
         if session is None or controller.runtime is None:
             return None
         try:
-            context = controller.authority.context(self.target_id, self.role_id)
+            context = controller.authority.context(self._context_target_id, self.role_id)
         except TaskError:
             # A role shared by several windows only has its context registered
             # on the primary route; page reads for an alias should use that same
             # role context instead of failing with a generic "unreadable" note.
-            link = controller.settings.window_link_for_target(self.target_id)
+            link = controller.settings.window_link_for_target(self._context_target_id)
             if link is None:
                 raise
             context = controller.authority.context(link.primary_target_id, self.role_id)
@@ -141,14 +146,16 @@ class MultiHostWebAPI:
     def __init__(self, controller):
         self.controller = controller
         self._registered_routes = []
+        self.setup = None
 
     def _register_routes(self, register, routes):
         registered = getattr(self.controller.context, "registered_web_apis", None)
         snapshot = list(registered) if isinstance(registered, list) else None
         try:
             for route, handler, methods, description in routes:
-                register(route, handler, methods, description)
-                self._registered_routes.append((route, handler))
+                wrapped = http_handler(handler)
+                register(route, wrapped, methods, description)
+                self._registered_routes.append((route, wrapped))
         except Exception:
             if snapshot is not None:
                 registered[:] = snapshot
@@ -235,6 +242,8 @@ class MultiHostWebAPI:
         保存映射会与 controller 重建并发，注册可能瞬时失败。这里只退避几秒，
         不做永久标记：一次失败不能让新角色的路由一直 404 到下次重载插件。
         """
+        if getattr(self.controller, "_terminated", False):
+            return
         if getattr(self, "_refreshing_role_routes", False):
             return
         retry_at = getattr(self, "_role_routes_retry_at", 0.0)
@@ -249,6 +258,8 @@ class MultiHostWebAPI:
         self._refreshing_role_routes = True
         try:
             self.controller.unregister_routes()
+            if getattr(self.controller, "_terminated", False):
+                return
             self.controller.register_routes()
             self._role_routes_retry_at = 0.0
         except Exception:
@@ -258,31 +269,33 @@ class MultiHostWebAPI:
         finally:
             self._refreshing_role_routes = False
 
-    @staticmethod
-    def _admin():
-        from .management_identity import _authenticated_api_key
-        username = request.username
-        if type(username) is not str or not username.strip() or (username.startswith("api_key:") and not _authenticated_api_key(username)):
-            raise TaskError("dashboard_identity_required", "sign in to the AstrBot Dashboard as an administrator")
+    def _admin(self):
+        username = current_request_username(request)
+        return require_controller_management_operator(
+            self.controller, username, allow_api_key=True,
+        )
 
     async def api_status(self):
+        import asyncio
+        from .http_etag import conditional_response
         try:
             self._admin()
-            status = self.controller.status()
+            status = await asyncio.to_thread(self.controller.status)
             status["targets"] = await display_names(self.controller).targets(status.get("targets", []))
             self._admin()
             if self.controller._terminated:
-                status = self.controller.status()
-            return {"status": "ok", "data": status}
+                status = await asyncio.to_thread(self.controller.status)
+            return conditional_response({"status": "ok", "data": status}, req=request)
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
 
     async def api_performance(self):
+        from .http_etag import conditional_response
         try:
             self._admin()
-            return {"status": "ok", "data": performance_status(
+            return conditional_response({"status": "ok", "data": performance_status(
                 getattr(self.controller, "config", {}),
-                enabled=getattr(self.controller, "_performance_mode_enabled", None))}
+                enabled=getattr(self.controller, "_performance_mode_enabled", None))}, req=request)
         except TaskError as error:
             return outcome_response(Outcome.failed(error.code, str(error)))
 
@@ -337,7 +350,13 @@ class MultiHostWebAPI:
             return
         routes += PageWebAPI(self.controller).routes() + IntegrationWebAPI(self.controller).routes() + AcquaintanceWebAPI(self.controller).routes()
         routes += SemanticWebAPI(self.controller).routes()
-        routes += SetupWebAPI(self.controller).routes()
+        if self.setup is None:
+            self.setup = SetupWebAPI(self.controller)
+        try:
+            setattr(self.controller, "_setup_api", self.setup)
+        except AttributeError:
+            pass
+        routes += self.setup.routes()
         routes += AccountSessionWebAPI(self.controller).routes()
         routes += PerceptionWebAPI(self.controller).routes()
         routes += NativeExtensionWebAPI(self.controller).routes()
@@ -349,6 +368,7 @@ class MultiHostWebAPI:
         routes += BackupWebAPI(self.controller).routes()
         routes += HostOptionsWebAPI(self.controller).routes()
         routes += StorageWebAPI(self.controller).routes()
+        routes += TuningWebAPI(self.controller).routes()
         routes += ConfigPortWebAPI(self.controller).routes()
         routes += WorksWebAPI(self.controller).routes()
         # Installation-owned groups stay on one route, away from selected chats.
@@ -424,7 +444,10 @@ class MultiHostWebAPI:
                 if role.get("legacy_api") is not None:
                     routes.extend((role["legacy_api"] + path.removeprefix(LEGACY_PREFIX), handler, methods, description)
                                   for path, handler, methods, description in LegacyMigrationWebAPI(view).routes())
-                routes.extend(configuration_routes(role["reply_api"], view,
+                config_view = TargetControllerView(
+                    self.controller, target["target_id"], role["role_id"], context_target_id=source_target_id
+                )
+                routes.extend(configuration_routes(role["reply_api"], config_view,
                     allowed_sections=TARGET_CONFIGURATION_SECTIONS))
                 routes.extend((role["image_material_api"] + path.removeprefix(IMAGE_MATERIAL_PREFIX),
                                handler, methods, description)

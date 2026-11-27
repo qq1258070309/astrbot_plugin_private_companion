@@ -30,22 +30,29 @@ class RoleLifeCoordinator:
     @staticmethod
     def route(context):
         s = context.scope
-        return (s.installation_id, s.platform, s.bot_id, s.account_id, s.native_scope_id,
-                context.role_binding.role.subject_id)
+        return (s.installation_id, s.platform, s.bot_id, s.account_id, s.native_scope_id)
+
+    def _can_reuse_binding(self, routine, context, role_instruction):
+        if (routine._retired or routine._closed or routine.instruction != role_instruction
+                or self.route(routine.context) != self.route(context)
+                or routine.context.role_binding.role != context.role_binding.role):
+            return False
+        binding = self.app.tasks.identity.resolve_role(routine.context.scope, observed_at=self.app.now())
+        return binding.is_success and binding.unwrap() == routine.context.role_binding
 
     def bind(self, context, role_instruction, *, guard=None):
         if self._closed:
             raise TaskError("life_closed", "routine coordinator is closed")
         routine = self.routines.get(context.key)
+        if (routine is not None and routine.context.key != context.key
+                and not self._can_reuse_binding(routine, context, role_instruction)):
+            del self.routines[context.key]
+            routine = None
         if routine is None:
             # The Dashboard and native intake can name the same private route
-            # with different conversation IDs.  Adopt the existing routine
-            # instead of creating a second one whose activities/grants use a
-            # different context key.
+            # with different conversation IDs. Reuse a binding while its authority is current.
             for candidate in self.routines.values():
-                if (not getattr(candidate, "_retired", False)
-                        and candidate.instruction in (None, role_instruction)
-                        and self.route(candidate.context) == self.route(context)):
+                if self._can_reuse_binding(candidate, context, role_instruction):
                     routine = candidate
                     self.routines[context.key] = candidate
                     break
@@ -126,9 +133,9 @@ class RoleLifeCoordinator:
         executor, _ = self._select_sleep_executor(routine, refresh=not self._in_read_snapshot())
         return executor
 
-    def sleep_schedule_status(self, routine, config):
+    def sleep_schedule_status(self, routine, config, *, body_sleep=None, now=None):
         settings = values(config)
-        now = self.app.now()
+        now = now or self.app.now()
         executor, next_at = (
             self._select_sleep_executor(routine, refresh=False, now=now)
             if settings["sleep_enabled"]
@@ -137,11 +144,28 @@ class RoleLifeCoordinator:
         if settings["sleep_enabled"] and next_at is None:
             next_at = next_bedtime(now, routine.owner, settings["sleep_timezone"],
                 time.fromisoformat(settings["sleep_time"]), settings["sleep_variation_minutes"])
-        profile = self.app.role_state.body_clock.profile(routine.context, now=now)
+        active_sleep = (
+            body_sleep
+            if body_sleep is not None
+            else self.app.role_state.body_clock.read(
+                routine.context, now=now, sleep_enabled=settings["sleep_enabled"]
+            )
+        )
+        if active_sleep is not None and "sleep_debt_minutes" in active_sleep and "workload_score" in active_sleep:
+            profile = {
+                "sleep_pressure": active_sleep["sleep_pressure"],
+                "sleep_debt_minutes": active_sleep["sleep_debt_minutes"],
+                "workload_score": active_sleep["workload_score"],
+                "awake_minutes": active_sleep["awake_minutes"],
+                "has_sleep_history": active_sleep["has_sleep_history"],
+            }
+        else:
+            profile = self.app.role_state.body_clock.profile(
+                routine.context, now=now, sleep_enabled=settings["sleep_enabled"]
+            )
         planned_minutes = recommended_sleep_minutes(settings["sleep_minutes"],
             profile["sleep_debt_minutes"], profile["workload_score"])
         next_wake = next_at + timedelta(minutes=planned_minutes) if next_at else None
-        active_sleep = self.app.role_state.body_clock.read(routine.context, now=now)
         rhythm = sleep_rhythm(now, next_at if settings["sleep_enabled"] else None, active_sleep)
         return {"shared": True, "owner": {"installation_id": routine.context.scope.installation_id,
                     "bot_id": routine.context.scope.bot_id, "role_id": routine.context.role_binding.role.subject_id},
@@ -173,10 +197,10 @@ class RoleLifeCoordinator:
                 "label": f"{scope.platform} · 账号 {account} · 会话 {scope.native_scope_id}"}
 
     def cancel_activity(self, identifier):
+        wake_prefix = "wake:" + identifier + ":"
         for routine in tuple(self.routines.values()):
-            for key in (identifier, "wake:" + identifier):
-                worker = routine._workers.get(key)
-                if worker is not None:
+            for key, worker in tuple(routine._workers.items()):
+                if key in (identifier, "wake:" + identifier) or key.startswith(wake_prefix):
                     worker.cancel()
 
     @property

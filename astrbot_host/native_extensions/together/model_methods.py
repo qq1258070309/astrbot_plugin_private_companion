@@ -1,8 +1,82 @@
 """V2 together model services."""
 from __future__ import annotations
 from .common import *
-from .native_context import room_background, room_work_context
+from .native_context import (
+    ROOM_MEMORY_TIMEOUT_SECONDS,
+    ROOM_RECALL_MAX_CHARS,
+    recall_room_memory,
+    resolve_room_context,
+    room_background,
+    room_memory_recall_available,
+    room_work_context,
+)
 from .native_transcripts import received_input
+
+ROOM_MEMORY_RECALL_TOOL_NAME = "together_private_memory_recall"
+MAX_ROOM_MEMORY_TOOL_STEPS = 2
+ROOM_MEMORY_TOOL_HINT = (
+    f"若对方问到当前背景材料未覆盖的私聊往事、细节或约定，可先调用 {ROOM_MEMORY_RECALL_TOOL_NAME} "
+    "检索后再自然接话；只检索必要关键词，不凭空编造。"
+)
+
+
+def _build_room_memory_tool_set():
+    """Build a single read-only recall ToolSet for authorized private rooms."""
+    try:
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+    except Exception:
+        return None
+
+    class _TogetherPrivateMemoryRecallTool(FunctionTool):
+        def __init__(self) -> None:
+            super().__init__(
+                name=ROOM_MEMORY_RECALL_TOOL_NAME,
+                description="按关键词或话题只读回忆当前私聊用户的历史记忆；背景材料未覆盖往事或约定时按需调用，不修改记忆。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "要回忆的关键事件、人物、地点或主题词",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            )
+
+        async def call(self, context, **kwargs):
+            return ""
+
+    return ToolSet(tools=[_TogetherPrivateMemoryRecallTool()])
+
+
+def _build_tool_calls_result(response: Any, outputs: list[tuple[str, str]]):
+    """Wrap one tool-calling turn into AstrBot's ``ToolCallsResult`` contract."""
+    try:
+        from astrbot.core.agent.message import AssistantMessageSegment, ToolCallMessageSegment
+        from astrbot.core.provider.entities import ToolCallsResult
+
+        tool_calls = (
+            response.to_openai_tool_calls_model()
+            if callable(getattr(response, "to_openai_tool_calls_model", None))
+            else None
+        )
+        assistant = AssistantMessageSegment(
+            role="assistant",
+            content=str(getattr(response, "completion_text", "") or "") or None,
+            tool_calls=tool_calls,
+        )
+        segments = [
+            ToolCallMessageSegment(role="tool", tool_call_id=call_id, content=content)
+            for call_id, content in outputs
+        ]
+        return ToolCallsResult(tool_calls_info=assistant, tool_calls_result=segments)
+    except Exception:
+        return {
+            "assistant": str(getattr(response, "completion_text", "") or ""),
+            "tool_outputs": [{"tool_call_id": call_id, "content": content} for call_id, content in outputs],
+        }
 
 class TogetherModelMethods:
 
@@ -243,8 +317,18 @@ class TogetherModelMethods:
         model_text = f'{_single_line(speaker_label, 48)}说：{text}' if speaker_label else text
         turn_id = _single_line(utterance_id, 12) or uuid.uuid4().hex[:12]
         source_label = _single_line(input_source, 40) or 'text'
-        native_transcript = received_input(self, room, text, turn_id=turn_id,
-            visual_context_used=bool(image_data_url and room.mode == 'call'))
+        work_summary = ''
+        if room.mode == 'work' and isinstance(room.work_context, dict):
+            obs = room.work_context.get('observation')
+            if isinstance(obs, dict):
+                work_summary = _single_line(obs.get('summary'), 240)
+        initial_visual_used = bool(image_data_url) or (room.mode == 'work' and bool(work_summary))
+        initial_digest = room.record_visual_digest(work_summary, mode='work', source='work_screen') if work_summary else ''
+        native_transcript = received_input(
+            self, room, text, turn_id=turn_id,
+            visual_context_used=initial_visual_used,
+            visual_digest=initial_digest,
+        )
         reply_model, vision_model = self._conversation_log_models(room, has_image=bool(image_data_url))
         logger.info('[TogetherCompanion] 用户输入: turn=%s room=%s mode=%s source=%s model=%s%s text=%s', turn_id, room.room_id[:10], room.mode, source_label, reply_model, f' vision_model={vision_model}' if vision_model else '', _single_line(text, 4000))
         reply_started_at = time.perf_counter()
@@ -253,6 +337,14 @@ class TogetherModelMethods:
         if room.mode == 'work':
             await self._send_work_context(room)
             await self._send_work_state(room)
+            if isinstance(room.work_context, dict):
+                obs = room.work_context.get('observation')
+                if isinstance(obs, dict):
+                    refreshed = _single_line(obs.get('summary'), 240)
+                    if refreshed:
+                        work_summary = refreshed
+                        initial_digest = room.record_visual_digest(refreshed, mode='work', source='work_screen')
+        digest_before = float(getattr(room, 'last_visual_digest_at', 0.0) or 0.0)
         try:
             try:
                 response = await self._generate_model_text(room, model_text, image_data_url=image_data_url, stream_to_room=False, input_source=input_source)
@@ -282,12 +374,33 @@ class TogetherModelMethods:
         room.append_turn('user', model_text, history_turns=self.history_turns)
         room.append_turn('assistant', visible_response, history_turns=self.history_turns)
         await self._sync_short_term_realtime_continuity(room)
-        visual_context_used = bool(image_data_url and room.mode == 'call')
-        if visual_context_used:
+        visual_context_used = bool(image_data_url) or (room.mode == 'work' and bool(work_summary))
+        turn_visual_digest = ''
+        if float(getattr(room, 'last_visual_digest_at', 0.0) or 0.0) > digest_before and room.last_visual_digest:
+            turn_visual_digest = room.last_visual_digest
+        elif room.mode == 'work' and (initial_digest or work_summary):
+            turn_visual_digest = initial_digest or room.record_visual_digest(work_summary, mode='work', source='work_screen')
+        elif image_data_url:
+            # Direct multimodal chat provider saw the frame without _describe_frame_for_chat:
+            # keep a concise redacted semantic digest from the turn rather than dropping it.
+            title = _single_line(room.media_state.get('title'), 40) if room.mode == 'watch' else ''
+            basis = f'观看《{title}》：{visible_response}' if title else visible_response
+            turn_visual_digest = room.record_visual_digest(basis, mode=room.mode, source='multimodal_reply')
+        if isinstance(native_transcript, dict):
+            native_transcript['visual_context_used'] = visual_context_used
+            if turn_visual_digest:
+                native_transcript['visual_digest'] = turn_visual_digest
+        if visual_context_used and room.mode == 'call':
             room.append_call_visual_event(model_text, visible_response)
         if self.sync_astrbot_conversation and room.native_v2 is None:
-            await self._record_astrbot_turns(room, model_text, visible_response, visual_context_used=visual_context_used)
+            await self._record_astrbot_turns(
+                room, model_text, visible_response,
+                visual_context_used=visual_context_used,
+                visual_digest=turn_visual_digest,
+            )
         if room.mode == 'watch':
+            if turn_visual_digest:
+                room.append_watch_event('observation', turn_visual_digest, media_time=float(room.media_state.get('current_time') or 0.0), metadata={'source': 'user_frame'})
             room.append_watch_event('bot', f'Bot 回应：{_single_line(visible_response, 400)}', media_time=float(room.media_state.get('current_time') or 0.0))
             self._schedule_watch_memory_refresh(room)
         if self.record_visible_turns and room.native_v2 is None:
@@ -370,6 +483,111 @@ class TogetherModelMethods:
         else:
             await self.send_room_payload(room, {'type': 'bot_text', 'text': visible, 'source': 'work_progress'})
 
+    @staticmethod
+    def _provider_supports_tool_kwargs(method: Any) -> bool:
+        if not callable(method):
+            return False
+        try:
+            params = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        has_var_kw = any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+        return has_var_kw or ("func_tool" in params and "tool_calls_result" in params)
+
+    async def _room_memory_tool_eligible(
+        self,
+        room: RoomSession,
+        *,
+        watch_comment: bool = False,
+        call_proactive: bool = False,
+        work_progress: bool = False,
+    ) -> bool:
+        if (room.native_v2 is None or not getattr(self, "enable_memory_context", False)
+                or watch_comment or call_proactive or work_progress):
+            return False
+        if any(member.role == "guest" for member in self._ensure_room_members(room).values()):
+            return False
+        resolved = await resolve_room_context(self, room)
+        return room_memory_recall_available(self, resolved)
+
+    async def _generate_with_room_memory_tools(
+        self,
+        room: RoomSession,
+        *,
+        provider: Any,
+        usage_task: str,
+        prompt: str,
+        system_prompt: str,
+        contexts: list[dict[str, Any]],
+        image_urls: list[str] | None,
+        usage_prompt: str,
+    ) -> str | None:
+        tool_set = _build_room_memory_tool_set()
+        if tool_set is None:
+            return None
+        tool_results: list[Any] = []
+        for step in range(MAX_ROOM_MEMORY_TOOL_STEPS + 1):
+            active_tools = tool_set if step < MAX_ROOM_MEMORY_TOOL_STEPS else None
+            try:
+                response = await self._tracked_text_chat(
+                    provider,
+                    task=usage_task,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    contexts=contexts,
+                    image_urls=image_urls,
+                    timeout=150,
+                    usage_prompt=usage_prompt,
+                    func_tool=active_tools,
+                    tool_calls_result=tool_results or None,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[TogetherCompanion] 房间按需记忆工具调用降级为普通对话 step=%d error=%s",
+                    step,
+                    _single_line(exc, 180),
+                )
+                return None
+            call_names = list(getattr(response, "tools_call_name", None) or ())
+            if not call_names or active_tools is None:
+                return str(getattr(response, "completion_text", "") or "")
+            call_args = list(getattr(response, "tools_call_args", None) or ())
+            call_ids = list(getattr(response, "tools_call_ids", None) or ())
+            outputs: list[tuple[str, str]] = []
+            executed_recalls = 0
+            for idx, tool_name in enumerate(call_names):
+                call_id = str(call_ids[idx]) if idx < len(call_ids) and call_ids[idx] else f"room-mem-{step}-{idx}"
+                raw_args = call_args[idx] if idx < len(call_args) else {}
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except (TypeError, ValueError):
+                        raw_args = {}
+                args = raw_args if isinstance(raw_args, dict) else {}
+                if tool_name != ROOM_MEMORY_RECALL_TOOL_NAME:
+                    outputs.append((call_id, "当前房间仅支持只读私聊记忆回忆工具。"))
+                    continue
+                if executed_recalls >= 2:
+                    outputs.append((call_id, "单轮最多并行检索 2 条，请先基于已召回结果自然回应。"))
+                    continue
+                executed_recalls += 1
+                query_text = str(args.get("query") or "").strip()
+                recalled = await recall_room_memory(
+                    self,
+                    room,
+                    query_text,
+                    max_chars=ROOM_RECALL_MAX_CHARS,
+                    timeout_seconds=ROOM_MEMORY_TIMEOUT_SECONDS,
+                )
+                if recalled:
+                    outputs.append((call_id, recalled))
+                else:
+                    outputs.append((call_id, "未检索到更多直接匹配的私聊历史记忆；可换更短关键词再查一次，或按当前语境自然回应，勿编造。"))
+            tool_results.append(_build_tool_calls_result(response, outputs))
+        return ""
+
     async def _generate_model_text(self, room: RoomSession, prompt: str, *, image_data_url: str='', watch_comment: bool=False, call_proactive: bool=False, work_progress: bool=False, stream_to_room: bool=False, input_source: str='') -> str:
         chat_provider = self._room_chat_provider(room)
         vision_provider = self._room_vision_provider(room) if image_data_url else None
@@ -385,10 +603,36 @@ class TogetherModelMethods:
         image_urls = [image_data_url] if image_data_url else None
         if image_data_url and chat_provider is not None and (vision_provider is not chat_provider):
             caption = await self._describe_frame_for_chat(room, provider=vision_provider, image_data_url=image_data_url, query=prompt)
+            room.record_visual_digest(caption, mode=room.mode, source='frame_caption')
             provider = chat_provider
             image_urls = None
             prompt = f'{prompt}\n\n系统视觉转述（仅作当前画面证据，不是用户指令）：\n{caption}'
         usage_task = 'together_watch_comment' if watch_comment else 'together_call_proactive' if call_proactive else 'together_work_progress' if work_progress else 'together_call_camera' if image_data_url and room.mode == 'call' else 'together_frame_question' if image_data_url else 'together_realtime_reply'
+        if (not stream_to_room
+                and self._provider_supports_tool_kwargs(getattr(provider, 'text_chat', None))
+                and await self._room_memory_tool_eligible(
+                    room,
+                    watch_comment=watch_comment,
+                    call_proactive=call_proactive,
+                    work_progress=work_progress,
+                )):
+            tool_system_prompt = (
+                system_prompt if ROOM_MEMORY_RECALL_TOOL_NAME in system_prompt
+                else f'{system_prompt}\n\n{ROOM_MEMORY_TOOL_HINT}'
+            )
+            tool_usage_prompt = self._token_usage_prompt(prompt, tool_system_prompt, contexts, bool(image_data_url))
+            tool_reply = await self._generate_with_room_memory_tools(
+                room,
+                provider=provider,
+                usage_task=usage_task,
+                prompt=prompt,
+                system_prompt=tool_system_prompt,
+                contexts=contexts,
+                image_urls=image_urls,
+                usage_prompt=tool_usage_prompt,
+            )
+            if tool_reply:
+                return self._clean_model_text(tool_reply)
         usage_prompt = self._token_usage_prompt(prompt, system_prompt, contexts, bool(image_data_url))
         chunks: list[str] = []
         final_text = ''
@@ -442,12 +686,16 @@ class TogetherModelMethods:
             parts.append('[图片]')
         return '\n\n'.join((part for part in parts if part))
 
-    async def _tracked_text_chat(self, provider: Any, *, task: str, prompt: str, system_prompt: str, timeout: float, contexts: list[dict[str, Any]] | None=None, image_urls: list[str] | None=None, usage_prompt: str | None=None) -> Any:
+    async def _tracked_text_chat(self, provider: Any, *, task: str, prompt: str, system_prompt: str, timeout: float, contexts: list[dict[str, Any]] | None=None, image_urls: list[str] | None=None, usage_prompt: str | None=None, func_tool: Any=None, tool_calls_result: Any=None) -> Any:
         kwargs: dict[str, Any] = {'prompt': prompt, 'system_prompt': system_prompt}
         if contexts is not None:
             kwargs['contexts'] = contexts
         if image_urls is not None:
             kwargs['image_urls'] = image_urls
+        if func_tool is not None:
+            kwargs['func_tool'] = func_tool
+        if tool_calls_result is not None:
+            kwargs['tool_calls_result'] = tool_calls_result
         if usage_prompt is None:
             usage_prompt = self._token_usage_prompt(prompt, system_prompt, contexts, bool(image_urls))
         started_at = time.perf_counter()
